@@ -1,0 +1,21 @@
+[project]
+name = "openi-bridge"
+version = "0.1.0"
+description = "MCP server that opens and manages OpenI (启智社区) compute tasks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=1.9.0",
+  "httpx>=0.27.0",
+]
+
+[project.scripts]
+openi-bridge = "openi_bridge.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openi_bridge"]
+
