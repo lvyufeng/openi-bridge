@@ -3,32 +3,60 @@
 The platform is a Gitea fork whose REST surface lives under /api/v1 and
 authenticates with a personal access token sent as Authorization: Bearer.
 
-Compute (云脑 / ai_task) endpoints are mixed:
+Compute (云脑 / ai_task) endpoints that this client uses:
 
-    GET  /api/v1/user                         account behind the token
-    GET  /api/v1/ai_task?id=                  single task detail
-    GET  /api/v1/ai_task/brief?id=            task status summary
-    GET  /api/v1/ai_task/log?id=              task log
-    GET  /api/v1/ai_task/resource_usage?id=   live card/CPU usage
-    GET  /api/v1/ai_task/debug_url?id=        Jupyter / SSH entry point
-    GET  /api/v1/ai_task/visualize_url?id=    TensorBoard entry point
-    GET  /api/v1/{owner}/{repo}/ai_task       tasks that belong to one repo
-    POST /api/v1/{owner}/{repo}/ai_task/create    create + start a task
-    POST /api/v1/ai_task/stop?id=             stop a task (stop billing)
-    POST /api/v1/ai_task/restart?id=          restart a stopped task
-    POST /api/v1/{owner}/{repo}/ai_task/del?id=   delete a task
+    GET  /api/v1/user                              account behind the token
+    GET  /api/v1/user/repos                        repos owned by the token
+    GET  /api/v1/ai_task/my_list                   every task of the account
+    GET  /api/v1/ai_task?id=                       one task detail (with sync)
+    GET  /api/v1/ai_task/brief?id=                 compact status
+    GET  /api/v1/ai_task/log?id=                   task log
+    GET  /api/v1/ai_task/resource_usage?id=        live card/CPU usage
+    GET  /api/v1/ai_task/debug_url?id=             Jupyter / SSH entry point
+    GET  /api/v1/ai_task/visualize_url?id=         TensorBoard entry point
+    GET  /api/v1/ai_task/creation/required         live specs, images, balance
+    GET  /api/v1/ai_task/creation/image_by_spec    images usable for a spec
+    POST /api/v1/{owner}/{repo}/ai_task/create     create + start a task
+    POST /api/v1/ai_task/stop?id=                  stop a task (stop billing)
+    POST /api/v1/ai_task/restart?id=               restart a stopped task
+    POST /api/v1/ai_task/del?id=                   delete a stopped task
+    POST /api/v1/ai_task/batch_del                 delete several stopped tasks
+
+The create body follows entity.CreateReq from the platform source. Required
+keys are job_type, display_job_name, spec_id, compute_source and cluster.
+Spec ids are discovered live through /ai_task/creation/required.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+import re
+from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
 
 from .auth import Credentials, resolve_credentials
 
 DEFAULT_USER_AGENT = "openi-bridge/0.1 (+mcp)"
+DEFAULT_CLUSTER = "C2Net"
+
+# Platform validation (services/ai_task_service/task/opt_handler.go).
+JOB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{1,34}[a-z0-9-]$")
+IMAGE_URL_RE = re.compile(
+    r"^(?:[a-zA-Z0-9.-]+(?::[0-9]+)?/)?[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*"
+    r"(?::[a-zA-Z0-9._-]+)?(?:@sha256:[a-fA-F0-9]{64})?$"
+)
+
+COMPUTE_SOURCES = (
+    "GPU",
+    "NPU",
+    "GCU",
+    "MLU",
+    "DCU",
+    "CPU",
+    "ILUVATAR-GPGPU",
+    "METAX-GPGPU",
+)
 
 
 class OpenIError(RuntimeError):
@@ -60,6 +88,16 @@ def _unwrap_text(response: httpx.Response) -> Any:
         return response.json()
     except ValueError:
         return response.text
+
+
+def validate_job_name(name: str) -> str:
+    """Raise if the display job name violates the platform pattern."""
+    if not JOB_NAME_RE.match(name or ""):
+        raise OpenIError(
+            "display_job_name 只能是 3-36 位小写字母/数字/连字符/下划线，"
+            f"且以字母或数字开头、以字母数字或连字符结尾：{name!r}"
+        )
+    return name
 
 
 class OpenIClient:
@@ -172,6 +210,12 @@ class OpenIClient:
         params = {"ref": ref} if ref else None
         return self.get_json(f"/repos/{subject_name}/contents", params=params)
 
+    def default_branch(self, subject_name: str) -> Optional[str]:
+        data = self.repo(subject_name)
+        if isinstance(data, Mapping):
+            return data.get("default_branch")
+        return None
+
     # ----------------------------------------------------------- data subjects
 
     def dataset_files(self, dataset_name: str, parent_dir: str = "") -> Any:
@@ -192,13 +236,73 @@ class OpenIClient:
             params={"subject_id": subject_id, "subject_type": subject_type},
         )
 
+    # --------------------------------------------------------- creation options
+
+    def creation_info(
+        self,
+        job_type: str = "DEBUG",
+        compute_source: str = "GPU",
+        cluster_type: str = DEFAULT_CLUSTER,
+        visualize_required: bool = False,
+        repo: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """GET /ai_task/creation/required.
+
+        Returns the live, account specific create form data: available specs
+        (with their numeric spec_id), usable images, branches, the default
+        display name, points balance and whether a new task may be created.
+        """
+        params: Dict[str, Any] = {
+            "job_type": job_type,
+            "compute_source": compute_source,
+            "cluster_type": cluster_type,
+            "visualize_required": str(bool(visualize_required)).lower(),
+        }
+        if repo:
+            # The platform scopes branch lookup to the repo when present.
+            params["repo"] = repo
+        return self.get_json("/ai_task/creation/required", params=params)
+
+    def specs(
+        self,
+        job_type: str = "DEBUG",
+        compute_source: str = "GPU",
+        cluster_type: str = DEFAULT_CLUSTER,
+        visualize_required: bool = False,
+        repo: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Just the spec list from creation_info."""
+        info = self.creation_info(job_type, compute_source, cluster_type, visualize_required, repo)
+        return list((info.get("specs") or {}).get("all") or [])
+
+    def images_for_spec(
+        self,
+        spec_id: int,
+        job_type: str = "DEBUG",
+        compute_source: str = "GPU",
+        cluster_type: str = DEFAULT_CLUSTER,
+        has_internet: int = 2,
+        visualize_required: bool = False,
+    ) -> Dict[str, Any]:
+        return self.get_json(
+            "/ai_task/creation/image_by_spec",
+            params={
+                "job_type": job_type,
+                "compute_source": compute_source,
+                "cluster_type": cluster_type,
+                "spec_id": spec_id,
+                "has_internet": has_internet,
+                "visualize_required": str(bool(visualize_required)).lower(),
+            },
+        )
+
     # ------------------------------------------------------------- compute tasks
 
     def sdk_code(
         self,
         job_type: str,
-        compute_source: str = "openi",
-        cluster_type: str = "openi",
+        compute_source: str = "GPU",
+        cluster_type: str = DEFAULT_CLUSTER,
         visualize_required: bool = False,
     ) -> Dict[str, Any]:
         return self.get_json(
@@ -212,7 +316,7 @@ class OpenIClient:
         )
 
     def task(self, task_id: Any) -> Dict[str, Any]:
-        """GET /api/v1/ai_task?id= - full detail of one task."""
+        """GET /api/v1/ai_task?id= - full detail of one task (triggers sync)."""
         return self.get_json("/ai_task", params={"id": task_id})
 
     def task_brief(self, task_id: Any) -> Dict[str, Any]:
@@ -225,21 +329,13 @@ class OpenIClient:
     def task_node_info(self, task_id: Any) -> Any:
         return self.get_json("/ai_task/node_info", params={"id": task_id})
 
-    def list_tasks(self, repo: Optional[str] = None) -> Any:
-        """List compute tasks.
+    def list_tasks(self, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """GET /api/v1/ai_task/my_list - every task of the account."""
+        return self.get_json("/ai_task/my_list", params={"page": page, "page_size": page_size})
 
-        The platform only exposes a JSON listing per repo
-        (GET /api/v1/{owner}/{repo}/ai_task); the account wide list is a
-        server rendered page without a JSON API.
-        """
-        if not repo:
-            raise OpenIError(
-                "list_tasks 需要 repo 参数（owner/name）。平台没有账号级任务列表 JSON 接口，"
-                "请通过 openi_list_my_repositories 选择代码仓后再查询，"
-                "或在网页 https://openi.pcl.ac.cn/cloudbrains 查看全部任务。"
-            )
-        result = self.get_json(f"/{repo}/ai_task")
-        return result
+    def repo_tasks(self, repo: str) -> Any:
+        """Tasks that belong to one repo (owner/name)."""
+        return self.get_json(f"/{repo}/ai_task")
 
     def task_log(
         self,
@@ -270,129 +366,118 @@ class OpenIClient:
         return self.get_json("/ai_task/visualize_url", params={"id": task_id})
 
     def task_action(self, action: str, task_id: Any, repo: Optional[str] = None) -> Any:
-        """Run stop / restart / del on a task."""
+        """Run stop / restart / del on a task.
+
+        All three accept id only; the repo scoped variants only exist for a
+        subset and are not required.
+        """
         if action not in ("stop", "restart", "del"):
             raise ValueError(f"unsupported action: {action}")
-        path = f"/{repo}/ai_task/{action}" if (repo and action == "del") else f"/ai_task/{action}"
-        return self.post_json(path, params={"id": task_id}, json_body={})
+        return self.post_json(f"/ai_task/{action}", params={"id": task_id}, json_body={})
+
+    def batch_delete(self, task_ids: List[Any]) -> Any:
+        return self.post_json("/ai_task/batch_del", json_body={"id": list(task_ids)})
+
+    # ------------------------------------------------------------- create task
 
     def create_task(
         self,
         repo: str,
-        task_name: str,
+        spec_id: int,
+        display_job_name: Optional[str] = None,
+        compute_source: str = "GPU",
+        cluster: str = DEFAULT_CLUSTER,
         job_type: str = "DEBUG",
-        cluster: str = "openi",
-        computer_res: Optional[str] = None,
-        card_type: Optional[str] = None,
-        card_count: int = 1,
-        node_count: int = 1,
-        image: Optional[str] = None,
+        work_server_number: int = 1,
+        branch_name: Optional[str] = None,
+        image_id: Optional[str] = None,
+        image_name: Optional[str] = None,
+        image_url: Optional[str] = None,
         boot_file: Optional[str] = None,
-        branch: Optional[str] = None,
-        dataset: Optional[str] = None,
-        model: Optional[str] = None,
-        command: Optional[str] = None,
-        duration_hours: Optional[int] = None,
+        params: Optional[str] = None,
+        dataset_uuid_str: Optional[str] = None,
+        pretrain_model_id_str: Optional[str] = None,
         description: Optional[str] = None,
-        has_internet: Optional[bool] = None,
-        visualize: Optional[bool] = None,
-        spec: Optional[str] = None,
+        label_names: Optional[str] = None,
+        has_internet: int = 2,
+        time_limit: Optional[int] = None,
+        visualize_required: bool = False,
+        auto_save: bool = False,
         extra: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """POST /api/v1/{owner}/{repo}/ai_task/create.
 
-        The field names mirror the web create form. They are the best
-        available approximation of the JSON body and can be corrected through
-        the extra mapping or by editing build_create_payload.
+        spec_id must come from openi_get_creation_options for the same
+        job_type/compute_source/cluster. When image_id is omitted the first
+        image from the creation options is used.
         """
-        payload = build_create_payload(
-            repo=repo,
-            task_name=task_name,
-            job_type=job_type,
-            cluster=cluster,
-            computer_res=computer_res,
-            card_type=card_type,
-            card_count=card_count,
-            node_count=node_count,
-            image=image,
-            boot_file=boot_file,
-            branch=branch,
-            dataset=dataset,
-            model=model,
-            command=command,
-            duration_hours=duration_hours,
-            description=description,
-            has_internet=has_internet,
-            visualize=visualize,
-            spec=spec,
-            extra=extra,
-        )
+        if display_job_name is None or image_id is None:
+            info = self.creation_info(job_type, compute_source, cluster, repo=repo)
+            if display_job_name is None:
+                display_job_name = info.get("display_job_name")
+            if image_id is None:
+                images = info.get("images") or []
+                if images:
+                    image_id = images[0].get("image_id")
+                    image_name = image_name or images[0].get("image_name")
+        validate_job_name(display_job_name or "")
+        if image_url and not IMAGE_URL_RE.match(image_url):
+            raise OpenIError(f"image_url 不是合法的镜像地址: {image_url!r}")
+
+        payload: Dict[str, Any] = {
+            "job_type": job_type,
+            "display_job_name": display_job_name,
+            "spec_id": int(spec_id),
+            "compute_source": compute_source,
+            "cluster": cluster,
+            "work_server_number": work_server_number,
+            "has_internet": has_internet,
+            "visualize_required": bool(visualize_required),
+            "auto_save": bool(auto_save),
+        }
+        optional = {
+            "branch_name": branch_name,
+            "image_id": image_id,
+            "image_name": image_name,
+            "image_url": image_url,
+            "boot_file": boot_file,
+            "params": params,
+            "dataset_uuid_str": dataset_uuid_str,
+            "pretrain_model_id_str": pretrain_model_id_str,
+            "description": description,
+            "label_names": label_names,
+            "time_limit": time_limit,
+        }
+        for key, value in optional.items():
+            if value not in (None, ""):
+                payload[key] = value
+        if extra:
+            payload.update(extra)
+
         result = self.post_json(f"/{repo}/ai_task/create", json_body=payload)
         if isinstance(result, dict):
             result.setdefault("_request_payload", payload)
         return result
 
 
-def build_create_payload(
-    *,
-    repo: str,
-    task_name: str,
-    job_type: str,
-    cluster: str,
-    computer_res: Optional[str],
-    card_type: Optional[str],
-    card_count: int,
-    node_count: int,
-    image: Optional[str],
-    boot_file: Optional[str],
-    branch: Optional[str],
-    dataset: Optional[str],
-    model: Optional[str],
-    command: Optional[str],
-    duration_hours: Optional[int],
-    description: Optional[str],
-    has_internet: Optional[bool],
-    visualize: Optional[bool],
-    spec: Optional[str],
-    extra: Optional[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    """Assemble the create-task request body from the create form fields."""
-    payload: Dict[str, Any] = {
-        "repo": repo,
-        "task_name": task_name,
-        "job_type": job_type,
-        "compute_source": cluster,
-        "cluster_type": cluster,
-        "card_count": card_count,
-        "node_count": node_count,
-        "work_server_num": node_count,
+def summarize_spec(spec: Mapping[str, Any]) -> Dict[str, Any]:
+    """Trim a raw spec row down to the fields a caller needs to choose one."""
+    return {
+        "spec_id": spec.get("id"),
+        "compute_resource": spec.get("compute_resource"),
+        "card_type": spec.get("acc_card_type"),
+        "card_count": spec.get("acc_cards_num"),
+        "cpu_cores": spec.get("cpu_cores"),
+        "mem_gb": spec.get("mem_gi_b"),
+        "gpu_mem_gb": spec.get("gpu_mem_gi_b"),
+        "price_per_card_hour": spec.get("unit_price"),
+        "has_internet": spec.get("has_internet"),
+        "visualization": spec.get("enable_visualization"),
+        "ai_center": spec.get("ai_center_code"),
     }
-    optional = {
-        "computer_res": computer_res or card_type,
-        "card_type": card_type,
-        "image": image,
-        "image_url": image,
-        "boot_file": boot_file,
-        "branch_name": branch,
-        "dataset": dataset,
-        "dataset_list": [dataset] if dataset else None,
-        "model": model,
-        "model_list": [model] if model else None,
-        "run_parameters": command,
-        "time_limit": duration_hours,
-        "task_descr": description,
-        "has_internet": has_internet,
-        "visualization": visualize,
-        "spec": spec,
-    }
-    for key, value in optional.items():
-        if value is not None:
-            payload[key] = value
-    if extra:
-        payload.update(extra)
-    return payload
 
 
 def dump(value: Any) -> str:
     """Stable JSON rendering used by the MCP tools."""
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+

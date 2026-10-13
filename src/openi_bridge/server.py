@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
-from .client import OpenIClient, OpenIError, dump
-from .resources import CLUSTERS, JOB_TYPES, describe_resources
+from .client import (
+    DEFAULT_CLUSTER,
+    OpenIClient,
+    OpenIError,
+    dump,
+    summarize_spec,
+)
+from .resources import describe_resources
 
 try:  # mcp 2.x renamed FastMCP to MCPServer
     from mcp.server.mcpserver import MCPServer as _Server
@@ -23,9 +29,10 @@ mcp = _Server(
     "openi-bridge",
     instructions=(
         "使用启智社区（openi.pcl.ac.cn，即 OpenI 鹏城云脑普惠算力）的计算任务。"
-        "可以查询账号、算力资源与积分、代码仓、任务的日志与状态，并新建、停止、"
-        "重启、删除计算任务。使用前必须设置 OPENI_TOKEN 环境变量，令牌在 "
-        "https://openi.pcl.ac.cn/user/settings/applications 生成。"
+        "可以查询账号、算力资源与积分、可用规格（spec）、代码仓、任务的日志与状态，"
+        "并新建、停止、重启、删除计算任务。创建任务前先用 "
+        "openi_list_creation_options 拿到实时的 spec_id 与镜像。使用前必须设置 "
+        "OPENI_TOKEN 环境变量，令牌在 https://openi.pcl.ac.cn/user/settings/applications 生成。"
     ),
 )
 
@@ -60,6 +67,81 @@ def openi_whoami() -> str:
 def openi_list_resources() -> str:
     """列出启智社区可用的算力集群、卡型与积分单价（分/卡时）。"""
     return describe_resources()
+
+
+@mcp.tool()
+def openi_list_creation_options(
+    job_type: str = "DEBUG",
+    compute_source: str = "GPU",
+    cluster_type: str = DEFAULT_CLUSTER,
+    visualize_required: bool = False,
+    repo: Optional[str] = None,
+) -> str:
+    """列出当前账号在这个作业类型/算力类型下真正可开的规格与镜像。
+
+    返回每一项的 spec_id、卡型、卡数、CPU/内存、单价，以及可用镜像的
+    image_id/image_name、默认任务名、积分余额和是否还能创建任务。
+    创建任务时必须用这里返回的 spec_id。
+
+    job_type: DEBUG / TRAIN / INFERENCE / ONLINEINFERENCE / HPC 等。
+    compute_source: GPU / NPU / GCU / MLU / DCU / CPU / ILUVATAR-GPGPU / METAX-GPGPU。
+    cluster_type: 默认 C2Net（普通用户真实可用的集群）。
+    """
+    try:
+        with _client() as client:
+            info = client.creation_info(
+                job_type=job_type,
+                compute_source=compute_source,
+                cluster_type=cluster_type,
+                visualize_required=visualize_required,
+                repo=repo,
+            )
+        specs = ((info.get("specs") or {}).get("all")) or []
+        point = info.get("point_account") or {}
+        result = {
+            "ok": True,
+            "job_type": job_type,
+            "compute_source": compute_source,
+            "cluster_type": cluster_type,
+            "can_create_more": info.get("can_create_more"),
+            "not_stop_task_count": info.get("not_stop_task_count"),
+            "limit_count": info.get("limit_count"),
+            "waiting_queue_count": info.get("wait_count"),
+            "default_display_job_name": info.get("display_job_name"),
+            "point_balance": point.get("balance"),
+            "allowed_worker_num": info.get("allowed_worker_num"),
+            "can_use_all_images": info.get("can_use_all_images"),
+            "images": info.get("images") or [],
+            "specs": [summarize_spec(s) for s in specs],
+        }
+        return dump(result)
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_images_for_spec(
+    spec_id: int,
+    job_type: str = "DEBUG",
+    compute_source: str = "GPU",
+    cluster_type: str = DEFAULT_CLUSTER,
+    has_internet: int = 2,
+    visualize_required: bool = False,
+) -> str:
+    """查询某个 spec 可用的镜像。若返回为空，请直接用创建任务的默认镜像。"""
+    try:
+        with _client() as client:
+            images = client.images_for_spec(
+                spec_id,
+                job_type=job_type,
+                compute_source=compute_source,
+                cluster_type=cluster_type,
+                has_internet=has_internet,
+                visualize_required=visualize_required,
+            )
+        return dump({"ok": True, "images": images})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
 
 
 @mcp.tool()
@@ -107,7 +189,7 @@ def openi_search_repositories(query: str, limit: int = 20) -> str:
 
 @mcp.tool()
 def openi_list_repo_files(repo: str, ref: Optional[str] = None) -> str:
-    """列出代码仓根目录文件，用于确定启动文件 boot_file（例如 train.py）。"""
+    """列出代码仓根目录与分支，用于确定启动文件 boot_file（例如 train.py）。"""
     try:
         with _client() as client:
             files = client.repo_contents(repo, ref=ref)
@@ -137,11 +219,52 @@ def openi_get_task(task_id: str) -> str:
 
 
 @mcp.tool()
-def openi_list_tasks(repo: str) -> str:
+def openi_list_tasks(page: int = 1, page_size: int = 20) -> str:
+    """列出当前账号的全部计算任务（跨所有代码仓）。"""
+    try:
+        with _client() as client:
+            data = client.list_tasks(page=page, page_size=page_size)
+        if not isinstance(data, dict):
+            return dump({"ok": True, "tasks": data})
+        slim = []
+        for item in data.get("tasks", []):
+            task = item.get("task", item) if isinstance(item, dict) else {}
+            if not isinstance(task, dict):
+                continue
+            slim.append(
+                {
+                    "id": task.get("id"),
+                    "display_job_name": task.get("display_job_name"),
+                    "job_type": task.get("job_type"),
+                    "status": task.get("status"),
+                    "compute_source": task.get("compute_source"),
+                    "card_type": task.get("acc_card_type"),
+                    "cluster": task.get("cluster"),
+                    "created_unix": task.get("created_unix"),
+                    "duration": task.get("formatted_duration"),
+                    "repo": item.get("repo_alias") if isinstance(item, dict) else None,
+                }
+            )
+        return dump(
+            {
+                "ok": True,
+                "total": data.get("total"),
+                "page": data.get("page"),
+                "page_size": data.get("page_size"),
+                "can_create_task": data.get("can_create_task"),
+                "tasks": slim,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_repo_tasks(repo: str) -> str:
     """列出某个代码仓（owner/name）下的全部计算任务。"""
     try:
         with _client() as client:
-            tasks = client.list_tasks(repo)
+            tasks = client.repo_tasks(repo)
         return dump({"ok": True, "repo": repo, "tasks": tasks})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -192,57 +315,71 @@ def openi_task_visualize_url(task_id: str) -> str:
 @mcp.tool()
 def openi_start_task(
     repo: str,
-    task_name: str,
+    spec_id: int,
     job_type: str = "DEBUG",
-    cluster: str = "openi",
-    card_type: str = "V100",
-    card_count: int = 1,
-    node_count: int = 1,
-    image: Optional[str] = None,
+    compute_source: str = "GPU",
+    cluster: str = DEFAULT_CLUSTER,
+    display_job_name: Optional[str] = None,
+    work_server_number: int = 1,
+    branch_name: Optional[str] = None,
+    image_id: Optional[str] = None,
+    image_name: Optional[str] = None,
+    image_url: Optional[str] = None,
     boot_file: Optional[str] = None,
-    branch: Optional[str] = None,
-    dataset: Optional[str] = None,
-    model: Optional[str] = None,
-    command: Optional[str] = None,
-    duration_hours: Optional[int] = None,
+    params: Optional[str] = None,
+    dataset_uuid_str: Optional[str] = None,
+    pretrain_model_id_str: Optional[str] = None,
     description: Optional[str] = None,
-    has_internet: Optional[bool] = None,
-    visualize: Optional[bool] = None,
+    has_internet: int = 2,
+    time_limit: Optional[int] = None,
+    visualize_required: bool = False,
     extra_fields: Optional[str] = None,
 ) -> str:
-    """新建并启动一个计算任务（调试/训练/推理），成功后会立刻开始计费。
+    """新建并启动一个计算任务，成功后立即开始计费（不足 6 分钟不扣费）。
+
+    先用 openi_list_creation_options 获取实时 spec_id 与镜像，再用这里创建。
 
     repo: 代码仓 owner/name，任务从该仓的代码运行。
-    job_type: DEBUG（交互调试）/ TRAIN（训练）/ INFERENCE（推理）等。
-    cluster: openi（启智集群）或 c2net（智算网络）。
-    card_type/card_count/node_count: 卡型、每节点卡数、节点数。
-    image: 容器镜像地址，留空则用平台默认镜像。
-    boot_file: 启动文件，例如 train.py。
-    command: 运行参数。
-    duration_hours: 自动停止时长（小时）。
-    extra_fields: JSON 字符串，用于覆盖或补充请求字段。
+    spec_id: 必填，规格 ID，来自 openi_list_creation_options。
+    job_type: DEBUG（交互调试，可开 Jupyter/SSH）/ TRAIN（训练）/ INFERENCE（批量推理）等。
+    compute_source: GPU / NPU / GCU / MLU / DCU / CPU / ILUVATAR-GPGPU / METAX-GPGPU。
+    cluster: 默认 C2Net（普通用户真实可用的集群）。
+    display_job_name: 任务名，留空用平台默认名（必须是小写字母数字，3-36 位）。
+    work_server_number: 节点数，默认 1。
+    branch_name: 代码分支，留空用仓库默认分支。
+    image_id/image_name: 镜像，留空用该算力类型的默认镜像。
+    image_url: 自定义镜像地址（若填则优先于 image_id）。
+    boot_file: 启动文件（训练任务需要，例如 train.py）。
+    params: 传给启动文件的运行参数。
+    dataset_uuid_str / pretrain_model_id_str: 挂载的数据集 UUID / 预训练模型 ID。
+    has_internet: 0 不限制 / 1 无外网 / 2 有外网。
+    time_limit: 自动停止时长（小时，-1 表示不自动停止）。
+    visualize_required: 是否需要 TensorBoard。
+    extra_fields: JSON 字符串，用于补充平台新增字段。
     """
     try:
         extra = json.loads(extra_fields) if extra_fields else None
         with _client() as client:
             result = client.create_task(
                 repo=repo,
-                task_name=task_name,
-                job_type=job_type,
+                spec_id=spec_id,
+                display_job_name=display_job_name,
+                compute_source=compute_source,
                 cluster=cluster,
-                card_type=card_type,
-                card_count=card_count,
-                node_count=node_count,
-                image=image,
+                job_type=job_type,
+                work_server_number=work_server_number,
+                branch_name=branch_name,
+                image_id=image_id,
+                image_name=image_name,
+                image_url=image_url,
                 boot_file=boot_file,
-                branch=branch,
-                dataset=dataset,
-                model=model,
-                command=command,
-                duration_hours=duration_hours,
+                params=params,
+                dataset_uuid_str=dataset_uuid_str,
+                pretrain_model_id_str=pretrain_model_id_str,
                 description=description,
                 has_internet=has_internet,
-                visualize=visualize,
+                time_limit=time_limit,
+                visualize_required=visualize_required,
                 extra=extra,
             )
         return _ok(result, ok=True)
@@ -254,7 +391,7 @@ def openi_start_task(
 def openi_start_task_raw(repo: str, payload_json: str, dry_run: bool = False) -> str:
     """用完全自定义的 JSON 请求体创建任务，用于平台接口字段变化时兜底。
 
-    例如 payload_json 可以是网页创建表单提交的原始字段。
+    payload_json 直接作为请求体发送到 /{repo}/ai_task/create。
     dry_run=True 时只回显将要发送的请求，不真正创建。
     """
     try:
@@ -289,17 +426,17 @@ def openi_restart_task(task_id: str) -> str:
 
 
 @mcp.tool()
-def openi_delete_task(task_id: str, repo: str) -> str:
-    """删除任务（不可恢复）。"""
+def openi_delete_task(task_id: str) -> str:
+    """删除任务（不可恢复）。任务需先处于已停止状态。"""
     try:
         with _client() as client:
-            return _ok(client.task_action("del", task_id, repo=repo), ok=True)
+            return _ok(client.task_action("del", task_id), ok=True)
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
 
 @mcp.tool()
-def openi_sdk_code(job_type: str = "DEBUG", cluster: str = "openi", visualize: bool = False) -> str:
+def openi_sdk_code(job_type: str = "DEBUG", compute_source: str = "GPU", visualize: bool = False) -> str:
     """生成任务容器内访问数据集/模型的示例代码。"""
     try:
         with _client() as client:
@@ -307,7 +444,9 @@ def openi_sdk_code(job_type: str = "DEBUG", cluster: str = "openi", visualize: b
                 {
                     "ok": True,
                     "sdk_code": client.sdk_code(
-                        job_type=job_type, cluster_type=cluster, visualize_required=visualize
+                        job_type=job_type,
+                        compute_source=compute_source,
+                        visualize_required=visualize,
                     ),
                 }
             )
@@ -327,3 +466,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
