@@ -55,6 +55,20 @@ JOB_TYPES: dict[str, str] = {
     "HPC": "超算任务",
 }
 
+# 镜像地址（place 字段）才是集群真正拉取的东西。平台的“推荐镜像”列表见
+# GET /api/v1/images/recommend，本账号收藏的镜像见 GET /api/v1/images/star。
+IMAGE_NOTES: dict[str, str] = {
+    "坑": (
+        "/ai_task/creation/required 返回的两个 image_id 在 C2Net 上会以 "
+        "'image not available' 失败，image_by_spec 也返回空。"
+    ),
+    "可用做法": "用 image_url 指定镜像地址（place），例如平台推荐镜像里的 place。",
+    "默认镜像": (
+        "不传镜像时工具会使用 OPENI_DEFAULT_IMAGE_URL，默认是 swr.cn-south-1.myhuaweicloud.com/"
+        "openi/cuda111_python37_pytorch191:v1（可验证拉起）。"
+    ),
+}
+
 
 def describe_resources() -> str:
     """Render the catalog as JSON for the MCP tool."""
@@ -74,6 +88,7 @@ def describe_resources() -> str:
         },
         "billing": "消耗积分 = 单价 × 卡时 × 节点数；每 6 分钟结算一次，不足 6 分钟不计费。",
         "points": "积分余额与明细见 https://openi.pcl.ac.cn/reward/point",
+        "image_notes": IMAGE_NOTES,
         "live_specs": "实时可开规格（含 spec_id）请调用 openi_list_creation_options。",
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)

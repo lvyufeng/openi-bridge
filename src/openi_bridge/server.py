@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from .client import (
     DEFAULT_CLUSTER,
+    DEFAULT_IMAGE_URL,
     OpenIClient,
     OpenIError,
     dump,
@@ -112,6 +113,13 @@ def openi_list_creation_options(
             "allowed_worker_num": info.get("allowed_worker_num"),
             "can_use_all_images": info.get("can_use_all_images"),
             "images": info.get("images") or [],
+            "images_usable": False,
+            "images_note": (
+                "上面 images 是平台登记的默认镜像，但在 C2Net 上会以 "
+                "'image not available' 失败。请用 openi_list_public_images 拿到可用"
+                "镜像地址并作为 image_url 传给 openi_start_task；不传镜像时会自动"
+                "使用默认镜像。"
+            ),
             "specs": [summarize_spec(s) for s in specs],
         }
         return dump(result)
@@ -128,7 +136,11 @@ def openi_list_images_for_spec(
     has_internet: int = 2,
     visualize_required: bool = False,
 ) -> str:
-    """查询某个 spec 可用的镜像。若返回为空，请直接用创建任务的默认镜像。"""
+    """查询某个 spec 可用的镜像。
+
+    在 C2Net 上这个接口通常返回空，说明该规格没有绑定镜像，需要用
+    openi_list_public_images 里的镜像地址（place）以 image_url 传入。
+    """
     try:
         with _client() as client:
             images = client.images_for_spec(
@@ -140,6 +152,50 @@ def openi_list_images_for_spec(
                 visualize_required=visualize_required,
             )
         return dump({"ok": True, "images": images})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_public_images() -> str:
+    """列出可以真正拉起的公共镜像地址（place）。
+
+    返回平台推荐镜像与本账号收藏的镜像。用其中的 place 作为
+    openi_start_task 的 image_url；不传镜像时工具会用默认镜像
+    （可用环境变量 OPENI_DEFAULT_IMAGE_URL 覆盖）。
+    """
+    try:
+        with _client() as client:
+            recommended = client.recommended_images()
+            starred = client.starred_images()
+
+        def slim(payload: Any) -> list:
+            images = payload.get("images") if isinstance(payload, dict) else payload
+            out = []
+            for image in images or []:
+                if not isinstance(image, dict):
+                    continue
+                out.append(
+                    {
+                        "tag": image.get("tag"),
+                        "image_url": image.get("place"),
+                        "compute_resource": image.get("compute_resource"),
+                        "train_type": image.get("trainType"),
+                        "framework": image.get("framework"),
+                        "description": (image.get("description") or "").strip()[:160],
+                        "use_count": image.get("useCount"),
+                    }
+                )
+            return out
+
+        return dump(
+            {
+                "ok": True,
+                "default_image_url": DEFAULT_IMAGE_URL,
+                "recommended": slim(recommended),
+                "starred": slim(starred),
+            }
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -347,8 +403,8 @@ def openi_start_task(
     display_job_name: 任务名，留空用平台默认名（必须是小写字母数字，3-36 位）。
     work_server_number: 节点数，默认 1。
     branch_name: 代码分支，留空用仓库默认分支。
-    image_id/image_name: 镜像，留空用该算力类型的默认镜像。
-    image_url: 自定义镜像地址（若填则优先于 image_id）。
+    image_id/image_name: 平台登记的镜像 ID；在 C2Net 上几乎都拉不起来，一般不用。
+    image_url: 镜像地址（place）。留空时用默认镜像，地址见 openi_list_public_images。
     boot_file: 启动文件（训练任务需要，例如 train.py）。
     params: 传给启动文件的运行参数。
     dataset_uuid_str / pretrain_model_id_str: 挂载的数据集 UUID / 预训练模型 ID。

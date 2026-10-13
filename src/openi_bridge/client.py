@@ -16,6 +16,8 @@ Compute (云脑 / ai_task) endpoints that this client uses:
     GET  /api/v1/ai_task/visualize_url?id=         TensorBoard entry point
     GET  /api/v1/ai_task/creation/required         live specs, images, balance
     GET  /api/v1/ai_task/creation/image_by_spec    images usable for a spec
+    GET  /api/v1/images/recommend                  platform recommended images
+    GET  /api/v1/images/star                       images the account starred
     POST /api/v1/{owner}/{repo}/ai_task/create     create + start a task
     POST /api/v1/ai_task/stop?id=                  stop a task (stop billing)
     POST /api/v1/ai_task/restart?id=               restart a stopped task
@@ -30,6 +32,7 @@ Spec ids are discovered live through /ai_task/creation/required.
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -39,6 +42,16 @@ from .auth import Credentials, resolve_credentials
 
 DEFAULT_USER_AGENT = "openi-bridge/0.1 (+mcp)"
 DEFAULT_CLUSTER = "C2Net"
+
+# /ai_task/creation/required advertises two images, but the C2Net cluster
+# rejects both with "image not available" (verified 2026-10). The default
+# below is a platform public image (the platform resolves it to
+# cuda111_python37_pytorch191_public) verified to boot a real C2Net GPU task.
+# Override with OPENI_DEFAULT_IMAGE_URL.
+DEFAULT_IMAGE_URL = os.getenv(
+    "OPENI_DEFAULT_IMAGE_URL",
+    "swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1",
+)
 
 # Platform validation (services/ai_task_service/task/opt_handler.go).
 JOB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{1,34}[a-z0-9-]$")
@@ -296,6 +309,14 @@ class OpenIClient:
             },
         )
 
+    def recommended_images(self) -> Dict[str, Any]:
+        """GET /images/recommend - images the platform recommends."""
+        return self.get_json("/images/recommend")
+
+    def starred_images(self) -> Dict[str, Any]:
+        """GET /images/star - images this account starred; all known to work."""
+        return self.get_json("/images/star")
+
     # ------------------------------------------------------------- compute tasks
 
     def sdk_code(
@@ -408,18 +429,17 @@ class OpenIClient:
         """POST /api/v1/{owner}/{repo}/ai_task/create.
 
         spec_id must come from openi_get_creation_options for the same
-        job_type/compute_source/cluster. When image_id is omitted the first
-        image from the creation options is used.
+        job_type/compute_source/cluster. When no image is given at all the
+        platform default is skipped on purpose: its listed images are not
+        pullable on C2Net, so DEFAULT_IMAGE_URL is used instead.
         """
-        if display_job_name is None or image_id is None:
+        image_source = "explicit"
+        if display_job_name is None:
             info = self.creation_info(job_type, compute_source, cluster, repo=repo)
-            if display_job_name is None:
-                display_job_name = info.get("display_job_name")
-            if image_id is None:
-                images = info.get("images") or []
-                if images:
-                    image_id = images[0].get("image_id")
-                    image_name = image_name or images[0].get("image_name")
+            display_job_name = info.get("display_job_name")
+        if not image_id and not image_url:
+            image_url = DEFAULT_IMAGE_URL
+            image_source = "default_image_url"
         validate_job_name(display_job_name or "")
         if image_url and not IMAGE_URL_RE.match(image_url):
             raise OpenIError(f"image_url 不是合法的镜像地址: {image_url!r}")
@@ -457,6 +477,7 @@ class OpenIClient:
         result = self.post_json(f"/{repo}/ai_task/create", json_body=payload)
         if isinstance(result, dict):
             result.setdefault("_request_payload", payload)
+            result.setdefault("_image_source", image_source)
         return result
 
 
