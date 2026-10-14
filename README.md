@@ -104,8 +104,8 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 | BIREN-GPU | 壁仞 Biren106M（32512 MiB，400W，BR-SMI 1.10.1 / SUPA 1.10） | `brsmi` | 000000 |
 
 也就是说，除了纯 CPU，这些算力都能真正开到卡。`METAX-GPGPU`（沐曦 C500）平台上有可用规格
-（`spec_id=333`），但 2026-10-13 23:00 到 2026-10-14 09:00 之间反复创建了 6 次 DEBUG 任务，
-每次都卡在 `centerPending`（示例任务 000000），一次都没调度到卡，所以上表里没有它；
+（`spec_id=333`），但 2026-10-13 23:00 到 2026-10-14 09:12 之间反复创建了 7 次 DEBUG 任务，
+每次都卡在 `centerPending`（示例任务 000000、000000），一次都没调度到卡，所以上表里没有它；
 `openi_list_creation_options(compute_source=...)` 里没有规格（spec）的只有 `CPU`。
 
 ## 提供的工具
