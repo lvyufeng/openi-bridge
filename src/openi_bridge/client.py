@@ -31,6 +31,7 @@ Spec ids are discovered live through /ai_task/creation/required.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -130,6 +131,7 @@ class OpenIClient:
         timeout: float = 30.0,
     ) -> None:
         self.creds: Credentials = resolve_credentials(token, endpoint)
+        self.timeout = timeout
         self._http = httpx.Client(
             base_url=f"{self.creds.endpoint}/api/v1",
             timeout=timeout,
@@ -254,6 +256,59 @@ class OpenIClient:
         return self.get_json(
             "/storage/summary",
             params={"subject_id": subject_id, "subject_type": subject_type},
+        )
+
+    # ------------------------------------------------------------ reward points
+
+    def _web_get(self, path: str, params: Optional[Mapping[str, Any]] = None) -> Any:
+        """GET on the web surface (outside /api/v1) using HTTP Basic auth.
+
+        The reward/points endpoints are served by the web app, not the REST API:
+        a Bearer token there just redirects to the sign-in page, while Basic auth
+        with the token as the password (any username) returns JSON. The envelope
+        is {Code, Msg, Data} with capital letters, unlike the REST API.
+        """
+        if not self.creds.has_token:
+            raise OpenIError(
+                "NO_TOKEN: 没有找到启智令牌。请在 https://openi.pcl.ac.cn/user/settings/applications "
+                "生成令牌，然后设置 OPENI_TOKEN 环境变量，或执行 openi login。"
+            )
+        auth = base64.b64encode(f"openi:{self.creds.token}".encode()).decode()
+        headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "application/json",
+            "Authorization": f"Basic {auth}",
+        }
+        with httpx.Client(base_url=self.creds.endpoint, timeout=self.timeout, headers=headers) as web:
+            response = web.get(path, params=params)
+        if response.status_code != 200:
+            raise OpenIError(
+                f"HTTP {response.status_code} for GET {path}",
+                status_code=response.status_code,
+                payload=response.text[:300],
+            )
+        payload = _unwrap_text(response)
+        if isinstance(payload, Mapping):
+            code = payload.get("Code")
+            if code not in (0, "0", None):
+                raise OpenIError(f"platform error {code}: {payload.get('Msg')}", payload=payload)
+            if "Data" in payload:
+                return payload["Data"]
+        return payload
+
+    def points_account(self) -> Dict[str, Any]:
+        """Available / total earned / total consumed compute points."""
+        return self._web_get("/reward/point/account")
+
+    def points_rules(self) -> Dict[str, Any]:
+        """Official earning rules: per-action points, cycle, per-cycle limits."""
+        return self._web_get("/reward/point/rule/config")
+
+    def points_records(self, operate: str = "INCREASE", page: int = 1) -> Dict[str, Any]:
+        """Point ledger, 10 rows per page. operate: INCREASE or DECREASE."""
+        return self._web_get(
+            "/reward/point/record/list",
+            params={"Operate": operate.upper(), "Page": page},
         )
 
     # --------------------------------------------------------- creation options

@@ -187,6 +187,36 @@ VERIFIED_ACCELERATORS: list[dict[str, object]] = [
 ]
 
 
+# 积分行为的官方代号 -> 中文名与说明，取自 /reward/point/rule/config 的 TaskCode。
+POINT_ACTIONS: dict[str, str] = {
+    "BindWechat": "完成微信扫码验证",
+    "CreatePublicRepo": "创建或 Fork 公开项目",
+    "CreatePullRequest": "每日提出 PR",
+    "PushCommits": "每日 commit",
+    "CreateIssue": "每日提出任务（Issue）",
+    "CommentIssue": "发表评论",
+    "TaskCreateDataset": "创建数据集",
+    "DatasetRecommended": "数据集被平台推荐",
+    "TaskCreateAimodel": "创建模型",
+    "TaskAimodelRecommended": "模型被平台推荐",
+    "CreateNewModelTask": "迁移外部模型",
+    "CreateCloudbrainTask": "每日运行计算任务",
+    "CreateImage": "提交新公开镜像",
+    "ImageRecommend": "镜像被平台推荐",
+    "ChangeUserAvatar": "首次更换头像",
+    "TaskInviteFriendRegister": "邀请好友注册",
+    "UploadAttachment": "上传数据集附件",
+}
+
+# 平台结算口径：积分只用于算力，打榜活动积分另行计算、不占每日上限。
+POINT_NOTES: dict[str, str] = {
+    "daily_limit": "单日获取上限（UserDailyLimit），打榜/活动奖励不占这个额度。",
+    "one_time": "NOT_CYCLE 类别为一次性奖励，领过就不再给。",
+    "cheapest_card": "最便宜的算力是 1 分/卡时，所以“每日运行计算任务”的 10 分正好等于当天 10 卡时的用量。",
+    "page": "余额与明细见 https://openi.pcl.ac.cn/reward/point 。",
+}
+
+
 def describe_resources() -> str:
     """Render the catalog as JSON for the MCP tool."""
     import json

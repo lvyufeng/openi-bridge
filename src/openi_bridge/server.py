@@ -18,7 +18,7 @@ from .client import (
     dump,
     summarize_spec,
 )
-from .resources import COMPUTE_SOURCES, describe_resources
+from .resources import COMPUTE_SOURCES, POINT_ACTIONS, POINT_NOTES, describe_resources
 
 try:  # mcp 2.x renamed FastMCP to MCPServer
     from mcp.server.mcpserver import MCPServer as _Server
@@ -177,6 +177,116 @@ def openi_estimate_runtime(
                 "billing": "积分 = 单价(分/卡时) × 卡数 × 小时；每 6 分钟结算，不足 6 分钟不计费。",
                 "note": "hours/days 已按 6 分钟向下取整；CPU 没有可用规格所以不在列表里。",
                 "estimates": rows,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_points() -> str:
+    """查看算力积分：余额、单日获取上限，以及平台公布的完整获取规则。
+
+    规则来自 /reward/point/rule/config，余额来自 /reward/point/account。
+    RefreshRate=DAILY 的按天重置，NOT_CYCLE 的是一次性奖励；打榜/活动奖励
+    另行计算，不占这里的单日上限。
+    """
+    try:
+        with _client() as client:
+            account = client.points_account()
+            config = client.points_rules()
+        rules = config.get("TaskRules") or []
+        enriched = []
+        daily_max = 0.0
+        for rule in rules:
+            code = rule.get("TaskCode")
+            amount = float(rule.get("AwardAmount") or 0)
+            limit = float(rule.get("LimitNum") or 0)
+            daily = rule.get("RefreshRate") == "DAILY"
+            if daily:
+                daily_max += amount * limit
+            enriched.append(
+                {
+                    "action": POINT_ACTIONS.get(code, code),
+                    "task_code": code,
+                    "points": amount,
+                    "cycle": "每日" if daily else "一次性",
+                    "limit": int(limit),
+                    "points_per_cycle": amount * limit,
+                }
+            )
+        enriched.sort(key=lambda row: (-row["points"], row["action"]))
+        daily_limit = float(config.get("UserDailyLimit") or 0)
+        return dump(
+            {
+                "ok": True,
+                "balance": account.get("Balance"),
+                "total_earned": account.get("TotalEarned"),
+                "total_consumed": account.get("TotalConsumed"),
+                "user_daily_limit": daily_limit,
+                "daily_rules_total_if_maxed": daily_max,
+                "daily_ceiling": min(daily_max, daily_limit) if daily_limit else daily_max,
+                "rules": enriched,
+                "notes": POINT_NOTES,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_points_history(operate: str = "INCREASE", pages: int = 1) -> str:
+    """查看积分流水，10 条一页。
+
+    operate=INCREASE 看获取明细，DECREASE 看消耗明细。pages 最多翻多少页
+    （每页 10 条），返回里会按天汇总，方便看每天实际拿了多少分。
+    """
+    try:
+        pages = max(1, int(pages))
+        records: list[dict[str, Any]] = []
+        total = None
+        with _client() as client:
+            for page in range(1, pages + 1):
+                data = client.points_records(operate=operate, page=page)
+                total = data.get("Total", total)
+                batch = data.get("Records") or []
+                if not batch:
+                    break
+                records.extend(batch)
+        per_day: dict[str, float] = {}
+        per_source: dict[str, dict[str, float]] = {}
+        rows = []
+        for rec in records:
+            amount = float(rec.get("Amount") or 0)
+            ts = rec.get("LastOperateDate")
+            day = None
+            if ts:
+                import datetime
+
+                day = datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).strftime("%Y-%m-%d")
+                per_day[day] = per_day.get(day, 0.0) + amount
+            source = rec.get("SourceTemplateId") or rec.get("SourceType") or "(其他)"
+            entry = per_source.setdefault(source, {"count": 0.0, "points": 0.0})
+            entry["count"] += 1
+            entry["points"] += amount
+            rows.append(
+                {
+                    "time": day,
+                    "action": POINT_ACTIONS.get(source, source),
+                    "points": amount,
+                    "serial_no": rec.get("SerialNo"),
+                    "remark": rec.get("Remark") or None,
+                }
+            )
+        return dump(
+            {
+                "ok": True,
+                "operate": operate.upper(),
+                "total_records": total,
+                "fetched": len(rows),
+                "per_action": per_source,
+                "per_day": dict(sorted(per_day.items(), reverse=True)),
+                "records": rows,
             }
         )
     except Exception as exc:  # noqa: BLE001
