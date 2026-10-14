@@ -1,0 +1,32 @@
+create: {"code": 0, "msg": "ok", "data": {"id": 000000, "status": ""}}
+TASK 000000
+DEBUG_URL https://<notebook-host>/47943dea-3d0f-4b1d-92de-306b53776b10/lab?token=<redacted>
+kernelspec: python-3.10.6
+### /usr/local/sbin/npu-smi
+  $ npu-smi  (rc 215)
+Usage: npu-smi <Command|-h|-v> [Options...]
+
+npu-smi Command:
+	-h            This command's help information
+	--help        This command's help information
+	-v            Show npu-smi version information
+	info          Show hardware details
+	set           Modify device configuration properties
+	clear         Clear device information
+	upgrade       Upgrade MCU firmware
+
+  $ npu-smi info (rc 0)
++------------------------------------------------------------------------------------------------+
+| npu-smi 24.1.0                   Version: 24.1.0                                               |
++---------------------------+---------------+----------------------------------------------------+
+| NPU   Name                | Health        | Power(W)    Temp(C)           Hugepages-Usage(page)|
+| Chip                      | Bus-Id        | AICore(%)   Memory-Usage(MB)  HBM-Usage(MB)        |
++===========================+===============+====================================================+
+| 6     910ProA             | OK            | 76.2        41                0    / 0             |
+| 0                         | 0000:42:00.0  | 0           2821 / 15665      1    / 32768         |
++===========================+===============+====================================================+
++---------------------------+---------------+----------------------------------------------------+
+| NPU     Chip              | Process id    | Process name             | Process memory(MB)      |
++===========================+===============+====================================================+
+| No running processes found in NPU 6                                                            |
++===========================+===============+====================================================+

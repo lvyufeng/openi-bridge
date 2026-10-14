@@ -1,0 +1,23 @@
+create: {"code": 0, "msg": "ok", "data": {"id": 000000, "status": ""}}
+TASK 000000
+DEBUG_URL https://mlunotebook.openi.org.cn/notebook_<id>_task0?token=
+kernelspec: python3 ['python3', 'ir']
+### /usr/local/corex/bin/ixsmi
+  $ ixsmi  (rc 0)
+Timestamp    Tue Oct 13 23:01:04 2026
++--------------------------------------------------------------------------------+
+|  IX-ML: 4.4.0            Driver Version: 4.4.0          CUDA Version: 10.2     |
+|----------------------------------+----------------------+----------------------|
+| GPU  Name                        | Bus-Id               | Clock-SM  Clock-Mem  |
+| Fan  Temp  Perf    Pwr:Usage/Cap |      Memory-Usage    | GPU-Util  Compute M. |
+|==================================+======================+======================|
+| 0    Iluvatar MR-V100            | 00000000:9C:00.0     | 1500MHz   1600MHz    |
+| N/A  53C   P0       39W / 150W   | 68MiB / 32768MiB     | 0%        Default    |
++----------------------------------+----------------------+----------------------+
+
++--------------------------------------------------------------------------------+
+| Processes:                                                          GPU Memory |
+|  GPU        PID      Process name                                   Usage(MiB) |
+|================================================================================|
+|  No running processes found                                                    |
++--------------------------------------------------------------------------------+

@@ -1,0 +1,32 @@
+create: {"code": 0, "msg": "ok", "data": {"id": 000000, "status": ""}}
+TASK 000000
+DEBUG_URL https://<host>:<port>/notebook_<id>_task0?token=
+kernelspec: python3
+### /usr/local/bin/npu-smi
+  $ npu-smi  (rc 215)
+Usage: npu-smi <Command|-h|-v> [Options...]
+
+npu-smi Command:
+	-h            This command's help information
+	--help        This command's help information
+	-v            Show npu-smi version information
+	info          Show hardware details
+	set           Modify device configuration properties
+	clear         Clear device information
+	upgrade       Upgrade MCU firmware
+
+  $ npu-smi info (rc 0)
++------------------------------------------------------------------------------------------------+
+| npu-smi 25.2.1                   Version: 25.2.1                                               |
++---------------------------+---------------+----------------------------------------------------+
+| NPU   Name                | Health        | Power(W)    Temp(C)           Hugepages-Usage(page)|
+| Chip                      | Bus-Id        | AICore(%)   Memory-Usage(MB)  HBM-Usage(MB)        |
++===========================+===============+====================================================+
+| 3     910B2               | OK            | 96.7        46                0    / 0             |
+| 0                         | 0000:02:00.0  | 0           0    / 0          3440 / 65536         |
++===========================+===============+====================================================+
++---------------------------+---------------+----------------------------------------------------+
+| NPU     Chip              | Process id    | Process name             | Process memory(MB)      |
++===========================+===============+====================================================+
+| No running processes found in NPU 3                                                            |
++===========================+===============+====================================================+

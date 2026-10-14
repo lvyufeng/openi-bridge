@@ -1,0 +1,35 @@
+create: {"code": 0, "msg": "ok", "data": {"id": 000000, "status": ""}}
+TASK 000000
+DEBUG_URL https://cloudbrain3-oct.openi.org.cn/notebook_<id>_task0?token=
+kernelspec: python3
+### /usr/local/bin/npu-smi
+  $ npu-smi  (rc 215)
+Usage: npu-smi <Command|-h|-v> [Options...]
+
+npu-smi Command:
+	-h            This command's help information
+	--help        This command's help information
+	-v            Show npu-smi version information
+	info          Show hardware details
+	set           Modify device configuration properties
+	clear         Clear device information
+	upgrade       Upgrade MCU firmware
+
+  $ npu-smi info (rc 0)
++------------------------------------------------------------------------------------------------------------------+
+| npu-smi 26.0.rc3                            Version: 26.0.rc3                                                    |
++---------------------------+---------------+----------------------------------------------------------------------+
+| NPU   Name                | Health        | Power(W)             Temp(C)                 Hugepages-Usage(page)   |
+| Chip  Phy-ID              | Bus-Id        | AICore(%)            Memory-Usage(MB)        HBM-Usage(MB)           |
++===========================+===============+======================================================================+
+| 3     Ascend910           | OK            | 162.2                41                      0    / 0                |
+| 0     6                   | 0000:91:00.0  | 0                    0    / 0                3127 / 65536            |
++------------------------------------------------------------------------------------------------------------------+
+| 3     Ascend910           | OK            | -                    42                      0    / 0                |
+| 1     7                   | 0000:93:00.0  | 0                    0    / 0                2875 / 65536            |
++===========================+===============+======================================================================+
++---------------------------+---------------+----------------------------------------------------------------------+
+| NPU     Chip              | Process id    | Process name       | Process memory(MB)    | Process id in container |
++===========================+===============+======================================================================+
+| No running processes found in NPU 3                                                                              |
++===========================+===============+======================================================================+
