@@ -61,18 +61,49 @@ Codex / 其他客户端可直接运行 `openi-bridge`（安装后生成的命令
 
 ## 镜像（重要）
 
-平台在创建任务页给出的两个 `image_id`（tensorflow2.14、torch2.1.2）在 C2Net 上都会以
-`image not available` 失败，`/ai_task/creation/image_by_spec` 也返回空。真正能被集群拉起的是
-镜像地址，可以从 `openi_list_public_images` 拿到（平台推荐镜像的 `place` 字段），例如：
+不同算力类型的镜像情况不一样，都是实测出来的：
+
+- **NVIDIA GPU**：平台给 GPU 登记的两个 `image_id` 在 C2Net 上都会以 `image not available`
+  失败，`/ai_task/creation/image_by_spec` 也返回空。真正能被集群拉起的是镜像地址，可以从
+  `openi_list_public_images` 拿到（平台推荐镜像的 `place` 字段），例如：
 
 ~~~text
 dockerhub.pcl.ac.cn:5000/user-images/openi:SemanticSegmentEnv
 swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 ~~~
 
-用法：把这个地址作为 `openi_start_task(image_url=...)` 传入。不传镜像时工具会自动使用默认镜像
-`swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1`（已验证能拉起 C2Net GPU 任务，
-平台把它识别为 `cuda111_python37_pytorch191_public`），可以用环境变量 `OPENI_DEFAULT_IMAGE_URL` 覆盖。
+- **NPU / GCU / MLU / DCU / ILUVATAR-GPGPU / METAX-GPGPU / BIREN-GPU**：`image_id` 是好的，
+  直接用 `openi_list_creation_options` 里的 `image_id`/`image_name` 即可。
+
+不传镜像时工具会自动处理：GPU 走 `OPENI_DEFAULT_IMAGE_URL`（默认
+`swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1`，平台识别为
+`cuda111_python37_pytorch191_public`）；其余算力优先用实测跑通的镜像（`src/openi_bridge/resources.py`
+里的 `VERIFIED_IMAGES`，按 `spec_id` 记录），命中就填这个 `image_id`，没命中再退回平台列出的第一个
+`image_id`。返回里的 `_image_source` 会说明走了哪条路径（`fallback_image_url` / `verified_image` /
+`platform_default_image` / `explicit`）。
+
+另外，除 NVIDIA GPU 外，创建任务**必须带 `branch_name`**（代码分支），否则集群会以
+`Fail to load code` 失败（`CREATED_FAILED`）。工具在你不传时默认用代码仓的默认分支，`_branch_source`
+会说明来源。
+
+## 实测可用的算力
+
+下面的结论来自逐个算力厂商开 DEBUG 任务、在容器里跑该厂商自带 SMI 的真实输出（2026-10）：
+
+| 算力类型 | 实测卡型 | 验证命令 |
+| --- | --- | --- |
+| GPU | NVIDIA Tesla V100S-PCIE-32GB（32768 MiB，驱动 570.124.06，CUDA 12.8） | `nvidia-smi` |
+| NPU | 华为昇腾 910B2（64 GB HBM，npu-smi 25.2.1） | `npu-smi info` |
+| NPU | 华为昇腾 910ProA / 910A（HBM 32768 MB，npu-smi 24.1.0） | `npu-smi info` |
+| GCU | 燧原 Enflame T20（32 G，efsmi V1.21.0） | `efsmi` |
+| MLU | 寒武纪 MLU290-M5（32768 MiB，CNMON v4.20.16） | `cnmon` |
+| DCU | 海光 DCU / K100_AI（HCU，PwrCap 400W） | `hy-smi`、`rocm-smi` |
+| ILUVATAR-GPGPU | 天数智芯 Iluvatar MR-V100（32768 MiB，驱动 4.4.0） | `ixsmi` |
+| BIREN-GPU | 壁仞 Biren106M（32512 MiB，400W，SUPA 1.10） | `brsmi` |
+
+也就是说，除了纯 CPU，这些算力都能真正开到卡。`METAX-GPGPU`（沐曦 C500）平台上有可用规格，
+但这次实测时集群一直排队（`centerPending`），没能跑到卡，所以上表里没有它；
+`openi_list_creation_options(compute_source=...)` 里没有规格（spec）的只有 `CPU`。
 
 ## 提供的工具
 
@@ -125,5 +156,7 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 - 创建是异步的：`create` 立即返回任务 ID（状态 `PREPARING`），随后集群异步拉起。如果集群侧排队或拉起失败，任务会进入失败态，且不计费；用 `openi_get_task` 观察状态。
 - DEBUG 任务不需要 `boot_file`；训练类任务需要以 `.py` 结尾的 `boot_file`。
 - 账号级任务列表用的是 `/ai_task/my_list`，它在平台前端真实存在，但字段较少；更完整的信息用 `openi_get_task`。
-- 镜像：`/ai_task/creation/required` 给出的 `image_id` 在本集群拉不起来（`image not available`），所以工具在未指定镜像时会改用 `OPENI_DEFAULT_IMAGE_URL`，把镜像地址作为 `image_url` 传下去；这也是平台上“外部镜像 / 推荐镜像”的实际工作方式。
+- 镜像：只有 NVIDIA GPU 的登记 `image_id` 在 C2Net 上拉不起来（`image not available`），工具对 GPU 会改用 `OPENI_DEFAULT_IMAGE_URL` 并把镜像地址作为 `image_url` 传下去；其余算力的 `image_id` 可直接使用。
+- `branch_name`：除 NVIDIA GPU 外的算力在创建时都需要它，缺失会以 `Fail to load code`（`CREATED_FAILED`）失败；工具默认取代码仓的默认分支。
+- 可用性：`GPU` / `NPU` / `GCU` / `MLU` / `DCU` / `ILUVATAR-GPGPU` / `BIREN-GPU` 都已开卡验证（见上面的“实测可用的算力”）；`METAX-GPGPU` 有规格但实测时集群排队未跑到卡；`CPU` 是唯一拿不到规格的 `compute_source`。
 

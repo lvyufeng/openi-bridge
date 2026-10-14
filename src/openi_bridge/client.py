@@ -39,19 +39,25 @@ from typing import Any, Dict, List, Mapping, Optional
 import httpx
 
 from .auth import Credentials, resolve_credentials
+from .resources import VERIFIED_IMAGES
 
 DEFAULT_USER_AGENT = "openi-bridge/0.1 (+mcp)"
 DEFAULT_CLUSTER = "C2Net"
 
-# /ai_task/creation/required advertises two images, but the C2Net cluster
-# rejects both with "image not available" (verified 2026-10). The default
-# below is a platform public image (the platform resolves it to
+# Only the NVIDIA GPU path is broken: /ai_task/creation/required advertises two
+# images and C2Net rejects both with "image not available" (verified 2026-10).
+# The default below is a platform public image (the platform resolves it to
 # cuda111_python37_pytorch191_public) verified to boot a real C2Net GPU task.
-# Override with OPENI_DEFAULT_IMAGE_URL.
+# The other accelerator families (NPU/GCU/MLU/DCU/...) do list working images,
+# so this is only used for compute_source=GPU. Override with
+# OPENI_DEFAULT_IMAGE_URL.
 DEFAULT_IMAGE_URL = os.getenv(
     "OPENI_DEFAULT_IMAGE_URL",
     "swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1",
 )
+
+# Compute sources whose advertised images cannot be pulled, checked live.
+SOURCES_NEEDING_IMAGE_URL = frozenset({"GPU"})
 
 # Platform validation (services/ai_task_service/task/opt_handler.go).
 JOB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{1,34}[a-z0-9-]$")
@@ -69,6 +75,7 @@ COMPUTE_SOURCES = (
     "CPU",
     "ILUVATAR-GPGPU",
     "METAX-GPGPU",
+    "BIREN-GPU",
 )
 
 
@@ -429,17 +436,51 @@ class OpenIClient:
         """POST /api/v1/{owner}/{repo}/ai_task/create.
 
         spec_id must come from openi_get_creation_options for the same
-        job_type/compute_source/cluster. When no image is given at all the
-        platform default is skipped on purpose: its listed images are not
-        pullable on C2Net, so DEFAULT_IMAGE_URL is used instead.
+        job_type/compute_source/cluster.
+
+        When the caller supplies no image, the platform's own default image is
+        used for every accelerator family except NVIDIA GPU, whose two listed
+        images C2Net cannot pull; there DEFAULT_IMAGE_URL is sent as image_url
+        instead. For the specs whose platform-listed images were verified on
+        C2Net (see resources.VERIFIED_IMAGES) that known-good image id wins over
+        the platform's first entry. The response reports which path was taken in
+        _image_source.
+
+        branch_name is the code version the task checks out. Omitting it makes
+        C2Net fail the task with "Fail to load code" (CREATED_FAILED) for every
+        family other than NVIDIA GPU, so when the caller does not pass one we
+        fall back to the repo's default branch. That branch is reported in
+        _branch_name.
         """
         image_source = "explicit"
-        if display_job_name is None:
+        branch_source = "explicit"
+        needs_info = display_job_name is None or not (image_id or image_url) or not branch_name
+        info: Optional[Dict[str, Any]] = None
+        if needs_info:
             info = self.creation_info(job_type, compute_source, cluster, repo=repo)
+        if display_job_name is None and info is not None:
             display_job_name = info.get("display_job_name")
+        if not branch_name:
+            if info is None:
+                info = self.creation_info(job_type, compute_source, cluster, repo=repo)
+            branch_name = info.get("default_branch") or self.default_branch(repo)
+            if branch_name:
+                branch_source = "repo_default_branch"
         if not image_id and not image_url:
-            image_url = DEFAULT_IMAGE_URL
-            image_source = "default_image_url"
+            images = (info or {}).get("images") or []
+            if compute_source.upper() in SOURCES_NEEDING_IMAGE_URL or not images:
+                image_url = DEFAULT_IMAGE_URL
+                image_source = "fallback_image_url"
+            else:
+                verified = VERIFIED_IMAGES.get(str(spec_id))
+                if verified:
+                    image_id = verified["image_id"]
+                    image_name = image_name or verified.get("image_name")
+                    image_source = "verified_image"
+                else:
+                    image_id = images[0].get("image_id")
+                    image_name = image_name or images[0].get("image_name")
+                    image_source = "platform_default_image"
         validate_job_name(display_job_name or "")
         if image_url and not IMAGE_URL_RE.match(image_url):
             raise OpenIError(f"image_url 不是合法的镜像地址: {image_url!r}")
@@ -478,6 +519,8 @@ class OpenIClient:
         if isinstance(result, dict):
             result.setdefault("_request_payload", payload)
             result.setdefault("_image_source", image_source)
+            result.setdefault("_branch_name", payload.get("branch_name"))
+            result.setdefault("_branch_source", branch_source)
         return result
 
 

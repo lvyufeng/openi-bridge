@@ -85,7 +85,7 @@ def openi_list_creation_options(
     创建任务时必须用这里返回的 spec_id。
 
     job_type: DEBUG / TRAIN / INFERENCE / ONLINEINFERENCE / HPC 等。
-    compute_source: GPU / NPU / GCU / MLU / DCU / CPU / ILUVATAR-GPGPU / METAX-GPGPU。
+    compute_source: GPU / NPU / GCU / MLU / DCU / CPU / ILUVATAR-GPGPU / METAX-GPGPU / BIREN-GPU。
     cluster_type: 默认 C2Net（普通用户真实可用的集群）。
     """
     try:
@@ -317,11 +317,35 @@ def openi_list_tasks(page: int = 1, page_size: int = 20) -> str:
 
 @mcp.tool()
 def openi_list_repo_tasks(repo: str) -> str:
-    """列出某个代码仓（owner/name）下的全部计算任务。"""
+    """列出某个代码仓（owner/name）下的全部计算任务。
+
+    优先用仓级接口 /{owner}/{repo}/ai_task；该接口对部分令牌会返回 403，
+    此时退回到账号级 /ai_task/my_list 再按仓名过滤，结果里会带 fallback 标记。
+    """
     try:
         with _client() as client:
-            tasks = client.repo_tasks(repo)
-        return dump({"ok": True, "repo": repo, "tasks": tasks})
+            try:
+                tasks = client.repo_tasks(repo)
+                return dump({"ok": True, "repo": repo, "tasks": tasks})
+            except OpenIError as exc:
+                if exc.status_code != 403:
+                    raise
+                name = repo.split("/")[-1]
+                data = client.list_tasks(page=1, page_size=100)
+                matched = [
+                    item
+                    for item in (data.get("tasks") or [])
+                    if isinstance(item, dict)
+                    and (item.get("repo_alias") in (name, repo) or item.get("repo_name") in (name, repo))
+                ]
+                return dump(
+                    {
+                        "ok": True,
+                        "repo": repo,
+                        "fallback": "repo 级接口返回 403，已用账号级任务列表按仓名过滤",
+                        "tasks": matched,
+                    }
+                )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -398,13 +422,13 @@ def openi_start_task(
     repo: 代码仓 owner/name，任务从该仓的代码运行。
     spec_id: 必填，规格 ID，来自 openi_list_creation_options。
     job_type: DEBUG（交互调试，可开 Jupyter/SSH）/ TRAIN（训练）/ INFERENCE（批量推理）等。
-    compute_source: GPU / NPU / GCU / MLU / DCU / CPU / ILUVATAR-GPGPU / METAX-GPGPU。
+    compute_source: GPU / NPU / GCU / MLU / DCU / CPU / ILUVATAR-GPGPU / METAX-GPGPU / BIREN-GPU。
     cluster: 默认 C2Net（普通用户真实可用的集群）。
     display_job_name: 任务名，留空用平台默认名（必须是小写字母数字，3-36 位）。
     work_server_number: 节点数，默认 1。
     branch_name: 代码分支，留空用仓库默认分支。
-    image_id/image_name: 平台登记的镜像 ID；在 C2Net 上几乎都拉不起来，一般不用。
-    image_url: 镜像地址（place）。留空时用默认镜像，地址见 openi_list_public_images。
+    image_id/image_name: 平台登记的镜像 ID，来自 openi_list_creation_options。留空时优先用实测跑通的镜像（按 spec_id 记录），没有则用平台列出的第一个；NVIDIA GPU 例外，它的登记镜像在 C2Net 上拉不起来，会自动改用 image_url。
+    image_url: 镜像地址（place）。留空时按上面的规则自动选择，地址见 openi_list_public_images。
     boot_file: 启动文件（训练任务需要，例如 train.py）。
     params: 传给启动文件的运行参数。
     dataset_uuid_str / pretrain_model_id_str: 挂载的数据集 UUID / 预训练模型 ID。
