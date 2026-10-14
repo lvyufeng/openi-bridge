@@ -34,21 +34,44 @@ export OPENI_ENDPOINT=https://openi.pcl.ac.cn
 
 ## 在 MCP 客户端里接入
 
-Claude Desktop / Cursor 等支持 stdio MCP 的客户端：
+想在**任意目录**下开 Claude Code / Codex 都能直接用到这些算力工具，分两步：先装一份
+不依赖当前目录的运行时，再把它注册进两个客户端。仓库里带了 `openi_mcp_install`
+（`python -m openi_bridge.install_mcp`）把这些都算好：
+
+~~~bash
+# 1. 装到 ~/.local/share 下的独立 venv（和项目目录解耦，editable 装法改代码即生效）
+python3 -m venv ~/.local/share/openi-bridge/venv
+~/.local/share/openi-bridge/venv/bin/pip install -e /path/to/openi-bridge
+
+# 2. 注册进 Claude Code 和 Codex（先看看会写什么，加 --apply 才真的写）
+~/.local/share/openi-bridge/venv/bin/python -m openi_bridge.install_mcp
+~/.local/share/openi-bridge/venv/bin/python -m openi_bridge.install_mcp --apply
+~~~
+
+`--apply` 会做两件事：往 Codex 的 `config.toml` 写一段 `[mcp_servers.openi-bridge]`
+（改前自动备份成 `config.toml.bak`），以及执行
+`claude mcp add --scope user openi-bridge <绝对路径>`。Codex 读的是
+`$CODEX_HOME/config.toml`（没设就是 `~/.codex/config.toml`），而这台机器上
+`CODEX_HOME` 指向 `~/.codex-tui`，同时又有一份 `~/.codex/config.toml`，所以两份都会
+写到，换个客户端也找得到。两处都只放**启动命令**，不放令牌——运行时从
+`~/.openi/token.json` 读，所以配置里没有明文密钥，换令牌也不用改配置。装完用
+`claude mcp list` / `codex mcp list` 或重启客户端确认（Claude Code 里可以 `/mcp` 查看）。
+
+Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即可：
 
 ~~~json
 {
   "mcpServers": {
     "openi-bridge": {
-      "command": "/绝对路径/openi-bridge/.venv/bin/python",
-      "args": ["-m", "openi_bridge.server"],
-      "env": { "OPENI_TOKEN": "你的令牌" }
+      "command": "/Users/you/.local/share/openi-bridge/venv/bin/openi-bridge",
+      "args": []
     }
   }
 }
 ~~~
 
-Codex / 其他客户端可直接运行 `openi-bridge`（安装后生成的命令）。
+服务本身不读当前工作目录，所以上面这个绝对路径在哪个目录都能用；`OPENI_TOKEN`
+环境变量仍然可以作为兜底，但不再是必需。
 
 ## 怎么开一个任务
 

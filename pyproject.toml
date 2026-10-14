@@ -14,6 +14,7 @@ dependencies = [
 openi-bridge = "openi_bridge.server:main"
 openi-autopoint = "openi_bridge.autopoint:main"
 openi-run-on-card = "openi_bridge.exec_on_card:main"
+openi-mcp-install = "openi_bridge.install_mcp:main"
 
 [build-system]
 requires = ["hatchling"]

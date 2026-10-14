@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any, Optional
 
 from .client import (
@@ -895,10 +896,16 @@ def openi_autopoint_schedule() -> str:
 
 def main() -> None:
     """Entry point used by the openi-bridge console script."""
-    if not os.getenv("OPENI_TOKEN") and not os.path.exists(os.path.expanduser("~/.openi/token.json")):
+    # 诊断信息一律走 stderr：stdout 上跑的是 MCP 的 stdio 协议，混进一行非 JSON
+    # 的文本会直接把客户端的解析弄崩。
+    if not os.getenv("OPENI_TOKEN") and not os.path.exists(
+        os.path.expanduser("~/.openi/token.json")
+    ):
         print(
-            "提示：未检测到 OPENI_TOKEN，工具调用会返回 NO_TOKEN 错误。"
-            "请在 https://openi.pcl.ac.cn/user/settings/applications 生成令牌并设置 OPENI_TOKEN。",
+            "提示：未检测到令牌，工具调用会返回 NO_TOKEN 错误。请在 "
+            "https://openi.pcl.ac.cn/user/settings/applications 生成令牌，"
+            "然后 export OPENI_TOKEN=... 或写入 ~/.openi/token.json。",
+            file=sys.stderr,
         )
     mcp.run("stdio")
 
