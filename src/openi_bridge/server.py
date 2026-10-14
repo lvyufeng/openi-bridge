@@ -18,7 +18,7 @@ from .client import (
     dump,
     summarize_spec,
 )
-from .resources import describe_resources
+from .resources import COMPUTE_SOURCES, describe_resources
 
 try:  # mcp 2.x renamed FastMCP to MCPServer
     from mcp.server.mcpserver import MCPServer as _Server
@@ -123,6 +123,62 @@ def openi_list_creation_options(
             "specs": [summarize_spec(s) for s in specs],
         }
         return dump(result)
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_estimate_runtime(
+    compute_sources: Optional[list[str]] = None,
+    job_type: str = "DEBUG",
+    cluster_type: str = DEFAULT_CLUSTER,
+) -> str:
+    """用当前积分余额估算每个规格还能开多少机时（小时/天）。
+
+    计费规则：消耗积分 = 单价（分/卡时）× 卡数 × 小时数，每 6 分钟结算一次，
+    不足 6 分钟不计费。所以机时按 0.1 小时的整数倍向下取整。单价比对的是
+    openi_list_creation_options 里的实时 unit_price，不是离线目录。
+
+    compute_sources: 要估算的算力类型，默认覆盖全部（GPU / NPU / GCU / MLU /
+        DCU / ILUVATAR-GPGPU / METAX-GPGPU / BIREN-GPU）。
+    """
+    sources = compute_sources or list(COMPUTE_SOURCES)
+    try:
+        balance: Optional[float] = None
+        rows: list[dict[str, Any]] = []
+        for source in sources:
+            with _client() as client:
+                info = client.creation_info(job_type=job_type, compute_source=source, cluster_type=cluster_type)
+            if balance is None:
+                balance = ((info.get("point_account") or {}).get("balance"))
+            for spec in ((info.get("specs") or {}).get("all")) or []:
+                slim = summarize_spec(spec)
+                price = slim.get("price_per_card_hour")
+                row = {
+                    "compute_source": source,
+                    "spec_id": slim.get("spec_id"),
+                    "card_type": slim.get("card_type"),
+                    "card_count": slim.get("card_count"),
+                    "price_per_hour": price,
+                }
+                if balance is not None and price:
+                    blocks = int(balance // (price * 0.1))  # 每块 6 分钟
+                    hours = round(blocks * 0.1, 1)
+                    row["hours"] = hours
+                    row["days"] = round(hours / 24, 1)
+                    row["blocks_of_6min"] = blocks
+                rows.append(row)
+        return dump(
+            {
+                "ok": True,
+                "balance": balance,
+                "job_type": job_type,
+                "cluster_type": cluster_type,
+                "billing": "积分 = 单价(分/卡时) × 卡数 × 小时；每 6 分钟结算，不足 6 分钟不计费。",
+                "note": "hours/days 已按 6 分钟向下取整；CPU 没有可用规格所以不在列表里。",
+                "estimates": rows,
+            }
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -546,4 +602,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

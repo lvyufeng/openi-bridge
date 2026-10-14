@@ -117,6 +117,7 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 | openi_whoami | 查看令牌对应的账号，确认令牌可用 |
 | openi_list_resources | 列出集群、卡型、积分单价与计费规则（离线目录） |
 | openi_list_creation_options | 列出当前账号实时可开的规格（含 spec_id）与镜像、余额 |
+| openi_estimate_runtime | 按当前积分余额估算每个规格还能开多少机时（小时/天，已按 6 分钟向下取整） |
 | openi_list_images_for_spec | 查询某个 spec 可用的镜像（C2Net 上通常为空） |
 | openi_list_public_images | 列出可真正拉起的公共镜像地址（平台推荐 + 自己收藏） |
 | openi_list_my_repositories | 列出自己的代码仓（创建任务要指定代码仓） |
@@ -143,6 +144,11 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 - 积分余额和明细见 https://openi.pcl.ac.cn/reward/point 。
 - 同一作业类型同时只能有一个运行/排队中的任务（新建前先停止旧任务）。
 - 任务名以小写字母或数字开头，只能包含小写字母、数字、`_` 和 `-`，不能以 `_` 结尾，最长 36 字符。
+
+想知道余额还能开多久，直接调 `openi_estimate_runtime`：它会用实时的 `unit_price`
+和当前余额，按“每 6 分钟向下取整”的口径算出每个 `spec_id` 还能开多少小时/天。
+例如余额 4891.8 分时，单卡 V100（spec 210，6 分/卡时）约 815 小时，单卡 910A
+（spec 328，2 分/卡时）约 2445 小时，910C（spec 392，8 分/卡时）约 611 小时。
 
 ## 实现说明与已知限制
 
