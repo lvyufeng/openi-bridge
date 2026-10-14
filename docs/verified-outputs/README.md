@@ -15,5 +15,9 @@
 | `iluvatar-mrv100-task-000000.txt` | 天数智芯 GPGPU | 388 | 000000 | `ixsmi`：Iluvatar MR-V100，32768 MiB，IX-ML 驱动 4.4.0 |
 | `biren106m-task-000000.txt` | 壁仞 GPU | 347 | 000000 | `brsmi`：Biren106M，32512 MiB，BR-SMI 1.10.1 / SUPA 1.10 |
 
-`METAX-GPGPU`（沐曦 C500，spec 333）没有输出：2026-10-14 的 7 次 DEBUG 任务全部停在
-`centerPending` 排队，从未调度到卡，因此没有可抓取的 SMI 输出。
+`METAX-GPGPU`（沐曦 C500，spec 333）没有输出。2026-10-14 连续 9 次 DEBUG 任务都没
+调度到卡，而且失败方式不一致：前 7 次（含 000000、000000）一直停在 `centerPending`
+排队，第 8 次（000000）在 `PREPARING` 约 2 分钟后变成 `CREATED_FAILED`，第 9 次
+（000000）同样在 `PREPARING` 停留约 2 分 14 秒后 `CREATED_FAILED`、日志为空。
+任务详情里的 `ai_center_code` 是 `openi-mlu`，即这个 `compute_source` 被路由到的
+其实是寒武纪那套中心，看不出存在真正的沐曦 C500 资源池，所以至今没有可抓取的 SMI 输出。

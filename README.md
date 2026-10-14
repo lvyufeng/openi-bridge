@@ -272,5 +272,5 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 - 账号级任务列表用的是 `/ai_task/my_list`，它在平台前端真实存在，但字段较少；更完整的信息用 `openi_get_task`。
 - 镜像：只有 NVIDIA GPU 的登记 `image_id` 在 C2Net 上拉不起来（`image not available`），工具对 GPU 会改用 `OPENI_DEFAULT_IMAGE_URL` 并把镜像地址作为 `image_url` 传下去；其余算力的 `image_id` 可直接使用。
 - `branch_name`：除 NVIDIA GPU 外的算力在创建时都需要它，缺失会以 `Fail to load code`（`CREATED_FAILED`）失败；工具默认取代码仓的默认分支。
-- 可用性：`GPU` / `NPU` / `GCU` / `MLU` / `DCU` / `ILUVATAR-GPGPU` / `BIREN-GPU` 都已开卡验证（见上面的“实测可用的算力”）；`METAX-GPGPU` 有规格但实测时集群排队未跑到卡；`CPU` 是唯一拿不到规格的 `compute_source`。
+- 可用性：`GPU` / `NPU` / `GCU` / `MLU` / `DCU` / `ILUVATAR-GPGPU` / `BIREN-GPU` 都已开卡验证（见上面的“实测可用的算力”）；`METAX-GPGPU`（沐曦 C500，spec 333）有规格但从未调度到卡——连续 9 次 DEBUG 任务里 7 次卡在 `centerPending`、2 次 `CREATED_FAILED`，且任务详情里的 `ai_center_code` 是 `openi-mlu`，看起来没有真正的沐曦资源池；`CPU` 是唯一拿不到规格的 `compute_source`。
 
