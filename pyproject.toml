@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 openi-bridge = "openi_bridge.server:main"
+openi-autopoint = "openi_bridge.autopoint:main"
 
 [build-system]
 requires = ["hatchling"]

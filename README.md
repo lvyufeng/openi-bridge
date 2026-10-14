@@ -120,6 +120,9 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 | openi_estimate_runtime | 按当前积分余额估算每个规格还能开多少机时（小时/天，已按 6 分钟向下取整） |
 | openi_points | 查看积分余额、单日获取上限与平台公布的完整获取规则 |
 | openi_points_history | 查看积分流水（获取/消耗明细，10 条一页，按天汇总） |
+| openi_points_today | 看今天（北京时间）已经拿到多少分、算力那 10 分还在不在、还剩哪些每日项 |
+| openi_claim_daily_points | 需要时自动跑一遍"开任务→RUNNING→停止→删除"，把当天 10 分算力积分拿到，净消耗 0 分 |
+| openi_autopoint_schedule | 生成 launchd plist 与 crontab 配置，把上面这条挂成每日定时任务 |
 | openi_list_images_for_spec | 查询某个 spec 可用的镜像（C2Net 上通常为空） |
 | openi_list_public_images | 列出可真正拉起的公共镜像地址（平台推荐 + 自己收藏） |
 | openi_list_my_repositories | 列出自己的代码仓（创建任务要指定代码仓） |
@@ -177,6 +180,51 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 历史上积分的大头来自打榜活动和“众智开发支持”这类人工发放，单笔 1000~3000 分。
 
 余额、每日上限和「一次性奖励有没有领过」用 `openi_points` 看，流水用 `openi_points_history`。
+
+## 自动获取积分
+
+上面那张表里，只有「每日运行计算任务」这 10 分是纯算力侧的行为，可以放心自动化；
+其余每日项（commit、PR、Issue、评论、建公开项目、建数据集/模型/镜像）都是仓库与社交
+行为，平台明确把重复建公开项目、发空评论后删除当成刷分并追回积分，不值得为此冒险。
+
+这 10 分可以零成本拿到，依据是两条实测结论：
+
+- 计费每 6 分钟一档、不足 6 分钟不计费（官方文档 `docs/quickstart/resources.md`）。
+  翻完账号 182 条消耗流水，1 分/卡时的卡最小的一笔正好是 0.2 分（两个计费单位），
+  从来没有出现过 0.1 分，说明第一笔扣费发生在第 6 分钟。
+- 一天之内多次开任务只有第一次给分。翻完 404 条获取流水，185 条
+  `CreateCloudbrainTask` 分布在 185 个不同的自然日，没有任何一天拿到两次。
+
+所以每天只要跑一个「建任务 → 等 RUNNING → 立刻停止并删除」的循环就够了，当天净赚
+10 分、算力消耗 0 分；这 10 分换成最便宜的 1 分/卡时算力，正好覆盖当天 10 卡时的用量。
+
+`openi_claim_daily_points` 就是这个循环，也可以直接在命令行跑：
+
+~~~bash
+python -m openi_bridge.autopoint --status    # 只看今天拿了多少分
+python -m openi_bridge.autopoint --dry-run   # 打印计划，不动算力
+python -m openi_bridge.autopoint             # 没拿到就补一次
+python -m openi_bridge.autopoint --reap      # 回收遗留的 autopoint-* 任务
+~~~
+
+默认用已实测能拉起的 1 分/卡时规格（燧原 T20 spec 229、寒武纪 MLU290 spec 184、
+天数 MR-V100 spec 388、壁仞 BIREN106M spec 347），代码仓取账号下第一个非空仓库，
+可用 `--repo` / `--source` 或环境变量 `OPENI_AUTOPOINT_REPO` / `OPENI_AUTOPOINT_SOURCE`
+指定。排队和 `PREPARING` 不计费，所以等 RUNNING 可以等久一点（默认 900 秒）；
+一旦发现 RUNNING 就立即停止，实际运行只有几秒。脚本带兜底：无论失败还是被中断，
+都会在 `finally` 里停掉并删除刚建的任务。
+
+挂成每日定时任务（`openi_autopoint_schedule` 会直接返回下面这些内容）：
+
+~~~bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/cn.openi.autopoint.plist
+# 或
+crontab -e
+5 9 * * * cd /path/to/openi-bridge && .venv/bin/python -m openi_bridge.autopoint --json >> ~/.openi/autopoint.log 2>&1
+*/30 * * * * cd /path/to/openi-bridge && .venv/bin/python -m openi_bridge.autopoint --reap >> ~/.openi/autopoint.log 2>&1
+~~~
+
+第二条是兜底：万一某次跑崩了，半小时内也会把 `autopoint-*` 任务停掉删掉。
 
 ## 实现说明与已知限制
 

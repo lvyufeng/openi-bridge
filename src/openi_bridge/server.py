@@ -18,6 +18,7 @@ from .client import (
     dump,
     summarize_spec,
 )
+from . import autopoint
 from .resources import COMPUTE_SOURCES, POINT_ACTIONS, POINT_NOTES, describe_resources
 
 try:  # mcp 2.x renamed FastMCP to MCPServer
@@ -261,9 +262,7 @@ def openi_points_history(operate: str = "INCREASE", pages: int = 1) -> str:
             ts = rec.get("LastOperateDate")
             day = None
             if ts:
-                import datetime
-
-                day = datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).strftime("%Y-%m-%d")
+                day = autopoint.beijing_day(ts)
                 per_day[day] = per_day.get(day, 0.0) + amount
             source = rec.get("SourceTemplateId") or rec.get("SourceType") or "(其他)"
             entry = per_source.setdefault(source, {"count": 0.0, "points": 0.0})
@@ -698,6 +697,150 @@ def openi_sdk_code(job_type: str = "DEBUG", compute_source: str = "GPU", visuali
             )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
+
+
+@mcp.tool()
+def openi_points_today() -> str:
+    """看今天（北京时间）已经拿到多少积分、还剩哪些没拿。
+
+    返回今天的获取流水、当天的算力 10 分是否已到账，以及规则里"每日"类项目的
+    完成情况。平台的每日结算以北京时间 0 点为界。
+    """
+    try:
+        with _client() as client:
+            status = autopoint.daily_status(client)
+            config = client.points_rules()
+        rules = config.get("TaskRules") or []
+        reward = next((r for r in rules if r.get("TaskCode") == autopoint.REWARD_ACTION), {})
+        earned_codes = set(status.get("today_actions") or [])
+        pending_daily = []
+        for rule in rules:
+            if rule.get("RefreshRate") != "DAILY":
+                continue
+            code = rule.get("TaskCode")
+            if code not in earned_codes:
+                pending_daily.append(
+                    {
+                        "action": POINT_ACTIONS.get(code, code),
+                        "task_code": code,
+                        "points_per_cycle": float(rule.get("AwardAmount") or 0)
+                        * float(rule.get("LimitNum") or 0),
+                    }
+                )
+        pending_daily.sort(key=lambda row: -row["points_per_cycle"])
+        return dump(
+            {
+                "ok": True,
+                **status,
+                "compute_reward_points": float(reward.get("AwardAmount") or 0),
+                "pending_daily_actions": pending_daily,
+                "automation": {
+                    "automated_action": POINT_ACTIONS.get(autopoint.REWARD_ACTION),
+                    "how": "openi_claim_daily_points 会在需要时开一个 1 分/卡时的 DEBUG 任务，"
+                    "进入 RUNNING 后立即停止并删除；不足 6 分钟不计费，所以当天净赚 10 分、"
+                    "算力消耗 0 分。其余每日项（commit/PR/issue/评论/建仓建数据集等）属于"
+                    "仓库与社交行为，平台对重复公开项目、空评论等按刷分处理，不做自动化。",
+                },
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_claim_daily_points(
+    repo: Optional[str] = None,
+    compute_source: Optional[str] = None,
+    job_type: str = "DEBUG",
+    timeout: Optional[float] = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> str:
+    """自动领取当天的 10 分算力积分（"每日运行计算任务"）。
+
+    流程：确认今天还没拿到 → 挑一个 1 分/卡时的规格（默认 GCU ENFLAME-T20，实测能拉起）
+    → 建任务 → 等它进入 RUNNING → 立刻停止并删除。计费按 6 分钟一档、不足 6 分钟不计费，
+    所以这一步当天净赚 10 分、算力消耗 0 分，同时也覆盖了当天 10 卡时的用量。
+
+    一天内多次开任务只有第一次给分（已核 185 条历史流水，没有任何一天拿到两次），
+    所以每天跑一次即可，重复调用会直接跳过。
+
+    repo: 代码仓 owner/name，留空自动选账号下第一个非空仓库。
+    compute_source: 指定算力类型（GCU/MLU/ILUVATAR-GPGPU/BIREN-GPU），留空自动挑最便宜的。
+    timeout: 等 RUNNING 的最长秒数，默认 900；排队不计费，可以等久一点。
+    dry_run: 只报告将要创建什么，不真的建任务。
+    force: 即使今天已经拿到也照常跑一遍，用来验证链路。
+
+    注意：这个调用会阻塞到任务跑完（正常 1-5 分钟，最长 timeout），期间不要重复调用。
+    """
+    try:
+        with _client() as client:
+            report = autopoint.claim_daily_points(
+                client,
+                repo=repo,
+                job_type=job_type,
+                compute_source=compute_source,
+                timeout=timeout,
+                dry_run=dry_run,
+                force=force,
+            )
+        return dump(report)
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_autopoint_schedule() -> str:
+    """给出把"每日自动领积分"挂到系统定时任务上的现成配置。
+
+    返回 launchd（macOS）plist 与 crontab（Linux/macOS）两套写法，以及对应的
+    命令路径（就是当前这个 Python 解释器）。把 plist 存到
+    ~/Library/LaunchAgents/cn.openi.autopoint.plist 后 `launchctl load` 即可。
+    """
+    import sys
+
+    python = sys.executable
+    cwd = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    log = os.path.expanduser("~/Library/Logs/openi-autopoint.log")
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>cn.openi.autopoint</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{python}</string>
+    <string>-m</string>
+    <string>openi_bridge.autopoint</string>
+    <string>--json</string>
+  </array>
+  <key>WorkingDirectory</key><string>{cwd}</string>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+"""
+    cron = (
+        f"5 9 * * * cd {cwd} && {python} -m openi_bridge.autopoint --json >> ~/.openi/autopoint.log 2>&1\n"
+        f"*/30 * * * * cd {cwd} && {python} -m openi_bridge.autopoint --reap >> ~/.openi/autopoint.log 2>&1"
+    )
+    return dump(
+        {
+            "ok": True,
+            "python": python,
+            "working_directory": cwd,
+            "plist_path": "~/Library/LaunchAgents/cn.openi.autopoint.plist",
+            "launchd_plist": plist,
+            "cron_lines": cron,
+            "notes": [
+                "令牌走 ~/.openi/token.json 或 OPENI_TOKEN，plist 里不用再塞令牌。",
+                "第二条 cron 是兜底：万一某次跑崩了，半小时内也会把 autopoint-* 任务停掉删掉。",
+                "手动跑一次验证：python -m openi_bridge.autopoint --status",
+            ],
+        }
+    )
 
 
 def main() -> None:
