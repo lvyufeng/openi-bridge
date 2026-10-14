@@ -7,11 +7,13 @@ requires-python = ">=3.10"
 dependencies = [
   "mcp>=1.9.0",
   "httpx>=0.27.0",
+  "websocket-client>=1.6.0",
 ]
 
 [project.scripts]
 openi-bridge = "openi_bridge.server:main"
 openi-autopoint = "openi_bridge.autopoint:main"
+openi-run-on-card = "openi_bridge.exec_on_card:main"
 
 [build-system]
 requires = ["hatchling"]

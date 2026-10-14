@@ -18,7 +18,7 @@ from .client import (
     dump,
     summarize_spec,
 )
-from . import autopoint
+from . import autopoint, exec_on_card
 from .resources import COMPUTE_SOURCES, POINT_ACTIONS, POINT_NOTES, describe_resources
 
 try:  # mcp 2.x renamed FastMCP to MCPServer
@@ -783,6 +783,56 @@ def openi_claim_daily_points(
                 timeout=timeout,
                 dry_run=dry_run,
                 force=force,
+            )
+        return dump(report)
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_run_on_card(
+    code: str,
+    compute_source: Optional[str] = None,
+    spec_id: Optional[int] = None,
+    repo: Optional[str] = None,
+    job_type: str = "DEBUG",
+    wait_seconds: float = 900.0,
+    exec_timeout: float = 300.0,
+    keep: bool = False,
+) -> str:
+    """在启智云脑的一张卡上直接跑一段 Python 代码，把 stdout 拿回来。
+
+    平台没有 SSH，DEBUG 任务唯一的交互入口是它自带的 JupyterLab。这个工具会：
+    挑代码仓和规格（默认最便宜的，通常是 1 分/卡时的 GCU ENFLAME-T20）→ 建 DEBUG
+    任务 → 等 RUNNING → 取 debug_url → 连它的内核执行 code → 收 stdout → 停掉并删除任务。
+
+    计费的只有 RUNNING 那段时间，不足 6 分钟不计费，所以跑个 print、查个
+    npu-smi/nvidia-smi、测一下 torch.cuda.is_available() 这类短探测通常净消耗 0 分。
+
+    code: 要执行的 Python 代码（可以用 "!cmd" 跑 shell）。
+    compute_source: 算力类型，如 GCU/MLU/NPU/GPU/DCU/ILUVATAR-GPGPU/METAX-GPGPU/BIREN-GPU。
+    spec_id: 指定规格 id（优先于 compute_source），先用 openi_list_creation_options 查。
+    repo: 代码仓 owner/name，留空自动选账号下第一个非空仓库。
+    wait_seconds: 等 RUNNING 的最长秒数，默认 900；排队不计费，可以等久一点。
+    exec_timeout: 单段代码执行上限秒数，默认 300。
+    keep: 跑完保留任务（不删），返回 Jupyter 地址供手动继续用；默认跑完即清理。
+    返回报告里的 result.stdout 就是代码的输出。
+
+    注意：这个调用会阻塞到跑完（正常几十秒到几分钟）；同时只能有 1 个 running
+    DEBUG 任务，保留任务（keep=True）会挡住其他任务创建。
+    """
+    try:
+        with _client() as client:
+            report = exec_on_card.run_on_card(
+                client,
+                code,
+                repo=repo,
+                spec_id=spec_id,
+                compute_source=compute_source,
+                job_type=job_type,
+                wait_seconds=wait_seconds,
+                exec_timeout=exec_timeout,
+                keep=keep,
             )
         return dump(report)
     except Exception as exc:  # noqa: BLE001

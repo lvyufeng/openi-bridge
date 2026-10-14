@@ -58,6 +58,9 @@ FREE_WINDOW_SECONDS = 6 * 60
 # 自动化创建的任务统一用这个前缀命名，方便只回收自己留下的任务。
 TASK_NAME_PREFIX = "autopoint"
 
+# 在卡上跑代码（exec_on_card）建的任务用这个前缀，回收时一并处理。
+EXEC_TASK_PREFIX = "openixec"
+
 # 1 分/卡时的规格，按"已经用真实镜像在 C2Net 上拉起过"的顺序优先尝试。
 PREFERRED_SPECS: Sequence[tuple[str, int]] = (
     ("GCU", 229),  # ENFLAME-T20
@@ -179,7 +182,7 @@ def reap_leftovers(client: OpenIClient) -> List[Dict[str, Any]]:
     reaped = []
     for task in _active_tasks(client):
         name = (task.get("display_job_name") or "")
-        if name.startswith(TASK_NAME_PREFIX):
+        if name.startswith(TASK_NAME_PREFIX) or name.startswith(EXEC_TASK_PREFIX):
             reaped.append(_stop_and_delete(client, task.get("id")))
     return reaped
 
@@ -256,6 +259,55 @@ def _pick_repo(client: OpenIClient, repo: Optional[str] = None) -> Optional[str]
 
 
 # ----------------------------------------------------------------------- loop
+
+
+def launch_and_wait(
+    client: OpenIClient,
+    repo: str,
+    spec: Dict[str, Any],
+    wait_seconds: float,
+    name_prefix: str = TASK_NAME_PREFIX,
+    job_type: str = "DEBUG",
+) -> Dict[str, Any]:
+    """建任务并等它进入 RUNNING。
+
+    调用方负责清理（正常路径和异常路径都要停删）。排队与 PREPARING 不计费，
+    所以等待时间可以给得比 6 分钟长；一旦 RUNNING 就应该尽快停掉。
+    """
+    started = time.monotonic()
+    name = f"{name_prefix}-{datetime.now(BEIJING).strftime('%H%M%S')}"
+    created = client.create_task(
+        repo=repo,
+        spec_id=spec["spec_id"],
+        compute_source=spec["compute_source"],
+        cluster=spec["cluster"],
+        job_type=job_type,
+        display_job_name=name,
+    )
+    task_id = created.get("id") or created.get("task_id") or created.get("Id")
+    report: Dict[str, Any] = {
+        "task_id": task_id,
+        "task_name": name,
+        "create_response": created,
+        "reached_running": False,
+        "status": None,
+    }
+    if not task_id:
+        report["error"] = "创建任务后没有拿到任务 ID"
+        return report
+    deadline = started + wait_seconds
+    while time.monotonic() < deadline:
+        brief = client.task_brief(task_id)
+        status = (brief.get("status") or "").upper()
+        report["status"] = status
+        if status in RUNNING_STATUSES:
+            report["reached_running"] = True
+            break
+        if status in ENDED_STATUSES:
+            break
+        time.sleep(3)
+    report["seconds"] = round(time.monotonic() - started, 1)
+    return report
 
 
 def claim_daily_points(

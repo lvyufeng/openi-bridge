@@ -123,6 +123,7 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 | openi_points_today | 看今天（北京时间）已经拿到多少分、算力那 10 分还在不在、还剩哪些每日项 |
 | openi_claim_daily_points | 需要时自动跑一遍"开任务→RUNNING→停止→删除"，把当天 10 分算力积分拿到，净消耗 0 分 |
 | openi_autopoint_schedule | 生成 launchd plist 与 crontab 配置，把上面这条挂成每日定时任务 |
+| openi_run_on_card | 在云脑的一张卡上直接跑一段代码：建 DEBUG 任务 → 连它的 Jupyter 内核执行 → 收 stdout → 清理 |
 | openi_list_images_for_spec | 查询某个 spec 可用的镜像（C2Net 上通常为空） |
 | openi_list_public_images | 列出可真正拉起的公共镜像地址（平台推荐 + 自己收藏） |
 | openi_list_my_repositories | 列出自己的代码仓（创建任务要指定代码仓） |
@@ -225,6 +226,32 @@ crontab -e
 ~~~
 
 第二条是兜底：万一某次跑崩了，半小时内也会把 `autopoint-*` 任务停掉删掉。
+
+## 在卡上跑代码
+
+平台没有给 SSH，也不接受批处理脚本，DEBUG 任务唯一稳定的交互入口是它自带的
+JupyterLab。`openi_run_on_card` 把这条路补上：取 `debug_url` 里带 token 的地址，
+走 Jupyter 的 REST 建内核，再连它的内核 WebSocket 发 `execute_request`，把 stdout、
+返回值、异常收回来，最后无论成功失败都在 `finally` 里停掉并删除任务。
+
+~~~bash
+python -m openi_bridge.exec_on_card --code "print(1+1)"
+python -m openi_bridge.exec_on_card --source GCU --code "!efsmi"
+python -m openi_bridge.exec_on_card --spec-id 184 --script probe.py --exec-timeout 600
+python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_available())" --keep
+~~~
+
+代码里可以用 `!cmd` 跑 shell，所以查厂商的 smi（`efsmi` / `npu-smi info` /
+`cnmon` / `ixsmi` / `mx-smi` / `brsmi` / `hy-smi`）或者 `nvidia-smi` 都是一行的事。
+默认挑最便宜的规格（1 分/卡时的 GCU ENFLAME-T20），用 `--source` / `--spec-id`
+换别的卡；代码仓默认取账号下第一个非空仓库，用 `--repo` 或 `OPENI_EXEC_REPO` 指定。
+
+计费的只有任务 RUNNING 的那段时间，而不足 6 分钟不计费，所以跑个 print、查个 smi
+这类几秒的探测净消耗 0 分——实测在 GCU spec 229 上建任务、跑 `efsmi`、删除，
+余额前后都是 4891.8 分。真正的成本是排队时间：实测这次从 create 到 RUNNING 等了
+216 秒（排队不计费）。要长时间跑就用 `--keep` 保留任务，报告里会给出 Jupyter 地址，
+用完自己停掉删除，否则会持续计费；`autopoint --reap` 也会顺带回收遗留的
+`openixec-*` 任务。
 
 ## 实现说明与已知限制
 
