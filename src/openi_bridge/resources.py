@@ -95,7 +95,7 @@ VERIFIED_IMAGES: dict[str, dict[str, str]] = {
     },
     "342": {  # DCU K100_AI
         "image_id": "471f9d39e02e4e73ae4639b78d9e229f",
-        "image_name": "dtk26.04",
+        "image_name": "jupyterlab-pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.11-devel",
     },
     "388": {  # ILUVATAR-GPGPU MR-V100
         "image_id": "fc19818a89cf4f7ba9a220b1c9d158dc",
@@ -108,8 +108,9 @@ VERIFIED_IMAGES: dict[str, dict[str, str]] = {
 }
 
 
-# 逐个算力厂商开 DEBUG 任务、在容器里跑该厂商自带的 SMI 得到的实测结果（2026-10）。
-# 用来证明这些卡不是“只有 CPU”，每一行都有任务内真实命令输出作为依据。
+# 逐个算力厂商开 DEBUG 任务、在容器里跑该厂商自带 SMI 的实测结果（2026-10）。
+# 每行的 evidence 都来自该任务 Jupyter 里的真实命令输出，task_id 是当时的任务号，
+# 用来证明这些卡不是“只有 CPU”。
 VERIFIED_ACCELERATORS: list[dict[str, object]] = [
     {
         "compute_source": "GPU",
@@ -117,27 +118,39 @@ VERIFIED_ACCELERATORS: list[dict[str, object]] = [
         "card": "NVIDIA Tesla V100S-PCIE-32GB",
         "smi": "nvidia-smi",
         "evidence": "32768 MiB，驱动 570.124.06，CUDA 12.8",
-    },
-    {
-        "compute_source": "NPU",
-        "spec_id": 389,
-        "card": "华为昇腾 910B2",
-        "smi": "npu-smi info",
-        "evidence": "64 GB HBM，aarch64，npu-smi 25.2.1",
+        "task_id": 903467,
     },
     {
         "compute_source": "NPU",
         "spec_id": 328,
         "card": "华为昇腾 910ProA（910A）",
         "smi": "npu-smi info",
-        "evidence": "HBM 32768 MB，aarch64，npu-smi 24.1.0",
+        "evidence": "NPU 6，HBM 32768 MB，npu-smi 24.1.0，aarch64",
+        "task_id": 903423,
+    },
+    {
+        "compute_source": "NPU",
+        "spec_id": 389,
+        "card": "华为昇腾 910B2",
+        "smi": "npu-smi info",
+        "evidence": "NPU 3，HBM 65536 MB，npu-smi 25.2.1，aarch64",
+        "task_id": 903434,
+    },
+    {
+        "compute_source": "NPU",
+        "spec_id": 392,
+        "card": "华为昇腾 910C（ASCEND-910C）",
+        "smi": "npu-smi info",
+        "evidence": "NPU 3/1（双芯），每芯 HBM 65536 MB，npu-smi 26.0.rc3",
+        "task_id": 903468,
     },
     {
         "compute_source": "GCU",
         "spec_id": 229,
         "card": "燧原 Enflame T20",
         "smi": "efsmi",
-        "evidence": "32 G 显存，efsmi V1.21.0",
+        "evidence": "32 G 显存，EFSMI V1.21.0，驱动 2.5.20231219",
+        "task_id": 903437,
     },
     {
         "compute_source": "MLU",
@@ -145,20 +158,23 @@ VERIFIED_ACCELERATORS: list[dict[str, object]] = [
         "card": "寒武纪 MLU290-M5",
         "smi": "cnmon",
         "evidence": "32768 MiB，CNMON v4.20.16",
+        "task_id": 903221,
     },
     {
         "compute_source": "DCU",
         "spec_id": 342,
         "card": "海光 DCU (K100_AI)",
         "smi": "hy-smi / rocm-smi",
-        "evidence": "HCU，PwrCap 400W，DTK 环境",
+        "evidence": "HCU，PwrCap 400W，hy-smi 与 rocm-smi 输出一致",
+        "task_id": 903223,
     },
     {
         "compute_source": "ILUVATAR-GPGPU",
         "spec_id": 388,
         "card": "天数智芯 Iluvatar MR-V100",
         "smi": "ixsmi",
-        "evidence": "32768 MiB，驱动 4.4.0，CUDA 10.2",
+        "evidence": "32768 MiB，IX-ML 驱动 4.4.0，CUDA 10.2",
+        "task_id": 903225,
     },
     {
         "compute_source": "BIREN-GPU",
@@ -166,6 +182,7 @@ VERIFIED_ACCELERATORS: list[dict[str, object]] = [
         "card": "壁仞 Biren106M",
         "smi": "brsmi",
         "evidence": "32512 MiB，400W，BR-SMI 1.10.1 / SUPA 1.10",
+        "task_id": 903439,
     },
 ]
 

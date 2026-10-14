@@ -88,21 +88,24 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 
 ## 实测可用的算力
 
-下面的结论来自逐个算力厂商开 DEBUG 任务、在容器里跑该厂商自带 SMI 的真实输出（2026-10）：
+下面的结论来自逐个算力厂商开 DEBUG 任务、在容器里跑该厂商自带 SMI 的真实输出（2026-10）。
+每行都标了当时实测用的任务号，可以在平台上直接查：
 
-| 算力类型 | 实测卡型 | 验证命令 |
-| --- | --- | --- |
-| GPU | NVIDIA Tesla V100S-PCIE-32GB（32768 MiB，驱动 570.124.06，CUDA 12.8） | `nvidia-smi` |
-| NPU | 华为昇腾 910B2（64 GB HBM，npu-smi 25.2.1） | `npu-smi info` |
-| NPU | 华为昇腾 910ProA / 910A（HBM 32768 MB，npu-smi 24.1.0） | `npu-smi info` |
-| GCU | 燧原 Enflame T20（32 G，efsmi V1.21.0） | `efsmi` |
-| MLU | 寒武纪 MLU290-M5（32768 MiB，CNMON v4.20.16） | `cnmon` |
-| DCU | 海光 DCU / K100_AI（HCU，PwrCap 400W） | `hy-smi`、`rocm-smi` |
-| ILUVATAR-GPGPU | 天数智芯 Iluvatar MR-V100（32768 MiB，驱动 4.4.0） | `ixsmi` |
-| BIREN-GPU | 壁仞 Biren106M（32512 MiB，400W，SUPA 1.10） | `brsmi` |
+| 算力类型 | 实测卡型 | 验证命令 | 实测任务号 |
+| --- | --- | --- | --- |
+| GPU | NVIDIA Tesla V100S-PCIE-32GB（32768 MiB，驱动 570.124.06，CUDA 12.8） | `nvidia-smi` | 000000 |
+| NPU | 华为昇腾 910B2（HBM 65536 MB，npu-smi 25.2.1，aarch64） | `npu-smi info` | 000000 |
+| NPU | 华为昇腾 910ProA / 910A（HBM 32768 MB，npu-smi 24.1.0，aarch64） | `npu-smi info` | 000000 |
+| NPU | 华为昇腾 910C（双芯，每芯 HBM 65536 MB，npu-smi 26.0.rc3） | `npu-smi info` | 000000 |
+| GCU | 燧原 Enflame T20（32 G 显存，EFSMI V1.21.0，驱动 2.5.20231219） | `efsmi` | 000000 |
+| MLU | 寒武纪 MLU290-M5（32768 MiB，CNMON v4.20.16） | `cnmon` | 000000 |
+| DCU | 海光 DCU / K100_AI（HCU，PwrCap 400W） | `hy-smi`、`rocm-smi` | 000000 |
+| ILUVATAR-GPGPU | 天数智芯 Iluvatar MR-V100（32768 MiB，IX-ML 驱动 4.4.0） | `ixsmi` | 000000 |
+| BIREN-GPU | 壁仞 Biren106M（32512 MiB，400W，BR-SMI 1.10.1 / SUPA 1.10） | `brsmi` | 000000 |
 
-也就是说，除了纯 CPU，这些算力都能真正开到卡。`METAX-GPGPU`（沐曦 C500）平台上有可用规格，
-但这次实测时集群一直排队（`centerPending`），没能跑到卡，所以上表里没有它；
+也就是说，除了纯 CPU，这些算力都能真正开到卡。`METAX-GPGPU`（沐曦 C500）平台上有可用规格
+（`spec_id=333`），但 2026-10-13 23:00 到 2026-10-14 09:00 之间反复创建了 6 次 DEBUG 任务，
+每次都卡在 `centerPending`（示例任务 000000），一次都没调度到卡，所以上表里没有它；
 `openi_list_creation_options(compute_source=...)` 里没有规格（spec）的只有 `CPU`。
 
 ## 提供的工具
