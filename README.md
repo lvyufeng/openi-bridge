@@ -3,7 +3,8 @@
 一个 MCP（Model Context Protocol）服务，让你在 Claude Code / Codex 里用一句话就用上
 [OpenI 启智社区](https://openi.pcl.ac.cn)的普惠算力：查余额和积分、看当前能开哪些规格
 （spec）和镜像、选代码仓、创建/停止/重启/删除计算任务、读任务状态与日志，以及直接在
-云脑的一张卡上跑一段代码。
+云脑的一张卡上跑一段代码。也可以就地创建数据集和模型库，把本地文件（数据集、ckpt
+权重等）直接传上去，再把返回的 UUID 挂到计算任务里。
 
 > www.openi.org.cn 只是社区门户网站，真正的算力平台是
 > [openi.pcl.ac.cn](https://openi.pcl.ac.cn)（启智 AI 协作平台），本工具对接的是后者。
@@ -98,6 +99,28 @@ Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即�
 “开张 GCU 跑一下 `efsmi`”。助手调 `openi_run_on_card`，建任务、连 Jupyter 内核执行、
 把 stdout 带回来、顺手清理，全过程你不用管任务 ID。
 
+**传数据集和 ckpt。** “把 `./data` 传成一个数据集叫 `my-corpus`”，“把这个 20G 的
+`ckpt/` 传到模型库 `llama-ft` 下”。助手先用 `openi_create_dataset` /
+`openi_create_model` 建库（库名固定的 `当前账号/name` 形式），再用
+`openi_upload_dataset_files` / `openi_upload_model_files` 传文件——小文件走直传、
+超过 64MB 自动按 64MB 分片续传。传完返回里的 UUID 直接就是 `openi_start_task` 的
+`dataset_uuid_str` / `pretrain_model_id_str`。“这个数据集还剩多少空间”用
+`openi_storage_usage` 看。传文件时最好给绝对路径——`paths` 相对的是 MCP 服务进程的
+工作目录，不一定是当前对话所在的目录。
+
+**用平台上现成的东西。** “OpenI 上有没有能直接用的 llama 权重？”“给我找个图像分类的
+数据集，拉到本地看看”。助手用 `openi_search_models` / `openi_search_datasets` 搜平台
+托管的模型与数据集（关键词、类别、任务、按下载量/收藏数排序、只看官方推荐都可以），
+返回里每项都带 `subject`（`owner/name`）、UUID 和体积；`openi_list_subject_files`
+可以继续看某个库里的文件清单，`openi_pull_model` / `openi_pull_dataset` 把它拉到本地
+（支持只拉单个文件、`dry_run` 先看体积、按大小跳过已完成文件、`max_bytes` 上限）。
+
+如果不打算下载到本地，直接把库挂到云脑任务上更省事：`openi_start_task` 的
+`dataset_uuid_str` / `pretrain_model_id_str` 既能填 UUID，也能直接填 `owner/name`
+（逗号分隔多个），工具会自动换成 UUID——也就是说搜到一个公开 ckpt 后可以直接
+`openi_start_task(..., pretrain_model_id_str="FoundationModel/llama_model_7B")`，
+不用先把十几 GB 的权重拖下来。
+
 **收拾现场。** “把我的调试任务都停掉/删掉。”助手用 `openi_list_tasks` 找到任务，再
 `openi_stop_task` / `openi_delete_task`。
 
@@ -110,7 +133,7 @@ python -m openi_bridge.autopoint --status
 python -m openi_bridge.install_mcp --apply
 ~~~
 
-完整的 28 个工具见下面的[工具全表](#工具全表)。创建任务的顺序是固定的：`openi_whoami`
+完整的 41 个工具见下面的[工具全表](#工具全表)。创建任务的顺序是固定的：`openi_whoami`
 → `openi_list_creation_options` → 选代码仓和分支 → `openi_start_task` →
 `openi_get_task` / `openi_task_debug_url` → 用完 `openi_stop_task`，必要时
 `openi_delete_task`。
@@ -305,7 +328,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 
 ## 工具全表
 
-共 28 个工具，都是 `openi_` 前缀。
+共 41 个工具，都是 `openi_` 前缀。
 
 | 工具 | 作用 |
 | --- | --- |
@@ -337,6 +360,19 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_restart_task | 重启已停止的任务 |
 | openi_delete_task | 删除任务（需先停止） |
 | openi_sdk_code | 生成容器内访问数据集/模型的示例代码 |
+| openi_create_dataset | 新建空数据集（返回 UUID，可作 dataset_uuid_str） |
+| openi_create_model | 新建空模型库（返回模型 ID，可作 pretrain_model_id_str） |
+| openi_data_subject_info | 查数据集/模型详情，拿 UUID 与是否有写权限 |
+| openi_upload_dataset_files | 把本地文件/目录上传到数据集（>64MB 自动分片续传） |
+| openi_upload_model_files | 把本地文件/目录（ckpt 等）上传到模型库 |
+| openi_storage_usage | 查看账号或单个主体的存储配额（上限/已用/剩余） |
+| openi_delete_dataset | 删除数据集（全名或 UUID，不可恢复） |
+| openi_delete_model | 删除模型库（全名或 UUID，不可恢复） |
+| openi_search_datasets | 搜索平台托管的数据集（关键词/类别/任务/排序/只看推荐，返回体积与 UUID） |
+| openi_search_models | 搜索平台托管的模型与 ckpt（返回体积、下载量、是否外链） |
+| openi_list_subject_files | 列出任意数据集/模型库里的文件与子目录及大小 |
+| openi_pull_dataset | 从 OpenI 拉取数据集文件到本地（单文件或整库，支持 dry_run 与 max_bytes） |
+| openi_pull_model | 从 OpenI 拉取模型/ckpt 文件到本地（单文件或整库，支持断点跳过） |
 
 ## 实现说明与已知限制
 
@@ -354,9 +390,55 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   `/{owner}/{repo}/ai_task`（按仓列表）。
 - 任务变更：`POST /{owner}/{repo}/ai_task/create`、`/ai_task/stop`、`/ai_task/restart`、
   `/ai_task/del`、`/ai_task/batch_del`。
+- 数据集与模型：`GET /dataset?dataset_name=`、`GET /aimodel?aimodel_name=`（拿 UUID 与
+  `can_edit_file`）、`GET /dataset/files`、`GET /aimodel/files`、`GET /storage/summary`；
+  创建走 `POST /dataset/create` 与 `POST /aimodel/create`（JSON 体，`owner_id` 必须是整数），
+  删除走 `POST /{dataset|aimodel}/batch_delete?dataset_ids=...`。
+- 广场检索：`GET /dataset/list/{scope}` 与 `GET /aimodel/list/{scope}`，`scope` 取
+  `public` / `owned` / `collected` / `collaborated`（对应平台数据集/模型页的四个 tab）。
+  查询参数 `page`、`page_size`、`q`、`order_by`、`tags`、`tasks`、`license`、`recommend`；
+  返回体是 `{datasets|aimodels, total, page, page_size}`。公开数据集体量约 1 万、
+  模型约 2.9 万，`recommend=only` 时是首页那 40 个数据集 / 37 个模型。
+- 文件清单：`GET /dataset/files` 与 `/aimodel/files` 用 `marker` 翻页（响应里的
+  `has_next` / `marker`），每行是 `FileName`、`IsDir`、`Size`、`ModTime`。
+- 从平台下载：`GET /dataset/file` 与 `/aimodel/file` 对托管在 OBS 上的文件返回
+  **301**，`Location` 就是带签名的直链，直接对 OBS 发 GET 即可，无需再带令牌
+  （工具内部走的就是这条路径）。整库打包另有
+  `GET /{dataset|aimodel}/download`，返回一个含 `openi_resource.version` 的 zip。
+- 文件上传：小文件走 `GET /upload/direct/get_upload_url` → `PUT` → `POST
+  /upload/direct/complete_upload`；大于 64MB 走 `GET /upload/get_chunks` →
+  `GET /upload/new_multipart` → 每片 `GET /upload/get_multipart_url` + `PUT` →
+  `POST /upload/complete_multipart`。实测 70MB 文件分片上传成功，重复上传会命中
+  `get_chunks` 的 `uploaded` 直接跳过（断点续传）。
 
 需要注意：
 
+- 上传到对象存储的 `PUT` 用的是预签名地址，签名把请求头也算进去了：带 `Authorization`
+  或 `Content-Type` 都会返回 `SignatureDoesNotMatch`，所以这条请求只发文件体本身。
+- 数据集/模型名（`name`）只能是字母/数字/连字符/下划线/点，字母数字开头结尾；`alias`
+  （中文展示名）只接受中文/字母/数字/连字符/下划线/点，且不含空格。
+- 分片的 md5 不是整文件 md5，而是「每个 64MB 分片取前 1MB」串起来算的值，与官方 openi
+  SDK 一致；`get_file_md5` 用错会导致续传判定失败。
+- 上传前会先查 `/storage/summary` 比对剩余配额；单账号默认 100GB。`/storage/summary`
+  带 `subject_id` 时实测仍返回账号级汇总，所以按主体维度的剩余额度只能作参考。
+- 文件本身落在华为 OBS（`obs.cn-south-222.ai.pcl.cn`）上，是持久化存储：上传成功后
+  不随任务或会话消失，删除只能通过 `openi_delete_dataset` / `openi_delete_model`
+  （`batch_delete`）显式触发。
+- 检索与下载用的是 REST 面（`/api/v1/...`），和积分那批 web 接口不同：这里带
+  `Authorization: Bearer`，而不需要 Basic。注意 `httpx.Client(base_url=...)` 必须写成
+  `"{endpoint}/api/v1"`，只填 endpoint 会让 `/aimodel/file` 之类返回 404。
+- 外链模型（返回里 `external: true`，`external_name` / `external_url` 非空）在平台上
+  没有实际文件，`openi_list_subject_files` 会是空、`openi_pull_model` 也拉不到东西；
+  真正托管在自己对象存储里的模型 `external` 为 false。
+- 大主体（例如 `Open_Dataset/imagenet`，143GB）会触发全量遍历，因此
+  `openi_pull_dataset` / `openi_pull_model` 在 `max_bytes` 有值且未指定 `file` 时，
+  先读主体的声明体积做一次拦截；真要全量拉请显式调大或省略 `max_bytes`。
+- `openi_start_task` 的 `dataset_uuid_str` / `pretrain_model_id_str` 支持逗号分隔的
+  `owner/name`，工具会先查回 UUID 再创建任务；挂载靠平台把数据迁到集群
+  （任务会经过 `dataMigrating`），所以公开 ckpt 可以直接挂、不必先下载。
+- 整库 zip 接口（`/{dataset|aimodel}/download`）没有单独做成工具：逐文件拉取已经能
+  拿到同样的内容，还多出 `dry_run` 预览、按大小跳过已下载文件和断点续传的能力，
+  而 zip 一次性把整包放进内存/磁盘、中途失败要重来。需要 zip 时可直接对该接口发请求。
 - 普通用户可用的集群是 `C2Net`（智算网络）。`cluster` 必须填 `C2Net`，`cluster_type`
   查询参数同理；`openi` 之类的值会返回参数错误或空规格。
 - 创建任务的必填字段是 `job_type`、`display_job_name`、`spec_id`（整数）、

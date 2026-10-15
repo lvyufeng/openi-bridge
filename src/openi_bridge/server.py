@@ -12,11 +12,15 @@ import sys
 from typing import Any, Optional
 
 from .client import (
+    DATASET_CATEGORIES,
+    DATASET_LICENSES,
+    DATASET_TASKS,
     DEFAULT_CLUSTER,
     DEFAULT_IMAGE_URL,
     OpenIClient,
     OpenIError,
     dump,
+    expand_upload_paths,
     summarize_spec,
 )
 from . import autopoint, exec_on_card
@@ -33,7 +37,8 @@ mcp = _Server(
     instructions=(
         "使用启智社区（openi.pcl.ac.cn，即 OpenI 鹏城云脑普惠算力）的计算任务。"
         "可以查询账号、算力资源与积分、可用规格（spec）、代码仓、任务的日志与状态，"
-        "并新建、停止、重启、删除计算任务。创建任务前先用 "
+        "并新建、停止、重启、删除计算任务；也可以创建数据集/模型库并把本地文件"
+        "（数据集、ckpt 权重等）上传上去，再把得到的 UUID 挂到计算任务上。创建任务前先用 "
         "openi_list_creation_options 拿到实时的 spec_id 与镜像。使用前必须设置 "
         "OPENI_TOKEN 环境变量，令牌在 https://openi.pcl.ac.cn/user/settings/applications 生成。"
     ),
@@ -424,6 +429,417 @@ def openi_list_repo_files(repo: str, ref: Optional[str] = None) -> str:
 
 
 @mcp.tool()
+def openi_create_dataset(
+    name: str,
+    alias: Optional[str] = None,
+    is_private: bool = False,
+    categories: Optional[list[str]] = None,
+    tasks: Optional[list[str]] = None,
+    licenses: str = "MIT",
+) -> str:
+    """新建一个空数据集，随后用 openi_upload_dataset_files 往里面传文件。
+
+    数据集全名是 当前账号登录名/name，例如 scratch-repo。返回里的 id
+    就是这个数据集的 UUID，可直接作为 openi_start_task 的 dataset_uuid_str。
+
+    name: 数据集短名（URL 标识），只能字母/数字/连字符/下划线/点，字母数字开头结尾。
+    alias: 中文显示名，可留空；只能中文/字母/数字/连字符/下划线/点。
+    is_private: True 为私有数据集，默认公开。
+    categories: 数据集类别，取自 DATASET_CATEGORIES，例如 ["natural_language_processing"]。
+    tasks: 关联任务，例如 ["language_modeling"]；可用值见 DATASET_TASKS。
+    licenses: 许可证，默认 MIT，可选值见 DATASET_LICENSES。
+    """
+    try:
+        bad_cat = [c for c in (categories or []) if c not in DATASET_CATEGORIES]
+        bad_task = [t for t in (tasks or []) if t not in DATASET_TASKS]
+        if bad_cat:
+            return dump({"ok": False, "error": f"未知的数据集类别：{bad_cat}", "allowed": list(DATASET_CATEGORIES)})
+        if bad_task:
+            return dump({"ok": False, "error": f"未知的数据集任务：{bad_task}", "allowed": list(DATASET_TASKS)})
+        if licenses not in DATASET_LICENSES:
+            return dump({"ok": False, "error": f"未知的许可证：{licenses}", "allowed": list(DATASET_LICENSES)})
+        with _client() as client:
+            result = client.create_dataset(
+                name=name,
+                alias=alias,
+                is_private=is_private,
+                categories=categories,
+                tasks=tasks,
+                licenses=licenses,
+            )
+        return dump(
+            {
+                "ok": True,
+                "id": result.get("id"),
+                "name": result.get("name"),
+                "owner_name": result.get("owner_name"),
+                "full_name": f"{result.get('owner_name')}/{result.get('name')}",
+                "note": "把 id 作为 dataset_uuid_str 传给 openi_start_task 即可挂载。",
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_create_model(
+    name: str,
+    alias: Optional[str] = None,
+    is_private: bool = False,
+    engine: int = 0,
+    label: str = "",
+    license: str = "",
+) -> str:
+    """新建一个空模型库，随后用 openi_upload_model_files 上传 ckpt 等权重文件。
+
+    模型全名是 当前账号登录名/name。返回里的 id 即模型 ID，可直接作为
+    openi_start_task 的 pretrain_model_id_str。
+
+    name: 模型短名（URL 标识），规则同数据集。
+    alias: 中文显示名，可留空。
+    is_private: True 为私有模型，默认公开。
+    engine: 引擎代号，默认 0（不指定）。
+    label / license: 展示用标签与许可证，可留空。
+    """
+    try:
+        with _client() as client:
+            result = client.create_model(
+                name=name,
+                alias=alias,
+                is_private=is_private,
+                engine=engine,
+                label=label,
+                license=license,
+            )
+        return dump(
+            {
+                "ok": True,
+                "id": result.get("id"),
+                "name": result.get("name"),
+                "owner_name": result.get("owner_name"),
+                "full_name": f"{result.get('owner_name')}/{result.get('name')}",
+                "note": "把 id 作为 pretrain_model_id_str 传给 openi_start_task 即可挂载。",
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_data_subject_info(subject: str, subject_type: str = "dataset") -> str:
+    """查询数据集/模型库的详情，主要是拿到 UUID 和是否有写权限。
+
+    subject: 全名 owner/name，例如 scratch-repo。
+    subject_type: dataset（数据集）或 model（模型库）。
+    返回的 id 用作 openi_start_task 的 dataset_uuid_str / pretrain_model_id_str。
+    """
+    try:
+        with _client() as client:
+            info = client.subject_info(subject, subject_type)
+        slim = {
+            "id": info.get("id"),
+            "name": info.get("name"),
+            "owner_name": info.get("owner_name"),
+            "alias": info.get("alias"),
+            "is_private": info.get("is_private"),
+            "size": info.get("size"),
+            "can_edit_file": info.get("can_edit_file")
+            if subject_type == "dataset"
+            else (info.get("permission") or {}).get("can_edit_file"),
+        }
+        return dump({"ok": True, "subject_type": subject_type, "info": slim})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_upload_dataset_files(
+    dataset: str,
+    paths: list[str],
+    remote_dir: str = "",
+) -> str:
+    """把本地文件/目录上传到数据集。小文件走直传、超过 64MB 自动分片续传。
+
+    dataset: 数据集全名 owner/name。
+    paths: 本地文件或目录路径列表；目录会递归上传并保留目录结构。建议用绝对路径，
+    相对路径按 MCP 服务进程的工作目录解析。
+    remote_dir: 仓内前缀目录，例如 "train/images"；留空则放在根目录。
+
+    返回里每个文件带 mode（direct/multipart）与是否成功。数据集里会自带一个
+    openi_resource.version，属于正常现象。
+    """
+    try:
+        entries = expand_upload_paths(paths, remote_dir=remote_dir)
+        with _client() as client:
+            report = client.upload_files(dataset, "dataset", entries)
+        return dump({"ok": report.get("failed_count", 0) == 0, **report})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_upload_model_files(
+    model: str,
+    paths: list[str],
+    remote_dir: str = "",
+) -> str:
+    """把本地文件/目录（例如 ckpt 权重）上传到模型库，规则同数据集上传。
+
+    model: 模型全名 owner/name。
+    paths: 本地文件或目录路径列表；目录会递归上传并保留目录结构。建议用绝对路径，
+    相对路径按 MCP 服务进程的工作目录解析。
+    remote_dir: 仓内前缀目录，例如 "v1"；留空则放在根目录。
+
+    大文件（>64MB）自动按 64MB 分片上传，可断点续传（重复调用会跳过已完成分片）。
+    """
+    try:
+        entries = expand_upload_paths(paths, remote_dir=remote_dir)
+        with _client() as client:
+            report = client.upload_files(model, "model", entries)
+        return dump({"ok": report.get("failed_count", 0) == 0, **report})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+def _resolve_subject_ids(client: OpenIClient, targets: list[str], subject_type: str) -> list[str]:
+    ids: list[str] = []
+    for target in targets:
+        if "/" in target:
+            ids.append(client.subject_id(target, subject_type))
+        else:
+            ids.append(target)
+    return ids
+
+
+def _resolve_mount_ids(client: OpenIClient, value: Optional[str], subject_type: str) -> Optional[str]:
+    """把挂载参数里的全名 owner/name 换成 UUID，UUID 原样保留。
+
+    平台创建任务的字段是逗号分隔的 UUID 串；这里允许直接写数据集/模型全名
+    （来自 openi_search_datasets / openi_search_models），方便挂载平台托管的
+    数据集与 ckpt，无需先手动查 UUID。
+    """
+    if not value:
+        return value
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    return ",".join(_resolve_subject_ids(client, parts, subject_type))
+
+
+@mcp.tool()
+def openi_delete_dataset(datasets: list[str]) -> str:
+    """删除数据集（不可恢复）。datasets 里可写全名 owner/name 或数据集 UUID。"""
+    try:
+        with _client() as client:
+            ids = _resolve_subject_ids(client, datasets, "dataset")
+            return dump({"ok": True, "deleted": client.delete_subjects("dataset", ids), "ids": ids})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_delete_model(models: list[str]) -> str:
+    """删除模型库（不可恢复）。models 里可写全名 owner/name 或模型 UUID。"""
+    try:
+        with _client() as client:
+            ids = _resolve_subject_ids(client, models, "model")
+            return dump({"ok": True, "deleted": client.delete_subjects("model", ids), "ids": ids})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_storage_usage(subject: Optional[str] = None, subject_type: str = "dataset") -> str:
+    """查看存储配额。不传 subject 时返回账号总体配额（上限/已用/剩余）。
+
+    subject: 可选，数据集/模型全名 owner/name，看单个主体的占用。
+    subject_type: subject 存在时有效，dataset 或 model。
+    平台单账号默认 100GB 配额，上传前会先比对剩余额度。注意该接口即使带上
+    subject 实测仍返回账号级汇总，所以单主体数字只能作参考。
+    """
+    try:
+        with _client() as client:
+            if subject:
+                subject_id = client.subject_id(subject, subject_type)
+                summary = client.storage_summary(subject_id, {"dataset": "1", "model": "2"}[subject_type])
+                return dump({"ok": True, "scope": subject, "subject_type": subject_type,
+                             "subject_id": subject_id, "storage": summary})
+            return dump({"ok": True, "scope": "account", "storage": client.storage_summary()})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_search_datasets(
+    q: str = "",
+    scope: str = "public",
+    order_by: str = "",
+    tags: Optional[list[str]] = None,
+    tasks: Optional[list[str]] = None,
+    recommend: bool = False,
+    page: int = 1,
+    page_size: int = 30,
+) -> str:
+    """检索平台托管的数据集，用来挑一个现成的数据集直接拉取或挂载。
+
+    q: 关键词，按名称/别名模糊匹配，留空返回全部。
+    scope: public（平台公开托管的全部数据集）/ owned（自己创建的）/
+      collected（我收藏的）/ collaborated（协作的）。
+    order_by: 留空按默认，可选 newest / recentupdate / downloadcount /
+      collections / alias_asc / alias。
+    tags: 类别过滤，例如 ["computer_vision"]；tasks: 任务过滤，例如 ["image_classification"]。
+    recommend: True 只看官方推荐（平台首页那批）。
+    page / page_size: 分页，默认第 1 页、每页 30 条。
+
+    返回里每项含 subject（owner/name，可直接传给 openi_pull_dataset /
+    openi_start_task）、id（UUID）、size_gb、downloads、stars、tags、tasks。
+    """
+    try:
+        with _client() as client:
+            result = client.search_subjects(
+                "dataset", q=q, scope=scope, order_by=order_by, tags=tags,
+                tasks=tasks, recommend=recommend, page=page, page_size=page_size,
+            )
+        return dump({"ok": True, **result})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_search_models(
+    q: str = "",
+    scope: str = "public",
+    order_by: str = "",
+    tags: Optional[list[str]] = None,
+    recommend: bool = False,
+    page: int = 1,
+    page_size: int = 30,
+) -> str:
+    """检索平台托管的模型/ckpt，用来挑一个现成的权重直接拉取或挂载。
+
+    q: 关键词（例如 "llama"、"chatglm"、"stable-diffusion"），留空返回全部。
+    scope: public（平台公开托管的全部模型）/ owned（自己的）/ collected（收藏）/
+      collaborated。
+    order_by: 留空按默认，可选 newest / recentupdate / downloadcount /
+      collections / alias_asc / alias。
+    tags: 标签过滤；recommend: True 只看官方推荐（llama2、chatglm3 等）。
+    page / page_size: 分页，默认第 1 页、每页 30 条。
+
+    返回里每项含 subject（owner/name，可直接传给 openi_pull_model /
+    openi_start_task 的 pretrain_model_id_str）、id（模型 ID）、size_gb、
+    downloads、stars、label、external（是否是外链模型，外链没有平台内的文件）。
+    """
+    try:
+        with _client() as client:
+            result = client.search_subjects(
+                "model", q=q, scope=scope, order_by=order_by, tags=tags,
+                recommend=recommend, page=page, page_size=page_size,
+            )
+        return dump({"ok": True, **result})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_subject_files(subject: str, subject_type: str = "dataset", parent_dir: str = "") -> str:
+    """列出某个数据集/模型库里的文件与子目录（含每个文件的大小）。
+
+    subject: 全名 owner/name（可用 openi_search_datasets / openi_search_models 查）。
+    subject_type: dataset 或 model。
+    parent_dir: 仓内子目录，留空为根目录。
+    用来在 openi_pull_dataset / openi_pull_model 之前确认要拉哪些文件。
+    """
+    try:
+        with _client() as client:
+            page = client.subject_files(subject, subject_type, parent_dir) or {}
+        rows = [
+            {
+                "name": (f"{parent_dir}/{r.get('FileName')}".strip("/") if parent_dir else r.get("FileName")),
+                "is_dir": bool(r.get("IsDir")),
+                "size": r.get("Size"),
+                "modified": r.get("ModTime"),
+            }
+            for r in (page.get("file_list") or [])
+        ]
+        return dump({"ok": True, "subject": subject, "dir": parent_dir, "has_next": page.get("has_next"),
+                     "files": rows})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+def _pull(client: OpenIClient, subject: str, subject_type: str, dest_dir: str, file: Optional[str],
+          parent_dir: str, dry_run: bool, overwrite: bool, max_bytes: Optional[int]) -> str:
+    report = client.pull_subject(
+        subject, subject_type, dest_dir, file=file, parent_dir=parent_dir,
+        dry_run=dry_run, overwrite=overwrite, max_bytes=max_bytes,
+    )
+    ok = report.get("failed_count", 0) == 0
+    return dump({"ok": ok, **report})
+
+
+@mcp.tool()
+def openi_pull_dataset(
+    dataset: str,
+    dest_dir: str,
+    file: Optional[str] = None,
+    parent_dir: str = "",
+    dry_run: bool = False,
+    overwrite: bool = False,
+    max_bytes: Optional[int] = None,
+) -> str:
+    """把平台托管的数据集文件拉取到本地目录（从 OpenI 直接下载）。
+
+    dataset: 数据集全名 owner/name，先用 openi_search_datasets 查，例如
+      "Open_Dataset/imagenet"。
+    dest_dir: 本地目标目录（会把仓内目录结构照搬下来）。
+    file: 只拉这一个文件时给出仓内相对路径，例如 "imagenet/README.md"；留空则递归
+      拉取整个数据集（或 parent_dir 指定的子目录）。
+    parent_dir: file 为空时，只拉这个仓内子目录。
+    dry_run: True 时只回显会下载哪些文件、多大，不真正下载——拉大文件前先跑一次。
+    overwrite: 默认 False，本地已存在且大小一致的文件会跳过，方便续传。
+    max_bytes: 总字节上限，超过直接报错（防止误拉几十 GB）。
+
+    数据集里自带的 openi_resource.version 默认跳过。
+    """
+    try:
+        with _client() as client:
+            return _pull(client, dataset, "dataset", dest_dir, file, parent_dir,
+                         dry_run, overwrite, max_bytes)
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_pull_model(
+    model: str,
+    dest_dir: str,
+    file: Optional[str] = None,
+    parent_dir: str = "",
+    dry_run: bool = False,
+    overwrite: bool = False,
+    max_bytes: Optional[int] = None,
+) -> str:
+    """把平台托管的模型/ckpt 文件拉取到本地目录（从 OpenI 直接下载）。
+
+    model: 模型全名 owner/name，先用 openi_search_models 查，例如
+      "FoundationModel/llama_model_7B"。
+    dest_dir: 本地目标目录（会保留仓内目录结构）。
+    file: 只拉某个文件时给出仓内相对路径；留空则递归拉取整个模型库。
+    parent_dir: file 为空时只拉这个子目录。
+    dry_run: True 时只回显文件名与大小，先看清体积再决定。
+    overwrite: 默认 False，本地已存在且大小一致的文件跳过，便于续传。
+    max_bytes: 总字节上限，超过直接报错。
+
+    ckpt 往往十几 GB，建议先 dry_run，或者直接用 openi_start_task 把它挂到云脑
+    任务里（pretrain_model_id_str），不必下载到本地。
+    """
+    try:
+        with _client() as client:
+            return _pull(client, model, "model", dest_dir, file, parent_dir,
+                         dry_run, overwrite, max_bytes)
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
 def openi_get_task(task_id: str) -> str:
     """按任务 ID 查询任务详情（状态、资源、时长等）。"""
     try:
@@ -597,7 +1013,10 @@ def openi_start_task(
     image_url: 镜像地址（place）。留空时按上面的规则自动选择，地址见 openi_list_public_images。
     boot_file: 启动文件（训练任务需要，例如 train.py）。
     params: 传给启动文件的运行参数。
-    dataset_uuid_str / pretrain_model_id_str: 挂载的数据集 UUID / 预训练模型 ID。
+    dataset_uuid_str / pretrain_model_id_str: 挂载的数据集 / 预训练模型，逗号分隔多个。
+      既可以填 UUID，也可以直接填平台全名 owner/name（来自 openi_search_datasets /
+      openi_search_models，或自己上传后拿到的库），工具会自动换成 UUID。挂载平台
+      托管的公开数据集/ckpt 时用这个，不必下载到本地。
     has_internet: 0 不限制 / 1 无外网 / 2 有外网。
     time_limit: 自动停止时长（小时，-1 表示不自动停止）。
     visualize_required: 是否需要 TensorBoard。
@@ -606,6 +1025,8 @@ def openi_start_task(
     try:
         extra = json.loads(extra_fields) if extra_fields else None
         with _client() as client:
+            dataset_uuid_str = _resolve_mount_ids(client, dataset_uuid_str, "dataset")
+            pretrain_model_id_str = _resolve_mount_ids(client, pretrain_model_id_str, "model")
             result = client.create_task(
                 repo=repo,
                 spec_id=spec_id,
