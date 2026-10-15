@@ -3,8 +3,11 @@
 每个文件是一次 C2Net DEBUG 任务里、在该任务的 Jupyter 中跑厂商自带 SMI 的原始输出片段。
 创建时间 2026-10-14，任务都已停止并删除，输出为当时抓取。
 
-每份文件第三行的 `DEBUG_URL` 只是记录当时连的是哪个 notebook 服务，`token=` 后面的值
-一律不保留，抓取时就抹掉，避免把调试入口的凭据写进仓库。
+每份 SMI 文件第三行的 `DEBUG_URL` 只是记录当时连的是哪个 notebook 服务，`token=` 后面
+的值一律不保留，抓取时就抹掉，避免把调试入口的凭据写进仓库。
+
+`code-repo-e2e-task-000000.txt` 不是 SMI 输出，而是代码仓读写链路的实测记录：建仓 →
+推文件 → 覆盖写 → 用这个仓跑 TRAIN 任务，任务日志证明跑的是被覆盖写过的代码。
 
 | 文件 | 算力 | spec_id | 任务号 | 关键内容 |
 | --- | --- | --- | --- | --- |
@@ -17,6 +20,7 @@
 | `dcu-k100-task-000000.txt` | 海光 DCU | 342 | 000000 | `hy-smi` / `rocm-smi`：HCU，PwrCap 400W |
 | `iluvatar-mrv100-task-000000.txt` | 天数智芯 GPGPU | 388 | 000000 | `ixsmi`：Iluvatar MR-V100，32768 MiB，IX-ML 驱动 4.4.0 |
 | `biren106m-task-000000.txt` | 壁仞 GPU | 347 | 000000 | `brsmi`：Biren106M，32512 MiB，BR-SMI 1.10.1 / SUPA 1.10 |
+| `code-repo-e2e-task-000000.txt` | NVIDIA GPU | 210 | 000000 | 代码仓链路：建仓/推文件/覆盖写/用该仓跑 TRAIN，日志出现被写入的 `print` |
 
 `METAX-GPGPU`（沐曦 C500，spec 333）没有输出。2026-10-14 连续 9 次 DEBUG 任务都没
 调度到卡，而且失败方式不一致：前 7 次（含 000000、000000）一直停在 `centerPending`

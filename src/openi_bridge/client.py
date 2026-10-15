@@ -7,6 +7,20 @@ Compute (云脑 / ai_task) endpoints that this client uses:
 
     GET  /api/v1/user                              account behind the token
     GET  /api/v1/user/repos                        repos owned by the token
+    POST /api/v1/user/repos                        create a code repo (slow, ~30s+)
+    GET  /api/v1/repos/{owner}/{repo}/right        write permission on a repo
+    GET  /api/v1/repos/{owner}/{repo}/contents     list a directory
+    GET  /api/v1/repos/{owner}/{repo}/contents/{p} read or list one path
+    POST /api/v1/repos/{owner}/{repo}/contents/{p} create a file (base64 body)
+    PUT  /api/v1/repos/{owner}/{repo}/contents/{p} update a file (needs old sha)
+    DELETE /api/v1/repos/{owner}/{repo}            delete a code repo
+
+File deletion (DELETE .../contents/{p}) is NOT wrapped: the platform route
+hangs and always dies at the 60s proxy timeout (504/502) without removing
+the file, so a tool around it could only ever lie. Overwrite the file or
+delete the whole repo instead.
+    GET  /api/v1/notifications                     account notifications
+    GET  /api/v1/notifications/new                 unread notification count
     GET  /api/v1/ai_task/my_list                   every task of the account
     GET  /api/v1/ai_task?id=                       one task detail (with sync)
     GET  /api/v1/ai_task/brief?id=                 compact status
@@ -73,6 +87,8 @@ CHUNK_SIZE = 64 * 1024 * 1024
 DIRECT_UPLOAD_MAX = CHUNK_SIZE
 # 关联主体类型：上传接口用字符串，subject_query 也用它区分数据集与模型。
 SUBJECT_TYPES = {"dataset": "1", "model": "2"}
+# 往代码仓提交单个文件的上限：contents API 用 base64 传，整个文件会进内存。
+MAX_REPO_FILE_BYTES = 50 * 1024 * 1024
 
 # 数据集 / 模型广场的列表范围（对应平台前端 getCardList 的 tab url）。
 SUBJECT_LIST_SCOPES = ("public", "owned", "collected", "collaborated")
@@ -364,6 +380,7 @@ class OpenIClient:
         json_body: Any = None,
         data: Optional[Mapping[str, Any]] = None,
         raise_for_status: bool = True,
+        timeout: Optional[float] = None,
     ) -> httpx.Response:
         if not self.creds.has_token:
             raise OpenIError(
@@ -371,8 +388,12 @@ class OpenIClient:
                 "生成令牌，然后设置 OPENI_TOKEN 环境变量，或执行 openi login。"
             )
         headers = {"Authorization": f"Bearer {self.creds.token}"}
+        # 少数接口（建仓、删仓）在平台上要跑几十秒，允许调用方单独放宽超时。
+        kwargs: Dict[str, Any] = {}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         response = self._http.request(
-            method, path, params=params, json=json_body, data=data, headers=headers
+            method, path, params=params, json=json_body, data=data, headers=headers, **kwargs
         )
         if not raise_for_status:
             return response
@@ -404,8 +425,33 @@ class OpenIClient:
         path: str,
         params: Optional[Mapping[str, Any]] = None,
         json_body: Any = None,
+        timeout: Optional[float] = None,
     ) -> Any:
-        return _wrap(_unwrap_text(self.request("POST", path, params=params, json_body=json_body)))
+        return _wrap(
+            _unwrap_text(
+                self.request("POST", path, params=params, json_body=json_body, timeout=timeout)
+            )
+        )
+
+    def put_json(
+        self,
+        path: str,
+        json_body: Any = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        return _wrap(
+            _unwrap_text(self.request("PUT", path, json_body=json_body, timeout=timeout))
+        )
+
+    def delete_json(
+        self,
+        path: str,
+        json_body: Any = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        return _wrap(
+            _unwrap_text(self.request("DELETE", path, json_body=json_body, timeout=timeout))
+        )
 
     # ------------------------------------------------------------------- users
 
@@ -415,6 +461,17 @@ class OpenIClient:
 
     def user(self, username: str) -> Dict[str, Any]:
         return self.get_json(f"/users/{username}")
+
+    def notifications(self, limit: int = 20, page: int = 1, unread: bool = False) -> Any:
+        """GET /notifications - 通知列表（含所属仓库的上下文）。"""
+        params: Dict[str, Any] = {"limit": limit, "page": page}
+        if unread:
+            params["unread"] = "true"
+        return self.get_json("/notifications", params=params)
+
+    def unread_notification_count(self) -> Any:
+        """GET /notifications/new - 未读通知数量。"""
+        return self.get_json("/notifications/new")
 
     # -------------------------------------------------------------------- repos
 
@@ -432,10 +489,190 @@ class OpenIClient:
         """Branches of a repo; the create form needs one for the code version."""
         return self.get_json(f"/repos/{subject_name}/branches")
 
-    def repo_contents(self, subject_name: str, ref: Optional[str] = None) -> Any:
-        """Top-level file listing, used to discover a valid boot_file."""
+    def repo_contents(
+        self, subject_name: str, ref: Optional[str] = None, path: str = ""
+    ) -> Any:
+        """列目录（默认根目录），用于发现可用的 boot_file 或翻看代码结构。"""
         params = {"ref": ref} if ref else None
-        return self.get_json(f"/repos/{subject_name}/contents", params=params)
+        clean = (path or "").strip("/")
+        suffix = f"/{clean}" if clean else ""
+        return self.get_json(f"/repos/{subject_name}/contents{suffix}", params=params)
+
+    def repo_permission(self, subject_name: str) -> Any:
+        """GET /repos/{owner}/{repo}/right - 当前账号对该仓的写权限。"""
+        return self.get_json(f"/repos/{subject_name}/right")
+
+    def create_repo(
+        self,
+        name: str,
+        description: str = "",
+        private: bool = False,
+        auto_init: bool = True,
+        readme: str = "Default",
+        default_branch: str = "master",
+        timeout: float = 180.0,
+    ) -> Dict[str, Any]:
+        """POST /user/repos - 建一个代码仓（owner 固定是当前账号）。
+
+        平台建仓要跑几十秒（实测 30s 以上），所以默认给 180s 的超时；
+        超时也不代表失败，调用方应回查 /user/repos 确认是否已建出来。
+        """
+        body: Dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "private": private,
+            "auto_init": auto_init,
+        }
+        if auto_init:
+            body["readme"] = readme or "Default"
+            body["default_branch"] = default_branch or "master"
+        return self.post_json("/user/repos", json_body=body, timeout=timeout)
+
+    def delete_repo(self, subject_name: str, timeout: float = 180.0) -> Any:
+        """DELETE /repos/{owner}/{repo} - 删掉一个代码仓（平台侧同样偏慢）。"""
+        return self.delete_json(f"/repos/{subject_name}", timeout=timeout)
+
+    def repo_file(self, subject_name: str, path: str, ref: Optional[str] = None) -> Any:
+        """读仓库里的单个文件，返回 Gitea contents 结构（content 是 base64）。"""
+        params = {"ref": ref} if ref else None
+        return self.get_json(f"/repos/{subject_name}/contents/{path.strip('/')}", params=params)
+
+    def repo_file_sha(
+        self, subject_name: str, path: str, ref: Optional[str] = None
+    ) -> Optional[str]:
+        """文件已存在时返回其 blob sha（更新文件必须带上），否则 None。"""
+        try:
+            data = self.repo_file(subject_name, path, ref=ref)
+        except OpenIError:
+            return None
+        return data.get("sha") if isinstance(data, Mapping) else None
+
+    def write_repo_file(
+        self,
+        subject_name: str,
+        path: str,
+        content: Any,
+        message: str = "",
+        branch: Optional[str] = None,
+        ref: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """新建或覆盖仓库里的一个文件，走 contents API（不需要 git）。
+
+        Gitea 的语义是新建用 POST、更新用 PUT 且必须带旧 blob 的 sha，所以这里
+        先查一次 sha 再决定用哪个动词。每次调用产生一个提交。
+        """
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        elif isinstance(content, bytearray):
+            content = bytes(content)
+        if not isinstance(content, bytes):
+            raise OpenIError("content 必须是 bytes 或 str。")
+        clean = path.strip("/")
+        if not clean:
+            raise OpenIError("path 不能为空。")
+        body: Dict[str, Any] = {
+            "content": base64.b64encode(content).decode("ascii"),
+            "message": message or f"update {clean}",
+        }
+        if branch:
+            body["branch"] = branch
+        sha = self.repo_file_sha(subject_name, clean, ref=ref)
+        if sha:
+            body["sha"] = sha
+            return self.put_json(f"/repos/{subject_name}/contents/{clean}", json_body=body)
+        return self.post_json(f"/repos/{subject_name}/contents/{clean}", json_body=body)
+
+    def read_repo_file(
+        self, subject_name: str, path: str, ref: Optional[str] = None, max_bytes: int = 0
+    ) -> Dict[str, Any]:
+        """读仓库文件并解码。返回 {path, sha, size, bytes}，max_bytes>0 时超限即拒绝。"""
+        data = self.repo_file(subject_name, path, ref=ref)
+        if not isinstance(data, Mapping):
+            raise OpenIError(f"{path} 不是一个文件（可能是目录）。")
+        if data.get("type") and data.get("type") != "file":
+            raise OpenIError(f"{path} 不是文件（type={data.get('type')}）。")
+        size = int(data.get("size") or 0)
+        if max_bytes and size > max_bytes:
+            raise OpenIError(
+                f"{path} 有 {size} 字节，超过 max_bytes={max_bytes}。"
+                "确认要读请调大 max_bytes，或改用 save_to 存到本地。"
+            )
+        encoded = data.get("content") or ""
+        try:
+            blob = base64.b64decode(encoded)
+        except Exception as exc:  # noqa: BLE001 - 内容不是合法 base64 时给个清楚的错
+            raise OpenIError(f"{path} 的内容不是 base64：{exc}") from exc
+        return {"path": data.get("path") or path, "sha": data.get("sha"), "size": size, "bytes": blob}
+
+    def push_repo_files(
+        self,
+        subject_name: str,
+        entries: List[Mapping[str, Any]],
+        message: str = "",
+        branch: Optional[str] = None,
+        dry_run: bool = False,
+        max_bytes: Optional[int] = None,
+        max_file_bytes: int = MAX_REPO_FILE_BYTES,
+    ) -> Dict[str, Any]:
+        """把 expand_upload_paths 的结果逐个提交进代码仓，每个文件一个提交。
+
+        contents API 走的是 base64，文件会被整个读进内存，所以单个文件有上限
+        （默认 50MB），整批总量可以用 max_bytes 再卡一道。
+        """
+        if dry_run:
+            total = sum(int(e["size"]) for e in entries)
+            return {
+                "repo": subject_name,
+                "dry_run": True,
+                "file_count": len(entries),
+                "total_bytes": total,
+                "files": [
+                    {"path": e["name"], "size": int(e["size"])} for e in entries
+                ],
+            }
+        total = sum(int(e["size"]) for e in entries)
+        if max_bytes is not None and total > max_bytes:
+            raise OpenIError(
+                f"待提交总量 {total} 字节超过 max_bytes={max_bytes}，已中止。"
+            )
+        right = self.repo_permission(subject_name)
+        if isinstance(right, Mapping) and right.get("right") not in ("write", "admin"):
+            raise OpenIError(
+                f"当前账号对 {subject_name} 没有写权限（right={right.get('right')}）。"
+            )
+        results: List[Dict[str, Any]] = []
+        for entry in entries:
+            name = entry["name"]
+            size = int(entry["size"])
+            record: Dict[str, Any] = {"path": name, "size": size}
+            try:
+                if size > max_file_bytes:
+                    raise OpenIError(
+                        f"{name} 有 {size} 字节，超过单文件上限 {max_file_bytes}。"
+                        "contents API 会把文件整个读进内存，大文件请改用 git 推送。"
+                    )
+                with open(entry["path"], "rb") as handle:
+                    blob = handle.read()
+                if len(blob) != size:
+                    raise OpenIError(f"{name} 读取字节数 {len(blob)} 与预期 {size} 不一致。")
+                existed = self.repo_file_sha(subject_name, name) is not None
+                self.write_repo_file(
+                    subject_name, name, blob, message=message or f"update {name}", branch=branch
+                )
+                record["ok"] = True
+                record["action"] = "update" if existed else "create"
+            except Exception as exc:  # noqa: BLE001 - 逐文件汇报失败
+                record["ok"] = False
+                record["error"] = str(exc)
+            results.append(record)
+        succeeded = [r for r in results if r.get("ok")]
+        return {
+            "repo": subject_name,
+            "committed_count": len(succeeded),
+            "failed_count": len(results) - len(succeeded),
+            "committed_bytes": sum(r["size"] for r in succeeded),
+            "files": results,
+        }
 
     def default_branch(self, subject_name: str) -> Optional[str]:
         data = self.repo(subject_name)

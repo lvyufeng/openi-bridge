@@ -1,0 +1,52 @@
+代码仓读写实测（推代码 → 覆盖写 → 用该仓跑任务）
+
+创建时间 2026-10-15，账号 <account>，真实令牌。全程走新加的工具，探针仓库
+scratch-repo 与任务 000000 事后都已删除，仓库列表回查已无该仓。
+
+建仓 POST /user/repos → 201（耗时约 32 秒）
+{"ok": true, "full_name": "scratch-repo", "default_branch": "master",
+ "private": false, "html_url": "https://openi.pcl.ac.cn/scratch-repo"}
+
+推文件 openi_push_repo_files（dry_run 先看清单，再真推；每文件一个提交）
+{"ok": true, "repo": "scratch-repo", "committed_count": 2, "failed_count": 0,
+ "committed_bytes": 380,
+ "files": [{"path": "train.py", "size": 339, "ok": true, "action": "create"},
+           {"path": "util/helper.py", "size": 41, "ok": true, "action": "create"}]}
+
+翻子目录 openi_list_repo_files(path="util")
+{"ok": true, "path": "util", "files": [{"name": "helper.py", "type": "file", "size": 41}],
+ "branches": ["master"]}
+
+覆盖写 openi_write_repo_file（先查旧 blob sha，再 PUT）
+{"ok": true, "repo": "scratch-repo", "path": "train.py",
+ "sha": "c093c2704bf3e311bf010c0394bb906a513c6423",
+ "commit_sha": "74de48046572bcc61a594b3916eaa22826aa6c1b"}
+写回读 openi_read_repo_file 得到的正文：
+  print("rewritten by openi_write_repo_file", flush=True)
+
+用这个仓建 TRAIN 任务（spec_id 210 / NVIDIA V100 / C2Net / branch master / boot_file train.py）
+{"id": 000000, "_branch_name": "master", "_branch_source": "explicit",
+ "_image_source": "fallback_image_url",
+ "_request_payload": {"job_type": "TRAIN", "spec_id": 210, "compute_source": "GPU",
+   "cluster": "C2Net", "branch_name": "master", "boot_file": "train.py",
+   "image_url": "swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1"}}
+状态 WAITING → SUCCEEDED。
+openi_task_logs(id=000000) 的 content：
+  Processing /tmp/sdk/c2net-0.4.0-py3-none-any.whl
+  Installing collected packages: c2net
+  Successfully installed c2net-0.4.0
+  rewritten by openi_write_repo_file
+  success
+
+这一段是这条测试链路的重点：日志里的 “rewritten by openi_write_repo_file” 正是被
+openi_write_repo_file 覆盖写进去的那一行，说明推上去的代码确实被集群检出并执行了，
+不是只写进了仓。
+
+收尾：openi_stop_task → openi_delete_task（{"result": null, "ok": true}）
+→ DELETE /repos/scratch-repo → 204 → openi_delete_repository
+{"ok": true, "repo": "scratch-repo", "deleted": true}
+
+过程中确认平台侧的两个坑（详见根 README「实现说明与已知限制」）：
+- DELETE .../contents/{path} 每次都会挂到代理的 60 秒超时（504/502）且不删文件，
+  所以没有包成工具；批量提交入口（POST .../contents、POST /git/blobs）都是 404。
+- 建仓偏慢（本次约 32 秒），工具默认 180 秒超时；超时不代表失败。

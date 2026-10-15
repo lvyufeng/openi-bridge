@@ -6,6 +6,7 @@ or through the console script:  openi-bridge
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -17,6 +18,7 @@ from .client import (
     DATASET_TASKS,
     DEFAULT_CLUSTER,
     DEFAULT_IMAGE_URL,
+    MAX_REPO_FILE_BYTES,
     OpenIClient,
     OpenIError,
     dump,
@@ -38,7 +40,9 @@ mcp = _Server(
         "使用启智社区（openi.pcl.ac.cn，即 OpenI 鹏城云脑普惠算力）的计算任务。"
         "可以查询账号、算力资源与积分、可用规格（spec）、代码仓、任务的日志与状态，"
         "并新建、停止、重启、删除计算任务；也可以创建数据集/模型库并把本地文件"
-        "（数据集、ckpt 权重等）上传上去，再把得到的 UUID 挂到计算任务上。创建任务前先用 "
+        "（数据集、ckpt 权重等）上传上去，再把得到的 UUID 挂到计算任务上。"
+        "代码仓本身也能读写：openi_create_repository 建仓，openi_push_repo_files / "
+        "openi_write_repo_file 把代码提交上去，不需要本地 git。创建任务前先用 "
         "openi_list_creation_options 拿到实时的 spec_id 与镜像。使用前必须设置 "
         "OPENI_TOKEN 环境变量，令牌在 https://openi.pcl.ac.cn/user/settings/applications 生成。"
     ),
@@ -75,6 +79,43 @@ def openi_whoami() -> str:
 def openi_list_resources() -> str:
     """列出启智社区可用的算力集群、卡型与积分单价（分/卡时）。"""
     return describe_resources()
+
+
+@mcp.tool()
+def openi_notifications(limit: int = 20, page: int = 1, unread_only: bool = False) -> str:
+    """查看账号通知（有人评论、@ 或给你的仓库提 issue 时会收到）。
+
+    unread_only: True 时只列未读；返回里带 unread 未读总数。
+    """
+    try:
+        with _client() as client:
+            items = client.notifications(limit=limit, page=page, unread=unread_only)
+            count = client.unread_notification_count()
+        slim = [
+            {
+                "id": n.get("id"),
+                "unread": n.get("unread"),
+                "type": (n.get("subject") or {}).get("type")
+                if isinstance(n.get("subject"), dict)
+                else None,
+                "title": (n.get("subject") or {}).get("title")
+                if isinstance(n.get("subject"), dict)
+                else None,
+                "url": ((n.get("subject") or {}).get("url") or "").replace("/api/v1/repos/", "/")
+                if isinstance(n.get("subject"), dict)
+                else None,
+                "repo": (n.get("repository") or {}).get("full_name")
+                if isinstance(n.get("repository"), dict)
+                else None,
+                "updated_at": n.get("updated_at"),
+            }
+            for n in (items or [])
+            if isinstance(n, dict)
+        ]
+        unread = count.get("new") if isinstance(count, dict) else count
+        return dump({"ok": True, "unread": unread, "count": len(slim), "notifications": slim})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
 
 
 @mcp.tool()
@@ -415,15 +456,235 @@ def openi_search_repositories(query: str, limit: int = 20) -> str:
 
 
 @mcp.tool()
-def openi_list_repo_files(repo: str, ref: Optional[str] = None) -> str:
-    """列出代码仓根目录与分支，用于确定启动文件 boot_file（例如 train.py）。"""
+def openi_create_repository(
+    name: str,
+    description: str = "",
+    private: bool = False,
+    auto_init: bool = True,
+    default_branch: str = "master",
+) -> str:
+    """新建一个代码仓，仓全名固定为 当前账号登录名/name。
+
+    建完可以用 openi_push_repo_files 把本地代码传上去，再用
+    openi_start_task 跑任务——不需要本地 git。
+
+    name: 仓名，只接受字母/数字/连字符/下划线/点。
+    description: 仓描述，可留空。
+    private: True 建私有仓。
+    auto_init: True 初始化一个 README，仓里就有一个默认分支可写；False 建空仓。
+    default_branch: 初始化时的默认分支名，默认 master。
+
+    注意：平台建仓很慢（实测 30 秒以上），超时不代表失败——请用
+    openi_list_my_repositories 回查确认，不要重复建仓。
+    """
     try:
         with _client() as client:
-            files = client.repo_contents(repo, ref=ref)
+            repo = client.create_repo(
+                name,
+                description=description,
+                private=private,
+                auto_init=auto_init,
+                default_branch=default_branch,
+            )
+        info = repo if isinstance(repo, dict) else {}
+        # 建仓响应里的 default_branch 常是空的（初始化还没跑完），补查一次。
+        branch = info.get("default_branch")
+        if not branch and info.get("full_name"):
+            with _client() as client:
+                branch = client.default_branch(info["full_name"])
+        return dump(
+            {
+                "ok": True,
+                "full_name": info.get("full_name"),
+                "default_branch": branch,
+                "private": info.get("private"),
+                "html_url": info.get("html_url"),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_delete_repository(repo: str) -> str:
+    """删掉一个代码仓，连同里面的代码和提交历史，不可恢复。
+
+    只删仓库本身；仓里跑过的任务和数据集/模型库不受影响，需要的话分别用
+    openi_delete_task / openi_delete_dataset / openi_delete_model 处理。
+
+    repo: 代码仓全名 owner/name。平台删仓同样偏慢，会在服务端先跑一会儿。
+    """
+    try:
+        with _client() as client:
+            client.delete_repo(repo)
+        return dump({"ok": True, "repo": repo, "deleted": True})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_repo_files(repo: str, ref: Optional[str] = None, path: str = "") -> str:
+    """列出代码仓某个目录与全部分支，用于确定启动文件 boot_file（例如 train.py）。
+
+    repo: 代码仓全名 owner/name。
+    ref: 分支或提交，留空用默认分支。
+    path: 仓内目录，留空是根目录，例如 "src" 或 "src/models"。
+    """
+    try:
+        with _client() as client:
+            files = client.repo_contents(repo, ref=ref, path=path)
             branches = client.repo_branches(repo)
-        names = [f.get("name") for f in files] if isinstance(files, list) else files
+        if isinstance(files, list):
+            entries = [
+                {"name": f.get("name"), "type": f.get("type"), "size": f.get("size")}
+                for f in files
+                if isinstance(f, dict)
+            ]
+        else:
+            entries = files
         branch_names = [b.get("name") for b in branches] if isinstance(branches, list) else branches
-        return dump({"ok": True, "files": names, "branches": branch_names})
+        return dump({"ok": True, "path": path, "files": entries, "branches": branch_names})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_read_repo_file(
+    repo: str,
+    path: str,
+    ref: Optional[str] = None,
+    encoding: str = "utf-8",
+    save_to: Optional[str] = None,
+    max_bytes: int = 2_000_000,
+) -> str:
+    """读取代码仓里的一个文件，用于确认 boot_file 里的启动入口、依赖或超参。
+
+    repo: 代码仓全名 owner/name。path: 仓内路径，例如 src/train.py。
+    ref: 分支或提交，留空用默认分支。
+    encoding: 按该编码解码成文本，默认 utf-8；解码不了说明是二进制文件。
+    save_to: 给了就把原始字节写到本地这个路径（二进制或大文件用这条），返回 md5。
+    max_bytes: 直接拒绝的大小上限，默认 2MB，0 表示不限制。
+    """
+    try:
+        with _client() as client:
+            data = client.read_repo_file(repo, path, ref=ref, max_bytes=max_bytes)
+        blob = data.pop("bytes")
+        if save_to:
+            dest = os.path.abspath(os.path.expanduser(save_to))
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            with open(dest, "wb") as handle:
+                handle.write(blob)
+            return dump(
+                {
+                    "ok": True,
+                    **data,
+                    "saved_to": dest,
+                    "md5": hashlib.md5(blob).hexdigest(),
+                }
+            )
+        try:
+            text = blob.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            return dump(
+                {
+                    "ok": True,
+                    **data,
+                    "binary": True,
+                    "note": f"按 {encoding} 解不出来，是二进制文件；需要落盘请传 save_to。",
+                }
+            )
+        return dump({"ok": True, **data, "text": text})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_write_repo_file(
+    repo: str,
+    path: str,
+    content: str,
+    message: Optional[str] = None,
+    branch: Optional[str] = None,
+    dry_run: bool = False,
+) -> str:
+    """往代码仓写一个文本文件（新建或覆盖），走平台 contents 接口，不需要本地 git。
+
+    典型用法：先 openi_push_repo_files 传代码，再用这个工具改 train.py 的
+    超参或 boot_file 里的入口，然后 openi_start_task。
+
+    repo: 代码仓全名 owner/name。path: 仓内路径。content: 文件正文（文本）。
+    message: 提交信息，留空自动生成。branch: 目标分支，留空用默认分支。
+    dry_run: True 时只回显会新建还是覆盖，不提交。
+    """
+    try:
+        with _client() as client:
+            if dry_run:
+                exists = client.repo_file_sha(repo, path) is not None
+                return dump(
+                    {
+                        "ok": True,
+                        "dry_run": True,
+                        "repo": repo,
+                        "path": path,
+                        "branch": branch,
+                        "action": "update" if exists else "create",
+                        "bytes": len(content.encode("utf-8")),
+                    }
+                )
+            result = client.write_repo_file(
+                repo, path, content, message=message or "", branch=branch
+            )
+        info = result.get("content") if isinstance(result, dict) else {}
+        commit = result.get("commit") if isinstance(result, dict) else {}
+        return dump(
+            {
+                "ok": True,
+                "repo": repo,
+                "path": (info or {}).get("path", path),
+                "sha": (info or {}).get("sha"),
+                "commit_sha": (commit or {}).get("sha"),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_push_repo_files(
+    repo: str,
+    paths: list[str],
+    remote_dir: str = "",
+    message: Optional[str] = None,
+    branch: Optional[str] = None,
+    dry_run: bool = False,
+    max_bytes: Optional[int] = None,
+    max_file_bytes: int = MAX_REPO_FILE_BYTES,
+) -> str:
+    """把本地文件/目录提交进代码仓，每个文件一个提交——不用装 git 就能发文代码去跑任务。
+
+    repo: 代码仓全名 owner/name。
+    paths: 本地文件或目录路径列表；目录会递归收集并保留目录结构。建议绝对路径。
+    remote_dir: 仓内前缀目录，例如 "src"；留空则放在根目录。
+    message: 提交信息，留空自动生成。
+    branch: 目标分支，留空用默认分支。
+    dry_run: True 时只回显会上传哪些文件、共多少字节，不提交。
+    max_bytes: 整批总量上限，超出直接拒绝。
+    max_file_bytes: 单文件上限，默认 50MB——contents 接口用 base64 传、文件会进内存，
+    更大的文件请改用 git 推送。
+    """
+    try:
+        entries = expand_upload_paths(paths, remote_dir=remote_dir)
+        with _client() as client:
+            result = client.push_repo_files(
+                repo,
+                entries,
+                message=message or "",
+                branch=branch,
+                dry_run=dry_run,
+                max_bytes=max_bytes,
+                max_file_bytes=max_file_bytes,
+            )
+        return dump({"ok": True, **result})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -960,11 +1221,36 @@ def openi_list_repo_tasks(repo: str) -> str:
 
 
 @mcp.tool()
-def openi_task_logs(task_id: str, repo: Optional[str] = None, lines: int = 200, order: str = "desc") -> str:
-    """读取计算任务的运行日志，默认最近 200 行。"""
+def openi_task_logs(
+    task_id: str,
+    repo: Optional[str] = None,
+    lines: int = 200,
+    order: str = "desc",
+    base_line: int = -1,
+    node_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+) -> str:
+    """读取计算任务的运行日志，默认最近 200 行。
+
+    训练任务写日志文件时，重复调用可以把最后一次的 base_line 传进来续读，
+    用来跟进训练进度。
+
+    order: desc 从尾部往前取（默认，看最新），asc 从头开始。
+    base_line: 从这一行之后继续读；-1 表示从 order 指定的那一端开始。
+    node_id: 多机任务里指定节点。
+    file_name: 训练任务里指定日志文件名。
+    """
     try:
         with _client() as client:
-            logs = client.task_log(task_id, lines=lines, order=order, repo=repo)
+            logs = client.task_log(
+                task_id,
+                lines=lines,
+                order=order,
+                base_line=base_line,
+                node_id=node_id,
+                file_name=file_name,
+                repo=repo,
+            )
         return dump({"ok": True, "logs": logs})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)

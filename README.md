@@ -121,6 +121,14 @@ Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即�
 `openi_start_task(..., pretrain_model_id_str="FoundationModel/llama_model_7B")`，
 不用先把十几 GB 的权重拖下来。
 
+**改代码再开卡。** “把这个目录传成一个新仓 `my-train`，把 `train.py` 里
+`epochs=10` 改成 `epochs=1`，然后拿一张 V100 跑一遍。”助手用
+`openi_create_repository` 建仓，`openi_push_repo_files` 把本地目录按原结构提交上去
+（每个文件一个提交，不需要本地 git），`openi_read_repo_file` / `openi_write_repo_file`
+读改写代码，再 `openi_start_task` 指定这个仓和分支。`openi_list_repo_files` 传
+`path` 可以翻子目录。建仓和删仓在平台上都要跑几十秒，工具已经放宽了超时；超时不代表
+失败，回查 `openi_list_my_repositories` 确认即可。用完 `openi_delete_repository` 删仓。
+
 **收拾现场。** “把我的调试任务都停掉/删掉。”助手用 `openi_list_tasks` 找到任务，再
 `openi_stop_task` / `openi_delete_task`。
 
@@ -133,7 +141,7 @@ python -m openi_bridge.autopoint --status
 python -m openi_bridge.install_mcp --apply
 ~~~
 
-完整的 41 个工具见下面的[工具全表](#工具全表)。创建任务的顺序是固定的：`openi_whoami`
+完整的 47 个工具见下面的[工具全表](#工具全表)。创建任务的顺序是固定的：`openi_whoami`
 → `openi_list_creation_options` → 选代码仓和分支 → `openi_start_task` →
 `openi_get_task` / `openi_task_debug_url` → 用完 `openi_stop_task`，必要时
 `openi_delete_task`。
@@ -328,12 +336,13 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 
 ## 工具全表
 
-共 41 个工具，都是 `openi_` 前缀。
+共 47 个工具，都是 `openi_` 前缀。
 
 | 工具 | 作用 |
 | --- | --- |
 | openi_whoami | 查看令牌对应的账号，确认令牌可用 |
 | openi_list_resources | 列出集群、卡型、积分单价与计费规则（离线目录） |
+| openi_notifications | 查看账号通知（评论、@、issue），可只看未读并带未读总数 |
 | openi_list_creation_options | 列出当前账号实时可开的规格（含 spec_id）与镜像、余额 |
 | openi_estimate_runtime | 按当前积分余额估算每个规格还能开多少机时（小时/天，已按 6 分钟向下取整） |
 | openi_points | 查看积分余额、单日获取上限与平台公布的完整获取规则 |
@@ -346,7 +355,12 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_list_public_images | 列出可真正拉起的公共镜像地址（平台推荐 + 自己收藏） |
 | openi_list_my_repositories | 列出自己的代码仓（创建任务要指定代码仓） |
 | openi_search_repositories | 搜索公开代码仓 |
-| openi_list_repo_files | 列出代码仓文件与分支，用于确定启动文件 |
+| openi_create_repository | 新建代码仓（owner 固定为当前账号），建完可直接推代码去跑任务 |
+| openi_delete_repository | 删除代码仓（连同代码与提交历史，不可恢复） |
+| openi_push_repo_files | 把本地文件/目录提交进代码仓，每文件一个提交，不需要本地 git |
+| openi_read_repo_file | 读取仓内单个文件（可落盘），用于确认启动入口或超参 |
+| openi_write_repo_file | 新建或覆盖仓内一个文本文件，产生一个提交 |
+| openi_list_repo_files | 列出代码仓某个目录的文件（含类型/大小）与全部分支，用于确定启动文件 |
 | openi_get_task | 按任务 ID 查询详情与状态 |
 | openi_list_tasks | 列出当前账号的全部任务（跨所有代码仓） |
 | openi_list_repo_tasks | 列出某个代码仓下的所有任务 |
@@ -379,7 +393,10 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 本工具基于平台前端实际调用的 REST 接口（`/api/v1/...`）实现，创建任务的请求体取自平台
 源码 `entity.CreateReq`。已用真实令牌验证过的接口与行为：
 
-- 账号与代码仓：`/user`、`/user/repos`、`/repos/{owner}/{repo}`、`/branches`、`/contents`。
+- 账号与代码仓：`/user`、`/user/repos`（`POST` 建仓）、`DELETE /repos/{owner}/{repo}`
+  删仓、`/repos/{owner}/{repo}`、`/branches`、`/right`（写权限）、`/contents` 目录列表，
+  以及文件读写 `GET/POST/PUT /repos/{owner}/{repo}/contents/{path}`（POST 新建、PUT 覆盖
+  需带旧 blob sha）。
 - 资源发现：`/ai_task/creation/required` 返回当前账号在指定 `job_type` + `compute_source`
   + `cluster_type` 下真实可用的规格列表（含数字 `spec_id`、卡型、卡数、CPU/内存、单价）、
   可用镜像、默认任务名、积分余额，以及 `can_create_more` / `not_stop_task_count` 等配额信息。
@@ -424,6 +441,18 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 - 文件本身落在华为 OBS（`obs.cn-south-222.ai.pcl.cn`）上，是持久化存储：上传成功后
   不随任务或会话消失，删除只能通过 `openi_delete_dataset` / `openi_delete_model`
   （`batch_delete`）显式触发。
+- 代码仓写入走 Gitea 风格的 `contents` 接口：新建用 `POST`、覆盖用 `PUT` 且必须带旧
+  blob 的 sha（工具会先查一次 sha 再决定用哪个动词），因此**每个文件一个提交**。平台的
+  多文件提交入口（`POST /repos/{owner}/{repo}/contents` 批量、`POST /git/blobs`）在这套
+  部署上都是 404，所以没有批量提交这条路径。
+- 单文件走 base64（整个文件进内存），因此 `openi_push_repo_files` 有单文件上限
+  `MAX_REPO_FILE_BYTES`（50MB）；更大的文件请改用 local git 推送。
+- 没有做成工具的 `DELETE /repos/{owner}/{repo}/contents/{path}`：这条路由在平台上会一直
+  挂到代理的 60 秒超时（504/502）且不删文件，包一层只会给出假的成功，所以故意不提供。
+  要换内容就覆盖写，要清空就删掉整个仓。
+- 建仓（`POST /user/repos`）与删仓（`DELETE /repos/{owner}/{repo}`）在平台侧都要跑几十秒
+  （实测建仓 30 秒以上、删仓约 7 秒），工具默认给 180 秒超时；超时不代表失败，请回查
+  `openi_list_my_repositories` 确认，不要重复建仓。
 - 检索与下载用的是 REST 面（`/api/v1/...`），和积分那批 web 接口不同：这里带
   `Authorization: Bearer`，而不需要 Basic。注意 `httpx.Client(base_url=...)` 必须写成
   `"{endpoint}/api/v1"`，只填 endpoint 会让 `/aimodel/file` 之类返回 404。
