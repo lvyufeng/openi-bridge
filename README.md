@@ -96,6 +96,15 @@ Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即�
 `spec_id` 和镜像，再 `openi_start_task` 建任务，`openi_get_task` 跟状态，
 `openi_task_debug_url` 取入口。
 
+**起一个在线服务。** “把这个仓里的 `serve.py` 起成在线推理，给我一个外网地址。”
+助手用 `openi_start_task(job_type="ONLINEINFERENCE", compute_source="GPU", boot_file="serve.py")`
+建任务（在线推理只支持 GPU，当前账号同时只能开一个），等它 RUNNING 后用
+`openi_task_service_url` 拿到 `https://<hex>.mlunotebook.openi.org.cn` 这样的地址。
+容器里的服务要监听 8000 端口——平台默认把外部流量转到这个端口，且不会往容器注入
+`PORT` / `SERVICE_PORT` 之类的环境变量，服务自己写死或按自己的约定读端口。这个地址在
+服务预热好之前会返回 `code 99`（“The service is loading”），隔一会儿再取即可。在线
+推理任务不会自动停，会一直计费，用完记得 `openi_stop_task` / `openi_delete_task`。
+
 **临时跑一段代码。** “在云脑上跑 `print(torch.cuda.is_available())` 看看有没有卡”，或者
 “开张 GCU 跑一下 `efsmi`”。助手调 `openi_run_on_card`，建任务、连 Jupyter 内核执行、
 把 stdout 带回来、顺手清理，全过程你不用管任务 ID。
@@ -145,7 +154,7 @@ python -m openi_bridge.autopoint --status
 python -m openi_bridge.install_mcp --apply
 ~~~
 
-完整的 59 个工具见下面的[工具全表](#工具全表)。从零创建任务的顺序是固定的：`openi_whoami`
+完整的 60 个工具见下面的[工具全表](#工具全表)。从零创建任务的顺序是固定的：`openi_whoami`
 → `openi_list_creation_options` → 选代码仓和分支 → `openi_start_task` →
 `openi_get_task` / `openi_task_debug_url` → 用完 `openi_stop_task`，必要时
 `openi_delete_task`。想省掉“自己找仓、自己配 spec、自己挂数据集”这几步，就先用
@@ -347,7 +356,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 
 ## 工具全表
 
-共 59 个工具，都是 `openi_` 前缀。
+共 60 个工具，都是 `openi_` 前缀。
 
 | 工具 | 作用 |
 | --- | --- |
@@ -386,6 +395,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_task_resource_usage | 查看任务实时算力占用 |
 | openi_task_debug_url | 获取调试任务的 Jupyter / SSH 入口 |
 | openi_task_visualize_url | 获取训练任务的 TensorBoard 入口 |
+| openi_task_service_url | 获取在线推理（ONLINEINFERENCE）任务的对外服务地址 |
 | openi_list_task_templates | 浏览任务模板广场：别人配好的一键开任务模板（含代码仓、分支、启动文件、卡型卡数、镜像、数据集/模型挂载） |
 | openi_get_task_template | 按模板 ID 查一个模板的完整配置 |
 | openi_collect_task_template | 收藏 / 取消收藏任务模板 |
@@ -441,8 +451,8 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   的实时清单里配对的（实测 NPU MNIST 模板配到 spec 328，挂上 MnistDataset_mindspore
   开 DEBUG 任务能到 RUNNING，代码仓可以直接用模板自带的公开示例仓）。
 - 任务读写：`/ai_task`、`/ai_task/brief`、`/ai_task/log`、`/ai_task/resource_usage`、
-  `/ai_task/debug_url`、`/ai_task/visualize_url`、`/ai_task/my_list`（账号级任务列表）、
-  `/{owner}/{repo}/ai_task`（按仓列表）。
+  `/ai_task/debug_url`、`/ai_task/visualize_url`、`/ai_task/self_endpoint_url`（在线推理
+  的对外地址）、`/ai_task/my_list`（账号级任务列表）、`/{owner}/{repo}/ai_task`（按仓列表）。
 - 任务变更：`POST /{owner}/{repo}/ai_task/create`、`/ai_task/stop`、`/ai_task/restart`、
   `/ai_task/del`、`/ai_task/batch_del`。
 - 数据集与模型：`GET /dataset?dataset_name=`、`GET /aimodel?aimodel_name=`（拿 UUID 与
@@ -561,6 +571,29 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 - 创建是异步的：`create` 立即返回任务 ID（状态 `PREPARING`），随后集群异步拉起。如果集群
   侧排队或拉起失败，任务会进入失败态，且不计费；用 `openi_get_task` 观察状态。
 - DEBUG 任务不需要 `boot_file`；训练类任务需要以 `.py` 结尾的 `boot_file`。
+- 在线推理（`job_type=ONLINEINFERENCE`）**只支持 GPU**：同样的 job_type 配
+  `compute_source=NPU` 时 `/ai_task/creation/required` 返回的规格清单是空的，开不了。
+  GPU 下实测给的是 A100 与 V100 两档（spec 237 / 210，单价 9 / 6 分/卡时），`images`
+  字段为 `None`，所以不指定镜像时会走 `image_url` 默认镜像（实测能拉起）。配额上
+  `limit_count` 通常是 1，即同一时刻只能有一个在线推理任务（`can_create_more` 反映
+  当前是否还能开）。
+- 在线推理任务把外部流量转到容器内的 **8000 端口**（任务详情的 `port` 字段就是这个值，
+  `end_point` 是平台自动生成的一段 hex）。平台**不会**向容器注入 `PORT` / `SERVICE_PORT`
+  之类的端口环境变量（实测 `env_PORT` 为 null），服务必须自己监听 8000。任务 RUNNING
+  后 `GET /ai_task/self_endpoint_url?id=` 返回真实地址（形如
+  `https://<hex>.mlunotebook.openi.org.cn`）。这个地址在任务还是 WAITING 时就已返回，
+  但那会儿服务没起来、连不上；预热期间该接口也可能返回 `code 99`
+  （"The service is loading"），隔一会儿重试即可。实测在这条地址上 GET 与 POST 都能
+  收到容器里服务的响应。
+- 在线推理的自定义访问路径与端口在请求体里的字段名是 `endpoint` / `port`，但平台对
+  这两个值校验很严（只传 `port` 报 2030 "Custom path and port must be filled in"，
+  再补 `endpoint` 又变成 9009 系统错误），所以工具没有把它们做成参数，需要时用
+  `extra_fields` 自己拼，并接受可能被拒。
+- 在线推理任务**不会自动停止**，会一直计费；训练任务里那套 `time_limit` 自动停止在这
+  条路径上没有用。实测过程中 `openi_task_logs` 在任务运行期间返回 "The AI task is still
+  running"（推理任务不落日志），`openi_task_resource_usage` 返回 6003 "Does not support
+  displaying resource usage data yet"，`visualize_url` 返回空串——这几点都是平台行为，
+  不是工具的问题。
 - 账号级任务列表用的是 `/ai_task/my_list`，它在平台前端真实存在，但字段较少；更完整的信息
   用 `openi_get_task`。
 - 镜像：只有 NVIDIA GPU 的登记 `image_id` 在 C2Net 上拉不起来（`image not available`），

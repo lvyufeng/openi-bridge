@@ -1,0 +1,83 @@
+在线推理（ONLINEINFERENCE）端到端实测记录（2026-10-16）
+========================================================
+
+走的路径：openi_start_task 建 ONLINEINFERENCE 任务 → openi_get_task / 新增的
+openi_task_service_url 取对外地址 → 对地址发 GET / POST 拿到容器里服务的响应 →
+openi_stop_task → openi_delete_task。
+
+账号实时可开的规格（GET /ai_task/creation/required?job_type=ONLINEINFERENCE&compute_source=GPU）：
+
+    specs = [(237, A100, 1, unit_price=9), (210, V100, 1, unit_price=6)]
+    images = None        <- 这个 job_type 没有登记镜像，走 image_url 默认镜像
+    limit_count = 1      <- 同时只能有一个在线推理任务
+    can_create_more = True
+
+同样的 job_type 换成 compute_source=NPU，specs 为空列表，开不了。
+
+创建（openi_start_task，spec 237 / A100 / C2Net / boot_file=serve.py）：
+
+    {"id": 000000, "status": ""}
+
+状态流转：WAITING（约 40 秒）→ RUNNING；任务详情里 port=8000、
+end_point=y4c98dbaecfb4602、app_name=""。
+
+注意：/ai_task/self_endpoint_url 早在状态还是 WAITING 时就已经返回地址了，但那时服务
+还没起来、连不上；要等服务侧真正就绪。本轮拿到地址时（第 3 次轮询、状态 WAITING）：
+
+    {"url": "https://<notebook-host>"}
+
+RUNNING 后用 openi_task_service_url 取到的完整结果：
+
+    {"task_id": "000000", "status": "RUNNING", "port": 8000,
+     "end_point": "y4c98dbaecfb4602", "app_name": "",
+     "url": "https://<notebook-host>"}
+
+openi_get_task 对 ONLINEINFERENCE 任务会自动带上 service 字段（内容同上）。
+
+对地址发真实请求（容器里跑的是标准库 http.server，监听 8000）：
+
+    GET  -> 200 {"ok": true, "path": "/", "model": "scratch-repo", "env_PORT": null}
+    POST {"hello":"openi"} -> 200 {"ok": true, "echo": "{\"hello\": \"openi\"}"}
+
+env_PORT 为 null 说明平台没有往容器注入端口环境变量，服务必须自己监听 8000。
+
+仓内 serve.py（本次用的探针服务）：
+
+    import json, os
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    PORT = int(os.environ.get("PORT") or os.environ.get("SERVICE_PORT") or 8000)
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, obj):
+            body = json.dumps(obj, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._send({"ok": True, "path": self.path, "model": "scratch-repo",
+                        "env_PORT": os.environ.get("PORT")})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            data = self.rfile.read(n).decode("utf-8", "replace")
+            self._send({"ok": True, "echo": data})
+
+    HTTPServer(("0.0.0.0", PORT), H).serve_forever()
+
+收尾：stop（STOPPING → STOPPED）→ del（删除成功）。任务存活约 22 秒（RUNNING 计费窗口），
+不足 6 分钟不扣费。探针用的临时私有仓 scratch-repo（id 177565）用完已删除。
+
+三条平台行为记在这里（都不是工具的问题）：
+
+1. 任务运行期间 /ai_task/log 返回 "The AI task is still running. Please check the logs
+   once it completes."——在线推理任务不落日志。
+2. /ai_task/resource_usage 返回 6003 "Does not support displaying resource usage data yet"。
+3. /ai_task/visualize_url 返回 {"url": ""}。
+
+自定义访问路径与端口：请求体里的字段名是 endpoint / port。只传 port=8000 时报
+2030 "Custom path and port must be filled in"；再补上 endpoint 变成 9009 系统错误。
+所以这次没有用自定义路径，让平台用默认值（port 8000、end_point 自动生成）。

@@ -37,6 +37,7 @@ delete the whole repo instead.
     GET  /api/v1/ai_task/resource_usage?id=        live card/CPU usage
     GET  /api/v1/ai_task/debug_url?id=             Jupyter / SSH entry point
     GET  /api/v1/ai_task/visualize_url?id=         TensorBoard entry point
+    GET  /api/v1/ai_task/self_endpoint_url?id=     ONLINEINFERENCE service URL
     GET  /api/v1/ai_task/creation/required         live specs, images, balance
     GET  /api/v1/ai_task/creation/image_by_spec    images usable for a spec
     GET  /api/v1/images/recommend                  platform recommended images
@@ -1758,6 +1759,53 @@ class OpenIClient:
         """TensorBoard entry point of a training task."""
         return self.get_json("/ai_task/visualize_url", params={"id": task_id})
 
+    def self_endpoint_url(self, task_id: Any) -> Any:
+        """GET /api/v1/ai_task/self_endpoint_url?id= - ONLINEINFERENCE 的对外地址。
+
+        只有 ONLINEINFERENCE 任务才有对外地址，平台返回
+        {"url": "https://<hex>.mlunotebook.openi.org.cn"}。这个地址在任务还是
+        WAITING 时就已返回，但那时服务没起来、连不上；预热期间该接口也会返回
+        {"code": 99, "msg": "The service is loading, please try again later."}，
+        隔一会儿重试即可。非在线推理任务拿到的是空 url。
+        """
+        return self.get_json("/ai_task/self_endpoint_url", params={"id": task_id})
+
+    def service_url(self, task_id: Any) -> Dict[str, Any]:
+        """在线推理服务的对外地址，附带平台自动生成的 end_point 与端口。
+
+        先用 /ai_task/self_endpoint_url 拿真实可访问的 URL（服务没起来时它会返回
+        code 99，这里把状态原样带回去让人知道该重试），同时读任务详情里的
+        end_point / port 作为兜底信息。注意容器里的服务必须监听任务详情的
+        port 字段（在线推理固定 8000），平台不会往容器注入 PORT /
+        SERVICE_PORT 之类的环境变量。
+        """
+        info: Dict[str, Any] = {"task_id": task_id}
+        try:
+            data = self.task(task_id)
+        except OpenIError:
+            data = None
+        task = data.get("task") if isinstance(data, Mapping) and isinstance(data.get("task"), Mapping) else data
+        if isinstance(task, Mapping):
+            info["status"] = task.get("status")
+            info["port"] = task.get("port")
+            info["end_point"] = task.get("end_point")
+            info["app_name"] = task.get("app_name")
+        try:
+            url_data = self.self_endpoint_url(task_id)
+        except OpenIError as exc:
+            info["url_error"] = str(exc)
+            return info
+        if isinstance(url_data, Mapping):
+            if "url" in url_data:
+                info["url"] = url_data.get("url")
+            # 平台错误信封是 {code, msg}（加载中时 code 为 99）。
+            if "code" in url_data:
+                info["code"] = url_data.get("code")
+                info["msg"] = url_data.get("msg")
+        else:
+            info["url"] = url_data
+        return info
+
     def task_action(self, action: str, task_id: Any, repo: Optional[str] = None) -> Any:
         """Run stop / restart / del on a task.
 
@@ -1929,6 +1977,15 @@ class OpenIClient:
         family other than NVIDIA GPU, so when the caller does not pass one we
         fall back to the repo's default branch. That branch is reported in
         _branch_name.
+
+        job_type=ONLINEINFERENCE（在线推理 / 模型体验）只支持 GPU：NPU 的规格
+        清单为空，开了也起不来。它的 images 为 None，所以不传镜像时会走
+        DEFAULT_IMAGE_URL（实测能拉起）。平台默认对外端口是 8000，容器里的服务
+        必须监听这个端口（PORT / SERVICE_PORT 之类的环境变量不会被注入）。
+        /ai_task/creation/required 里 limit_count 通常为 1，即同时只能有一个在线
+        推理任务。自定义访问路径与端口的字段名是 endpoint / port，但平台对这两
+        个值校验很严（实测直接传会被拒），所以这里只透传 extra，不替调用方拼。
+        任务 RUNNING 之后用 self_endpoint_url() / service_url() 取对外地址。
         """
         image_source = "explicit"
         branch_source = "explicit"

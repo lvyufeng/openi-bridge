@@ -12,6 +12,10 @@
 `task-template-e2e-task-000000.txt` 也不是 SMI 输出，是任务模板链路的实测记录：取模板 →
 按卡型卡数配对实时 spec → 开任务 → RUNNING → 停止 → 删除。
 
+`online-inference-e2e-task-000000.txt` 是在线推理链路的实测记录：建 ONLINEINFERENCE 任务 →
+取对外服务地址 → 对地址发 GET / POST 拿到容器里服务的响应 → 停止 → 删除。这份记录了
+平台默认端口 8000、地址在 WAITING 阶段就已返回、以及自定义路径/端口会被平台拒的细节。
+
 | 文件 | 算力 | spec_id | 任务号 | 关键内容 |
 | --- | --- | --- | --- | --- |
 | `gpu-v100-task-000000.txt` | NVIDIA GPU | 210 | 000000 | `nvidia-smi`：Tesla V100S-PCIE-32GB，32768 MiB，驱动 570.124.06 / CUDA 12.8 |
@@ -25,6 +29,7 @@
 | `biren106m-task-000000.txt` | 壁仞 GPU | 347 | 000000 | `brsmi`：Biren106M，32512 MiB，BR-SMI 1.10.1 / SUPA 1.10 |
 | `code-repo-e2e-task-000000.txt` | NVIDIA GPU | 210 | 000000 | 代码仓链路：建仓/推文件/覆盖写/用该仓跑 TRAIN，日志出现被写入的 `print` |
 | `task-template-e2e-task-000000.txt` | 昇腾 NPU | 328 | 000000 | 任务模板链路：模板 → 实时 spec 配对 → 开任务 → RUNNING → 停止并删除 |
+| `online-inference-e2e-task-000000.txt` | NVIDIA GPU | 237 | 000000 | 在线推理链路：建 ONLINEINFERENCE → 取服务地址 → GET/POST 拿到响应 → 停止并删除 |
 
 `METAX-GPGPU`（沐曦 C500，spec 333）没有输出。2026-10-14 连续 9 次 DEBUG 任务都没
 调度到卡，而且失败方式不一致：前 7 次（含 000000、000000）一直停在 `centerPending`

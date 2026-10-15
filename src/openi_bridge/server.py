@@ -51,7 +51,9 @@ mcp = _Server(
         "openi_list_creation_options 拿到实时的 spec_id 与镜像；openi_list_task_templates "
         "列出别人配好的一键运行模板，openi_start_task_from_template 可以直接照着模板开任务"
         "（模板自带代码仓/分支/启动文件/数据集挂载），openi_list_compute_resources 看平台"
-        "在线的算力中心与卡型。使用前必须设置 "
+        "在线的算力中心与卡型。在线推理任务（job_type=ONLINEINFERENCE）用 openi_start_task "
+        "建，容器里的服务监听 8000 端口，RUNNING 之后用 openi_task_service_url 取对外地址。"
+        "使用前必须设置 "
         "OPENI_TOKEN 环境变量，令牌在 https://openi.pcl.ac.cn/user/settings/applications 生成。"
     ),
 )
@@ -1330,6 +1332,14 @@ def openi_get_task(task_id: str) -> str:
                 detail.update(client.task_brief(task_id) or {})
             except OpenIError:
                 pass
+            job_type = detail.get("job_type") or (
+                (detail.get("task") or {}).get("job_type") if isinstance(detail.get("task"), dict) else ""
+            )
+            if str(job_type).upper() == "ONLINEINFERENCE":
+                try:
+                    detail["service"] = client.service_url(task_id)
+                except OpenIError:
+                    pass
         return _ok(detail, ok=True)
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -1474,6 +1484,24 @@ def openi_task_visualize_url(task_id: str) -> str:
     try:
         with _client() as client:
             return dump({"ok": True, "visualize": client.visualize_url(task_id)})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_service_url(task_id: str) -> str:
+    """获取在线推理（ONLINEINFERENCE）任务的对外服务地址。
+
+    返回里的 url 就是可以直接访问的地址（形如 https://<hex>.mlunotebook.openi.org.cn），
+    同时带上任务详情里的 port 与平台自动生成的 end_point 作为补充。
+
+    只有 ONLINEINFERENCE 任务在 RUNNING 之后才有地址。服务还在预热时平台返回
+    code 99（"The service is loading"），等一会儿再调用即可；容器里的服务必须
+    监听 8000 端口，否则这个地址连不上。
+    """
+    try:
+        with _client() as client:
+            return dump({"ok": True, "service": client.service_url(task_id)})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -1710,7 +1738,11 @@ def openi_start_task(
 
     repo: 代码仓 owner/name，任务从该仓的代码运行。
     spec_id: 必填，规格 ID，来自 openi_list_creation_options。
-    job_type: DEBUG（交互调试，可开 Jupyter/SSH）/ TRAIN（训练）/ INFERENCE（批量推理）等。
+    job_type: DEBUG（交互调试，可开 Jupyter/SSH）/ TRAIN（训练）/ INFERENCE（批量推理）/
+      ONLINEINFERENCE（在线推理，起一个常驻服务并提供外部地址）等。
+      ONLINEINFERENCE 只支持 GPU，当前账号同时只能开一个；它没有登记镜像，会走
+      image_url 默认镜像；容器里的服务必须监听 8000 端口（平台不会注入端口环境变量）。
+      任务 RUNNING 后用 openi_task_service_url 取对外地址。
     compute_source: GPU / NPU / GCU / MLU / DCU / CPU / ILUVATAR-GPGPU / METAX-GPGPU / BIREN-GPU。
     cluster: 默认 C2Net（普通用户真实可用的集群）。
     display_job_name: 任务名，留空用平台默认名（必须是小写字母数字，3-36 位）。
