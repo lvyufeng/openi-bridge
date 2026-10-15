@@ -24,6 +24,8 @@ from .client import (
     dump,
     expand_upload_paths,
     summarize_spec,
+    summarize_task_template,
+    template_image_url,
 )
 from . import autopoint, exec_on_card
 from .resources import COMPUTE_SOURCES, POINT_ACTIONS, POINT_NOTES, describe_resources
@@ -46,7 +48,10 @@ mcp = _Server(
         "拿全文件树，openi_list_repo_commits 看提交历史，openi_download_repo_archive "
         "打包下载整仓，openi_create_repo_issue / openi_comment_repo_issue 在仓里提 issue "
         "与评论。数据集/模型库里的文件也能单个删除：openi_delete_subject_file。创建任务前先用 "
-        "openi_list_creation_options 拿到实时的 spec_id 与镜像。使用前必须设置 "
+        "openi_list_creation_options 拿到实时的 spec_id 与镜像；openi_list_task_templates "
+        "列出别人配好的一键运行模板，openi_start_task_from_template 可以直接照着模板开任务"
+        "（模板自带代码仓/分支/启动文件/数据集挂载），openi_list_compute_resources 看平台"
+        "在线的算力中心与卡型。使用前必须设置 "
         "OPENI_TOKEN 环境变量，令牌在 https://openi.pcl.ac.cn/user/settings/applications 生成。"
     ),
 )
@@ -82,6 +87,47 @@ def openi_whoami() -> str:
 def openi_list_resources() -> str:
     """列出启智社区可用的算力集群、卡型与积分单价（分/卡时）。"""
     return describe_resources()
+
+
+@mcp.tool()
+def openi_list_compute_resources() -> str:
+    """查平台实时上线的算力中心与卡型（比离线目录更全）。
+
+    回答的是“平台现在有什么”：哪些算力中心在线、在哪个城市、各有哪些卡型
+    （含 CPU 的 INTEL XEON、GPGPU 的 N100/N260、GPU 的 5090/A800 这些离线目录
+    里没有的）。它不代表账号现在能开哪些规格——那要用 openi_list_creation_options
+    拿实时 spec_id、单价与配额。价格参考 openi_list_resources。
+    """
+    try:
+        with _client() as client:
+            data = client.compute_resources()
+        cards = [
+            {"compute_source": row.get("ComputeSource"), "card_types": row.get("CardList") or []}
+            for row in data.get("acc_card_types") or []
+            if isinstance(row, dict)
+        ]
+        centers = [
+            {
+                "code": row.get("AICenterCode"),
+                "name": row.get("AICenterName"),
+                "city": row.get("City"),
+                "province": row.get("Province"),
+                "compute_sources": row.get("ComputeSourceList") or [],
+                "card_types": row.get("AccCardTypeList") or [],
+            }
+            for row in data.get("ai_centers") or []
+            if isinstance(row, dict)
+        ]
+        return dump(
+            {
+                "ok": True,
+                "acc_card_types": cards,
+                "ai_centers": centers,
+                "note": "这是平台在线资源目录；能开哪些规格（spec_id、单价、配额）见 openi_list_creation_options。",
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
 
 
 @mcp.tool()
@@ -1428,6 +1474,209 @@ def openi_task_visualize_url(task_id: str) -> str:
     try:
         with _client() as client:
             return dump({"ok": True, "visualize": client.visualize_url(task_id)})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_task_templates(
+    q: str = "",
+    scope: str = "public",
+    job_type: str = "",
+    compute_source: str = "",
+    tags: Optional[list[str]] = None,
+    order_by: str = "",
+    page: int = 1,
+    page_size: int = 30,
+) -> str:
+    """浏览任务模板广场：别人配好的“一键开任务”模板，里面已带代码仓、分支、启动文件、
+    卡型卡数、镜像和要挂载的数据集/模型。
+
+    挑到合适的模板后直接用 openi_start_task_from_template 开任务，不需要自己找仓、
+    配 spec 或查数据集 UUID。相比 openi_list_creation_options（只列规格），这里列的是
+    别人跑通过的完整组合。
+
+    q: 关键词，按模板名模糊匹配（例如 "MNIST"、"ComfyUI"、"llama"），留空返回全部。
+    scope: public（平台公开的模板，约 1600 个）/ all（含私有，约 2700 个）/
+      created（自己创建的）/ collected（自己收藏的）。
+    job_type: DEBUG / TRAIN / INFERENCE / ONLINEINFERENCE 之一，留空不筛。
+    compute_source: GPU / NPU / GCU / MLU / DCU / ILUVATAR-GPGPU / METAX-GPGPU /
+      BIREN-GPU 之一，留空不筛。
+    order_by: 留空用平台默认顺序，可选 newest（最新）/ usecount（被用最多）/
+      collections（被收藏最多）。写别的平台会静默按默认顺序返回，所以这里直接报错。
+    page / page_size: 分页，默认第 1 页、每页 30 条，上限 100。
+
+    返回每项含 template_id、name、job_type、compute_source、acc_card_type、
+    acc_cards_num、repo（要跑的代码仓）、branch、boot_file、image_*、datasets、
+    models、use_count、collected。tags 是按模板自己的标签做精确匹配（大小写敏感，
+    取值多为中文，如 "调试任务"、"训练任务"、"NPU"），拿不准就用 q 搜关键词。
+    """
+    try:
+        with _client() as client:
+            result = client.list_task_templates(
+                scope=scope, q=q, job_type=job_type, compute_source=compute_source,
+                tags=tags, order_by=order_by, page=page, page_size=page_size,
+            )
+        return dump({"ok": True, **result})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_get_task_template(template_id: str) -> str:
+    """按模板 ID 查一个任务模板的完整配置（代码仓、分支、启动文件、镜像、要挂的数据集/模型）。
+
+    列表工具返回的字段这里都有，区别是这里能按 ID 精确取一条。注意平台只有
+    GET /ai_task_template?id= 这一个按 ID 取详情的入口，列表接口的 id 参数是无效的。
+    """
+    try:
+        with _client() as client:
+            tpl = client.task_template(template_id)
+        return dump({"ok": True, "template": summarize_task_template(tpl)})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_collect_task_template(template_id: str, collect: bool = True) -> str:
+    """收藏 / 取消收藏一个任务模板，收藏后在 scope="collected" 里能找到。
+
+    collect=False 表示取消收藏。
+    """
+    try:
+        with _client() as client:
+            client.collect_task_template(template_id, collect=collect)
+            listed = client.list_task_templates(scope="collected", page_size=100)
+        ids = [item.get("template_id") for item in listed.get("items") or []]
+        return dump(
+            {
+                "ok": True,
+                "template_id": template_id,
+                "collected": collect,
+                "collected_total": listed.get("total"),
+                "still_collected": template_id in ids,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_start_task_from_template(
+    template_id: str,
+    repo: Optional[str] = None,
+    display_job_name: Optional[str] = None,
+    boot_file: Optional[str] = None,
+    params: Optional[str] = None,
+    dataset_uuid_str: Optional[str] = None,
+    pretrain_model_id_str: Optional[str] = None,
+    has_internet: Optional[int] = None,
+    work_server_number: Optional[int] = None,
+    time_limit: Optional[int] = None,
+    use_template_image: bool = False,
+    extra_fields: Optional[str] = None,
+) -> str:
+    """照着一个任务模板开计算任务：模板里的代码仓、分支、启动文件、数据集/模型挂载
+    都会被带上，spec 由模板的卡型+卡数在当前账号的实时规格里配对得到。
+
+    这是最省事的一条开任务路径：openi_list_task_templates 挑一个 template_id，
+    直接传进来即可；不用自己查 spec_id、不用自己挂数据集。成功后立即开始计费
+    （不足 6 分钟不扣费），用完记得 openi_stop_task。
+
+    template_id: 来自 openi_list_task_templates / openi_get_task_template。
+    repo: 代码仓 owner/name，留空用模板自带的仓（公开模板的仓多为示例仓，平台允许
+      直接在上面开任务）。想跑自己的代码就填自己的仓。
+    display_job_name: 任务名，留空用平台默认名（小写字母数字，3-36 位）。
+    boot_file / params: 启动文件与运行参数，留空用模板里的；模板没写就留空。
+    dataset_uuid_str / pretrain_model_id_str: 挂载的数据集/模型，留空用模板自带的。
+      也可以写 owner/name 全名，工具会换成 UUID；写 "" 表示不挂载。
+    has_internet / work_server_number / time_limit: 留空用模板里的值。
+    use_template_image: 默认 False，即忽略模板里的镜像，用本工具实测能拉起的镜像
+      （模板的 ImageUrl 字段有些只是内部记录 UUID，直接拿去拉会失败）。模板确实
+      指定了特殊镜像（如在线推理的 openclaw-feishu-qwen3.5）时才置 True。
+    extra_fields: JSON 字符串，补充平台新增字段。
+    """
+    try:
+        extra = json.loads(extra_fields) if extra_fields else None
+        with _client() as client:
+            tpl = client.task_template(template_id)
+            spec = client.template_spec(tpl)
+            job_type = str(tpl.get("JobType") or "DEBUG")
+            source = str(tpl.get("ComputeSource") or "GPU")
+            cluster = str(tpl.get("Cluster") or DEFAULT_CLUSTER)
+            repo = repo or f'{tpl.get("RepoOwnerName")}/{tpl.get("RepoName")}'
+            boot = boot_file if boot_file is not None else (tpl.get("BootFile") or None)
+            mounts = dataset_uuid_str
+            if mounts is None:
+                mounts = ",".join(
+                    d.get("DatasetID")
+                    for d in (tpl.get("DatasetLists") or [])
+                    if not d.get("IsDeleted")
+                )
+            models = pretrain_model_id_str
+            if models is None:
+                models = ",".join(
+                    m.get("ModelID")
+                    for m in (tpl.get("ModelLists") or [])
+                    if not m.get("IsDeleted")
+                )
+            mounts = _resolve_mount_ids(client, mounts, "dataset")
+            models = _resolve_mount_ids(client, models, "model")
+            image_id = image_name = image_url = None
+            if use_template_image:
+                image_id = tpl.get("ImageID") or None
+                image_name = tpl.get("ImageName") or None
+                if not image_id:
+                    image_url = template_image_url(tpl)
+            workers = work_server_number
+            if workers is None:
+                workers = int(tpl.get("AccCardsNum") or 1)
+            internet = tpl.get("HasInternet") if has_internet is None else has_internet
+            result = client.create_task(
+                repo=repo,
+                spec_id=spec.get("id"),
+                display_job_name=display_job_name,
+                compute_source=source,
+                cluster=cluster,
+                job_type=job_type,
+                work_server_number=workers,
+                branch_name=tpl.get("BranchName") or None,
+                image_id=image_id,
+                image_name=image_name,
+                image_url=image_url,
+                boot_file=boot,
+                params=params,
+                dataset_uuid_str=mounts,
+                pretrain_model_id_str=models,
+                has_internet=int(internet if internet is not None else 2),
+                time_limit=time_limit,
+                visualize_required=bool(tpl.get("VisualizeRequired")),
+                extra=extra,
+            )
+            template_info = summarize_task_template(tpl)
+        return _ok(
+            result,
+            ok=True,
+            template={
+                "template_id": template_info.get("template_id"),
+                "name": template_info.get("name"),
+                "repo": repo,
+                "branch": template_info.get("branch"),
+                "boot_file": boot,
+                "job_type": job_type,
+                "compute_source": source,
+                "cluster": cluster,
+                "acc_card_type": spec.get("acc_card_type"),
+                "acc_cards_num": spec.get("acc_cards_num"),
+                "spec_id": spec.get("id"),
+                "unit_price": spec.get("unit_price"),
+                "datasets": mounts or None,
+                "models": models or None,
+                "used_template_image": bool(use_template_image),
+                "template_parameters": template_info.get("parameters"),
+                "note": "模板里的 Parameters（表单默认值）没有自动映射到 params，需要时请自己传 params。",
+            },
+        )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 

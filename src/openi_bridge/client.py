@@ -41,6 +41,12 @@ delete the whole repo instead.
     GET  /api/v1/ai_task/creation/image_by_spec    images usable for a spec
     GET  /api/v1/images/recommend                  platform recommended images
     GET  /api/v1/images/star                       images the account starred
+    GET  /api/v1/resources/ai_center/card_info/active  card types online now
+    GET  /api/v1/resources/ai_center/active        AI centers online now
+    GET  /api/v1/ai_task_template/list/{scope}     task template square
+    GET  /api/v1/ai_task_template?id=              one template (the only by-id route)
+    PUT  /api/v1/ai_task_template/collect?id=      collect a template
+    DELETE /api/v1/ai_task_template/collect?id=    uncollect a template
     POST /api/v1/{owner}/{repo}/ai_task/create     create + start a task
     POST /api/v1/ai_task/stop?id=                  stop a task (stop billing)
     POST /api/v1/ai_task/restart?id=               restart a stopped task
@@ -71,6 +77,11 @@ Data subjects (datasets / models) and their files:
 The create body follows entity.CreateReq from the platform source. Required
 keys are job_type, display_job_name, spec_id, compute_source and cluster.
 Spec ids are discovered live through /ai_task/creation/required.
+
+Task templates (the 任务模板 page) carry a whole runnable configuration - repo,
+branch, boot file, card type and count, image, mounted datasets - but no
+spec_id, so template_spec() matches (compute_source, acc_card_type,
+acc_cards_num) against the same live spec list before creating a task.
 """
 
 from __future__ import annotations
@@ -114,6 +125,11 @@ SUBJECT_LIST_ORDER = (
 SUBJECT_LIST_PAGE_SIZE = 30
 # 平台把 page_size 上限压到 100：再大就静默退回默认的 12 条，所以这里显式拦住。
 SUBJECT_LIST_MAX_PAGE_SIZE = 100
+# 任务模板（任务模板页的卡片列表）取值范围。列表走 /ai_task_template/list/{scope}，
+# 单条走 /ai_task_template?id=（列表接口的 id 参数是摆设，实测被忽略）。
+TEMPLATE_LIST_SCOPES = ("public", "all", "created", "collected")
+# 平台只认识这三个排序值，写别的会静默回落到默认排序，所以这里显式拦住。
+TEMPLATE_LIST_ORDER = ("newest", "usecount", "collections")
 # 递归列目录时的文件数上限，避免误对超大主体做全量 crawl。
 WALK_FILE_LIMIT = int(os.getenv("OPENI_WALK_FILE_LIMIT", "20000"))
 
@@ -459,11 +475,14 @@ class OpenIClient:
     def put_json(
         self,
         path: str,
+        params: Optional[Mapping[str, Any]] = None,
         json_body: Any = None,
         timeout: Optional[float] = None,
     ) -> Any:
         return _wrap(
-            _unwrap_text(self.request("PUT", path, json_body=json_body, timeout=timeout))
+            _unwrap_text(
+                self.request("PUT", path, params=params, json_body=json_body, timeout=timeout)
+            )
         )
 
     def delete_json(
@@ -1654,6 +1673,22 @@ class OpenIClient:
         """GET /images/star - images this account starred; all known to work."""
         return self.get_json("/images/star")
 
+    def compute_resources(self) -> Dict[str, Any]:
+        """平台上线的算力中心与卡型清单（比离线目录更全、更新）。
+
+        GET /resources/ai_center/card_info/active 给的是全平台在线卡型（比
+        /resources/acc_card/list 多出 CPU、GPGPU 的 N100/N260、GPU 的 5090/A800），
+        GET /resources/ai_center/active 给的是每个算力中心所在城市与卡型。
+        两者和 /ai_task/creation/required 不同：这里回答“平台有什么”，不回答
+        “我这个账号现在能开哪些规格”。
+        """
+        cards = self.get_json("/resources/ai_center/card_info/active") or {}
+        centers = self.get_json("/resources/ai_center/active") or {}
+        return {
+            "acc_card_types": cards.get("list") or [],
+            "ai_centers": centers.get("list") or [],
+        }
+
     # ------------------------------------------------------------- compute tasks
 
     def sdk_code(
@@ -1735,6 +1770,119 @@ class OpenIClient:
 
     def batch_delete(self, task_ids: List[Any]) -> Any:
         return self.post_json("/ai_task/batch_del", json_body={"id": list(task_ids)})
+
+    # ------------------------------------------------------------ task templates
+
+    def list_task_templates(
+        self,
+        scope: str = "public",
+        q: str = "",
+        job_type: str = "",
+        compute_source: str = "",
+        tags: Optional[List[str]] = None,
+        order_by: str = "",
+        page: int = 1,
+        page_size: int = SUBJECT_LIST_PAGE_SIZE,
+    ) -> Dict[str, Any]:
+        """任务模板广场（对应平台“任务模板”页的卡片列表）。
+
+        GET /ai_task_template/list/{scope}，scope 取 public / all / created /
+        collected；返回体是 {Page, PageSize, Total, Templates}。每行自带创建任务
+        需要的全部字段（JobType、Cluster、ComputeSource、AccCardType、
+        AccCardsNum、BranchName、BootFile、数据集与模型清单），所以挑一个模板
+        就能直接开任务，不需要再查详情。
+
+        tags 按模板自己的标签做精确匹配（大小写敏感，取值多为中文，如“调试任务”），
+        和广场数据集那种类别枚举不是一回事。
+        """
+        if scope not in TEMPLATE_LIST_SCOPES:
+            raise OpenIError(f"scope 只能是 {'/'.join(TEMPLATE_LIST_SCOPES)}：{scope!r}")
+        if order_by and order_by not in TEMPLATE_LIST_ORDER:
+            raise OpenIError(
+                f"order_by 只能是 {'/'.join(TEMPLATE_LIST_ORDER)} 或留空：{order_by!r}。"
+                f"平台对未知取值不报错，直接按默认顺序返回，所以这里不替你猜。"
+            )
+        page_size = int(page_size)
+        if not 1 <= page_size <= SUBJECT_LIST_MAX_PAGE_SIZE:
+            raise OpenIError(
+                f"page_size 必须在 1-{SUBJECT_LIST_MAX_PAGE_SIZE} 之间：{page_size}。"
+            )
+        params: Dict[str, Any] = {"page": int(page), "page_size": page_size}
+        if q:
+            params["q"] = q
+        if job_type:
+            params["job_type"] = job_type
+        if compute_source:
+            params["compute_source"] = compute_source
+        if order_by:
+            params["order_by"] = order_by
+        tags_csv = _csv(tags)
+        if tags_csv:
+            params["tags"] = tags_csv
+        data = self.get_json(f"/ai_task_template/list/{scope}", params=params) or {}
+        rows = data.get("Templates") or []
+        return {
+            "total": int(data.get("Total") or 0),
+            "page": int(data.get("Page") or page),
+            "page_size": int(data.get("PageSize") or page_size),
+            "items": [summarize_task_template(row) for row in rows],
+        }
+
+    def task_template(self, template_id: str) -> Dict[str, Any]:
+        """单个任务模板的完整详情：GET /ai_task_template?id=<uuid>。
+
+        列表接口不认识 id 参数（传了照旧返回首页），也没有
+        /ai_task_template/detail 之类的路由，只有这一个按 ID 取详情的入口。
+        """
+        if not template_id or not str(template_id).strip():
+            raise OpenIError("template_id 不能为空")
+        data = self.get_json("/ai_task_template", params={"id": str(template_id).strip()})
+        if not isinstance(data, Mapping):
+            raise OpenIError(f"没有拿到模板详情：{template_id!r}")
+        return dict(data)
+
+    def collect_task_template(self, template_id: str, collect: bool = True) -> Any:
+        """收藏 / 取消收藏任务模板（PUT / DELETE /ai_task_template/collect?id=）。"""
+        if not template_id or not str(template_id).strip():
+            raise OpenIError("template_id 不能为空")
+        params = {"id": str(template_id).strip()}
+        if collect:
+            return self.put_json("/ai_task_template/collect", params=params)
+        return self.delete_json("/ai_task_template/collect", params=params)
+
+    def template_spec(
+        self,
+        template: Mapping[str, Any],
+        compute_source: Optional[str] = None,
+        cluster: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """把模板换算成当前账号真正可开的 spec。
+
+        模板自己不带 spec_id（它记的是卡型与卡数），所以这里按
+        (compute_resource, acc_card_type, acc_cards_num) 去
+        /ai_task/creation/required 的实时清单里配对。对不上就报错，不猜。
+        """
+        source = compute_source or str(template.get("ComputeSource") or "")
+        cluster_type = cluster or str(template.get("Cluster") or DEFAULT_CLUSTER)
+        job_type = str(template.get("JobType") or "DEBUG")
+        info = self.creation_info(job_type, source, cluster_type)
+        specs = ((info.get("specs") or {}).get("all")) or []
+        want = (source, template.get("AccCardType"), template.get("AccCardsNum"))
+        for spec in specs:
+            got = (
+                spec.get("compute_resource"),
+                spec.get("acc_card_type"),
+                spec.get("acc_cards_num"),
+            )
+            if got == want:
+                return dict(spec)
+        listed = ", ".join(
+            f"{s.get('acc_card_type')}x{s.get('acc_cards_num')}" for s in specs
+        ) or "（空）"
+        raise OpenIError(
+            f"模板要的 {want[0]}/{want[1]}x{want[2]} 在当前账号的 {job_type} 可用规格里不存在。"
+            f"可用的有：{listed}"
+        )
 
     # ------------------------------------------------------------- create task
 
@@ -1893,6 +2041,87 @@ def _csv(value: Any) -> str:
     else:
         parts = list(value)
     return ",".join(str(p).strip() for p in parts if str(p).strip())
+
+
+TEMPLATE_IMAGE_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}$")
+
+
+def template_image_url(row: Mapping[str, Any]) -> Optional[str]:
+    """模板的 ImageUrl 字段有时是镜像地址，有时只是一个内部记录 UUID。
+
+    NPU 的 MNIST 模板给的是 318c8cac-2011-44c8-acee-21d6a1c138ff 这种 UUID，
+    拿它当镜像地址发给平台必然拉不起来；OpenClaw 模板给的则是
+    <host>:<port>/default-workspace/... 这种真地址。这里只认后者。
+    """
+    value = str(row.get("ImageUrl") or "").strip()
+    if not value or TEMPLATE_IMAGE_UUID_RE.match(value):
+        return None
+    if not IMAGE_URL_RE.match(value):
+        return None
+    return value
+
+
+def summarize_task_template(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """把一行任务模板压成“挑一个来开任务”需要的字段。"""
+    owner = row.get("RepoOwnerName") or ""
+    name = row.get("RepoName") or ""
+    raw_params = row.get("Parameters")
+    try:
+        parameters = json.loads(raw_params) if isinstance(raw_params, str) and raw_params else raw_params
+    except ValueError:
+        parameters = raw_params
+    return {
+        "template_id": row.get("ID"),
+        "name": row.get("Name"),
+        "description": row.get("Description"),
+        "tags": row.get("Tags") or [],
+        "job_type": row.get("JobType"),
+        "compute_source": row.get("ComputeSource"),
+        "cluster": row.get("Cluster"),
+        "acc_card_type": row.get("AccCardType"),
+        "acc_cards_num": row.get("AccCardsNum"),
+        "cpu_cores": row.get("CpuCores"),
+        "mem_gi_b": row.get("MemGiB"),
+        "gpu_mem_gi_b": row.get("GPUMemGiB"),
+        "image_id": row.get("ImageID"),
+        "image_name": row.get("ImageName"),
+        "image_url": template_image_url(row),
+        "image_url_raw": row.get("ImageUrl"),
+        "repo": f"{owner}/{name}" if owner and name else None,
+        "repo_deleted": bool(row.get("IsRepoDeleted")),
+        "branch": row.get("BranchName"),
+        "boot_file": row.get("BootFile") or None,
+        "parameters": parameters if parameters else None,
+        "has_internet": row.get("HasInternet"),
+        "visualize_required": bool(row.get("VisualizeRequired")),
+        "datasets": [
+            {
+                "uuid": d.get("DatasetID"),
+                "name": d.get("DatasetName"),
+                "alias": d.get("DatasetAlias"),
+                "owner": d.get("OwnerName"),
+                "deleted": bool(d.get("IsDeleted")),
+            }
+            for d in (row.get("DatasetLists") or [])
+        ],
+        "models": [
+            {
+                "id": m.get("ModelID"),
+                "name": m.get("ModelName"),
+                "alias": m.get("ModelAlias"),
+                "owner": m.get("OwnerName"),
+                "deleted": bool(m.get("IsDeleted")),
+            }
+            for m in (row.get("ModelLists") or [])
+        ],
+        "use_count": row.get("UseCount"),
+        "collections": row.get("NumCollections"),
+        "recommend": bool(row.get("Recommend")),
+        "collected": bool(row.get("IsCollected")),
+        "can_edit": bool(row.get("CanEdit")),
+        "author": (row.get("Owner") or {}).get("Name") if isinstance(row.get("Owner"), Mapping) else None,
+        "updated_unix": row.get("UpdatedUnix"),
+    }
 
 
 def summarize_subject(row: Mapping[str, Any], subject_type: str) -> Dict[str, Any]:

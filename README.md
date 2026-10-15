@@ -145,10 +145,11 @@ python -m openi_bridge.autopoint --status
 python -m openi_bridge.install_mcp --apply
 ~~~
 
-完整的 54 个工具见下面的[工具全表](#工具全表)。创建任务的顺序是固定的：`openi_whoami`
+完整的 59 个工具见下面的[工具全表](#工具全表)。从零创建任务的顺序是固定的：`openi_whoami`
 → `openi_list_creation_options` → 选代码仓和分支 → `openi_start_task` →
 `openi_get_task` / `openi_task_debug_url` → 用完 `openi_stop_task`，必要时
-`openi_delete_task`。
+`openi_delete_task`。想省掉“自己找仓、自己配 spec、自己挂数据集”这几步，就先用
+`openi_list_task_templates` 挑一个别人跑通的模板，再 `openi_start_task_from_template`。
 
 ## 配置令牌
 
@@ -346,12 +347,13 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 
 ## 工具全表
 
-共 54 个工具，都是 `openi_` 前缀。
+共 59 个工具，都是 `openi_` 前缀。
 
 | 工具 | 作用 |
 | --- | --- |
 | openi_whoami | 查看令牌对应的账号，确认令牌可用 |
 | openi_list_resources | 列出集群、卡型、积分单价与计费规则（离线目录） |
+| openi_list_compute_resources | 查平台实时在线的算力中心（城市）与卡型（含离线目录没有的 CPU/5090/A800 等） |
 | openi_notifications | 查看账号通知（评论、@、issue），可只看未读并带未读总数 |
 | openi_list_creation_options | 列出当前账号实时可开的规格（含 spec_id）与镜像、余额 |
 | openi_estimate_runtime | 按当前积分余额估算每个规格还能开多少机时（小时/天，已按 6 分钟向下取整） |
@@ -384,6 +386,10 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_task_resource_usage | 查看任务实时算力占用 |
 | openi_task_debug_url | 获取调试任务的 Jupyter / SSH 入口 |
 | openi_task_visualize_url | 获取训练任务的 TensorBoard 入口 |
+| openi_list_task_templates | 浏览任务模板广场：别人配好的一键开任务模板（含代码仓、分支、启动文件、卡型卡数、镜像、数据集/模型挂载） |
+| openi_get_task_template | 按模板 ID 查一个模板的完整配置 |
+| openi_collect_task_template | 收藏 / 取消收藏任务模板 |
+| openi_start_task_from_template | 照着模板开任务：仓/分支/启动文件/挂载自动带上，spec 由卡型+卡数实时配对 |
 | openi_start_task | 新建并启动计算任务（调试/训练/推理） |
 | openi_start_task_raw | 用自定义 JSON 请求体创建任务（兜底/调试用） |
 | openi_stop_task | 停止任务、释放算力、停止计费 |
@@ -422,6 +428,18 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   可用镜像、默认任务名、积分余额，以及 `can_create_more` / `not_stop_task_count` 等配额信息。
 - 镜像目录：`/images/recommend`（平台推荐）与 `/images/star`（本账号收藏），其中的 `place`
   才是集群实际拉取的镜像地址。
+- 算力资源目录：`/resources/ai_center/card_info/active` 是在线卡型（比
+  `/resources/acc_card/list` 多出 CPU 的 INTEL XEON、GPGPU 的 N100/N260、GPU 的
+  5090/A800），`/resources/ai_center/active` 给每个算力中心的城市与卡型。
+- 任务模板：`GET /ai_task_template/list/{scope}`（`scope` 取 `public` / `all` /
+  `created` / `collected`，返回体是 `{Page, PageSize, Total, Templates}`）、
+  `GET /ai_task_template?id=<uuid>`（单条详情，响应是 `{code,msg,data}` 信封），
+  收藏走 `PUT` / `DELETE /ai_task_template/collect?id=`。模板自带 JobType、Cluster、
+  ComputeSource、AccCardType、AccCardsNum、RepoOwnerName/RepoName、BranchName、
+  BootFile 与数据集/模型清单，但没有 spec_id，`openi_start_task_from_template` 是按
+  `(compute_source, acc_card_type, acc_cards_num)` 去 `/ai_task/creation/required`
+  的实时清单里配对的（实测 NPU MNIST 模板配到 spec 328，挂上 MnistDataset_mindspore
+  开 DEBUG 任务能到 RUNNING，代码仓可以直接用模板自带的公开示例仓）。
 - 任务读写：`/ai_task`、`/ai_task/brief`、`/ai_task/log`、`/ai_task/resource_usage`、
   `/ai_task/debug_url`、`/ai_task/visualize_url`、`/ai_task/my_list`（账号级任务列表）、
   `/{owner}/{repo}/ai_task`（按仓列表）。
@@ -524,6 +542,19 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   代码仓的打包下载是另一条路由，做成了 `openi_download_repo_archive`。
 - 普通用户可用的集群是 `C2Net`（智算网络）。`cluster` 必须填 `C2Net`，`cluster_type`
   查询参数同理；`openi` 之类的值会返回参数错误或空规格。
+- 任务模板按 ID 取详情只有 `GET /ai_task_template?id=<uuid>` 一条路：
+  `/ai_task_template/detail`、`/ai_task_template/<uuid>` 都是 404，列表接口的 `id`
+  参数也是摆设（传了照旧返回首页，实测过）；列表 `page_size` 上限同样是 100。公开
+  模板约 1600 个、含私有约 2700 个。`order_by` 只认 `newest` / `usecount` /
+  `collections`，写别的平台不报错、直接按默认顺序返回，所以工具显式拦住；`tags` 是按
+  模板自己的标签精确匹配（大小写敏感，取值多为中文），不是广场数据集那种类别枚举。
+- 模板的 `ImageUrl` 不一定是镜像地址：NPU 的 MNIST 模板给的是内部记录 UUID
+  （`318c8cac-...`），当镜像地址发下去必然拉不起来。`openi_start_task_from_template`
+  默认忽略模板镜像、改用实测跑通的镜像，要指定就用 `image_url`；模板确实固定了特殊
+  镜像（如在线推理的 `openclaw-feishu-qwen3.5`）时才把 `use_template_image` 置 True。
+  模板里的 `Parameters`（表单默认值）也没有自动映射到 `params`，需要时自己传。
+- `openi_start_task_from_template` 不填 `repo` 时用模板自带的仓，公开模板多是示例仓
+  （如 `OpenIOSSG/OpenI_Cloudbrain_Example`），实测可以直接在上面开任务，不必先建仓。
 - 创建任务的必填字段是 `job_type`、`display_job_name`、`spec_id`（整数）、
   `compute_source`、`cluster`；`spec_id` 必须来自 `openi_list_creation_options`，否则会
   返回 Specification not available。
