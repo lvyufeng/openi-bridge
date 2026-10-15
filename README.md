@@ -106,7 +106,7 @@ Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即�
 超过 64MB 自动按 64MB 分片续传。传完返回里的 UUID 直接就是 `openi_start_task` 的
 `dataset_uuid_str` / `pretrain_model_id_str`。“这个数据集还剩多少空间”用
 `openi_storage_usage` 看。传文件时最好给绝对路径——`paths` 相对的是 MCP 服务进程的
-工作目录，不一定是当前对话所在的目录。
+工作目录，不一定是当前对话所在的目录。传之前可以 `dry_run=True` 先看一眼清单和总量。
 
 **用平台上现成的东西。** “OpenI 上有没有能直接用的 llama 权重？”“给我找个图像分类的
 数据集，拉到本地看看”。助手用 `openi_search_models` / `openi_search_datasets` 搜平台
@@ -363,14 +363,14 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_create_dataset | 新建空数据集（返回 UUID，可作 dataset_uuid_str） |
 | openi_create_model | 新建空模型库（返回模型 ID，可作 pretrain_model_id_str） |
 | openi_data_subject_info | 查数据集/模型详情，拿 UUID 与是否有写权限 |
-| openi_upload_dataset_files | 把本地文件/目录上传到数据集（>64MB 自动分片续传） |
-| openi_upload_model_files | 把本地文件/目录（ckpt 等）上传到模型库 |
+| openi_upload_dataset_files | 把本地文件/目录上传到数据集（>64MB 自动分片续传，可 dry_run 先看清单） |
+| openi_upload_model_files | 把本地文件/目录（ckpt 等）上传到模型库（同样支持 dry_run） |
 | openi_storage_usage | 查看账号或单个主体的存储配额（上限/已用/剩余） |
 | openi_delete_dataset | 删除数据集（全名或 UUID，不可恢复） |
 | openi_delete_model | 删除模型库（全名或 UUID，不可恢复） |
-| openi_search_datasets | 搜索平台托管的数据集（关键词/类别/任务/排序/只看推荐，返回体积与 UUID） |
-| openi_search_models | 搜索平台托管的模型与 ckpt（返回体积、下载量、是否外链） |
-| openi_list_subject_files | 列出任意数据集/模型库里的文件与子目录及大小 |
+| openi_search_datasets | 搜索平台托管的数据集（关键词/类别/任务/许可证/排序/只看推荐，返回体积与 UUID） |
+| openi_search_models | 搜索平台托管的模型与 ckpt（关键词/标签/排序/推荐，返回体积、下载量、是否外链） |
+| openi_list_subject_files | 列出任意数据集/模型库里的文件与子目录及大小（>1000 行用 marker 翻页） |
 | openi_pull_dataset | 从 OpenI 拉取数据集文件到本地（单文件或整库，支持 dry_run 与 max_bytes） |
 | openi_pull_model | 从 OpenI 拉取模型/ckpt 文件到本地（单文件或整库，支持断点跳过） |
 
@@ -399,8 +399,8 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   查询参数 `page`、`page_size`、`q`、`order_by`、`tags`、`tasks`、`license`、`recommend`；
   返回体是 `{datasets|aimodels, total, page, page_size}`。公开数据集体量约 1 万、
   模型约 2.9 万，`recommend=only` 时是首页那 40 个数据集 / 37 个模型。
-- 文件清单：`GET /dataset/files` 与 `/aimodel/files` 用 `marker` 翻页（响应里的
-  `has_next` / `marker`），每行是 `FileName`、`IsDir`、`Size`、`ModTime`。
+- 文件清单：`GET /dataset/files` 与 `/aimodel/files` 单页最多 1000 行，用 `marker`
+  翻页（响应里的 `has_next` / `marker`），每行是 `FileName`、`IsDir`、`Size`、`ModTime`。
 - 从平台下载：`GET /dataset/file` 与 `/aimodel/file` 对托管在 OBS 上的文件返回
   **301**，`Location` 就是带签名的直链，直接对 OBS 发 GET 即可，无需再带令牌
   （工具内部走的就是这条路径）。整库打包另有
@@ -427,6 +427,28 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 - 检索与下载用的是 REST 面（`/api/v1/...`），和积分那批 web 接口不同：这里带
   `Authorization: Bearer`，而不需要 Basic。注意 `httpx.Client(base_url=...)` 必须写成
   `"{endpoint}/api/v1"`，只填 endpoint 会让 `/aimodel/file` 之类返回 404。
+- 广场列表的 `page_size` 上限是 100：传 200 会被平台静默压成默认的 12 条，所以工具
+  在 1-100 之外直接报错。反过来，`tags` / `tasks` 传字符串会被 `",".join()` 按字符拆开
+  （`tags=computer_vision` 变成 `c,o,m,...`），平台照样返回 200 但结果是 0 条——工具
+  内部已把字符串按逗号切分，列表和逗号串两种写法都吃。
+- 数据集接口支持 `tasks` 和 `license` 过滤（`license=MIT` 实测从 1 万条筛到 1099 条），
+  但模型接口实测忽略这两个参数（传进去仍返回全量），所以 `openi_search_models` 没有
+  它们，找模型请用 `q` 或 `tags`。
+- 文件清单一页最多 1000 行，靠响应里的 `has_next` / `marker` 翻页；
+  `openi_list_subject_files` 把 `marker` 透传出来了（20 万张图的目录要翻 200 页），
+  递归下载走的是内部循环，不受影响。
+- 重复上传同名文件是覆盖，不会出现两份（实测二次上传后目录里仍然只有一个 `a.txt`）；
+  但 ≤64MB 的直传不做跳过判断，重传会把字节重发一遍，只有分片路径会命中
+  `get_chunks` 的 `uploaded` 跳过已完成分片。
+- 上传目录只跳过 `.DS_Store` / `Thumbs.db`，`.git` 之类的隐藏目录会一起传上去；
+  传代码目录时注意先清理。
+- 下载不做重试：单个文件失败会记在返回的 `failed` 里，重跑会跳过已完成文件，所以
+  半途断掉直接再跑一次即可。下载的总时长不设上限（怕大 ckpt 被掐断），但每次读有
+  120 秒超时，连接被静默挂住时不会无限等。
+- 拉取时如果平台返回的文件名里含 `..`，写到目标目录之外的路径会被跳过并计入 `failed`。
+- 目录遍历默认上限 20000 个文件（环境变量 `OPENI_WALK_FILE_LIMIT` 可调），
+  `openi_pull_dataset` / `openi_pull_model` 另有 `max_files` 参数；文件更多的数据集
+  必须显式放宽才拉得全，否则会直接报错而不是悄悄少拉。
 - 外链模型（返回里 `external: true`，`external_name` / `external_url` 非空）在平台上
   没有实际文件，`openi_list_subject_files` 会是空、`openi_pull_model` 也拉不到东西；
   真正托管在自己对象存储里的模型 `external` 为 false。

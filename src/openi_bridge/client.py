@@ -30,6 +30,9 @@ Data subjects (datasets / models) and their files:
     GET  /api/v1/aimodel?aimodel_name=             model detail incl. uuid
     GET  /api/v1/dataset/files?dataset_name=       dataset file listing
     GET  /api/v1/aimodel/files?aimodel_name=       model file listing
+    GET  /api/v1/dataset/list/{scope}              dataset square listing
+    GET  /api/v1/aimodel/list/{scope}              model square listing
+    GET  /api/v1/{dataset|aimodel}/file            301 to the presigned OBS url
     GET  /api/v1/storage/summary                   account or subject quota
     POST /api/v1/dataset/create                    create an empty dataset
     POST /api/v1/aimodel/create                    create an empty model
@@ -83,8 +86,10 @@ SUBJECT_LIST_ORDER = (
     "alias",
 )
 SUBJECT_LIST_PAGE_SIZE = 30
+# 平台把 page_size 上限压到 100：再大就静默退回默认的 12 条，所以这里显式拦住。
+SUBJECT_LIST_MAX_PAGE_SIZE = 100
 # 递归列目录时的文件数上限，避免误对超大主体做全量 crawl。
-WALK_FILE_LIMIT = 20000
+WALK_FILE_LIMIT = int(os.getenv("OPENI_WALK_FILE_LIMIT", "20000"))
 
 # 平台前端对数据集 name / alias 的校验（services/... 与 create 页面一致）。
 SUBJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-_.]{0,98}[a-zA-Z0-9]$")
@@ -440,14 +445,19 @@ class OpenIClient:
 
     # ----------------------------------------------------------- data subjects
 
-    def dataset_files(self, dataset_name: str, parent_dir: str = "", marker: str = "") -> Any:
-        params = {"dataset_name": dataset_name, "parent_dir": parent_dir, "page_size": 1000}
+    def dataset_files(
+        self, dataset_name: str, parent_dir: str = "", marker: str = "", page_size: int = 1000
+    ) -> Any:
+        """列目录。单次最多 1000 行，响应里的 has_next/marker 用来翻页。"""
+        params = {"dataset_name": dataset_name, "parent_dir": parent_dir, "page_size": int(page_size)}
         if marker:
             params["marker"] = marker
         return self.get_json("/dataset/files", params=params)
 
-    def model_files(self, model_name: str, parent_dir: str = "", marker: str = "") -> Any:
-        params = {"aimodel_name": model_name, "parent_dir": parent_dir, "page_size": 1000}
+    def model_files(
+        self, model_name: str, parent_dir: str = "", marker: str = "", page_size: int = 1000
+    ) -> Any:
+        params = {"aimodel_name": model_name, "parent_dir": parent_dir, "page_size": int(page_size)}
         if marker:
             params["marker"] = marker
         return self.get_json("/aimodel/files", params=params)
@@ -481,16 +491,23 @@ class OpenIClient:
             raise OpenIError(
                 f"order_by 只能是 {'/'.join(SUBJECT_LIST_ORDER)} 或留空：{order_by!r}"
             )
+        page_size = int(page_size)
+        if not 1 <= page_size <= SUBJECT_LIST_MAX_PAGE_SIZE:
+            raise OpenIError(
+                f"page_size 必须在 1-{SUBJECT_LIST_MAX_PAGE_SIZE} 之间：{page_size}。"
+                f"平台对更大的取整页会静默回退到 12 条，所以这里不替你猜。"
+            )
         path = "/dataset/list" if subject_type == "dataset" else "/aimodel/list"
-        params: Dict[str, Any] = {"page": int(page), "page_size": int(page_size)}
+        params: Dict[str, Any] = {"page": int(page), "page_size": page_size}
         if q:
             params["q"] = q
         if order_by:
             params["order_by"] = order_by
-        if tags:
-            params["tags"] = ",".join(tags)
-        if tasks:
-            params["tasks"] = ",".join(tasks)
+        tags_csv, tasks_csv = _csv(tags), _csv(tasks)
+        if tags_csv:
+            params["tags"] = tags_csv
+        if tasks_csv:
+            params["tasks"] = tasks_csv
         if license:
             params["license"] = license
         if recommend:
@@ -505,13 +522,14 @@ class OpenIClient:
         }
 
     def subject_files(
-        self, subject_name: str, subject_type: str, parent_dir: str = "", marker: str = ""
+        self, subject_name: str, subject_type: str, parent_dir: str = "", marker: str = "",
+        page_size: int = 1000,
     ) -> Any:
         """列出数据集 / 模型库某个目录下的文件，含子目录（IsDir=True）。"""
         if subject_type == "dataset":
-            return self.dataset_files(subject_name, parent_dir, marker)
+            return self.dataset_files(subject_name, parent_dir, marker, page_size)
         if subject_type == "model":
-            return self.model_files(subject_name, parent_dir, marker)
+            return self.model_files(subject_name, parent_dir, marker, page_size)
         raise OpenIError(f"subject_type 只能是 dataset 或 model：{subject_type!r}")
 
     def storage_summary(
@@ -717,14 +735,34 @@ class OpenIClient:
         subject_type: str,
         entries: List[Mapping[str, Any]],
         skip_storage_check: bool = False,
+        dry_run: bool = False,
     ) -> Dict[str, Any]:
         """把 entries（expand_upload_paths 的结果）上传到数据集/模型。
 
         小文件走直传、大文件走分片，按官方 SDK 的规则各走一条通道；直传的文件
         最后统一补一次 complete_upload。返回每个文件的结果与汇总。
+        dry_run=True 时不建连接，只回显会上传哪些文件、多大、各走哪条通道。
         """
         if subject_type not in SUBJECT_TYPES:
             raise OpenIError(f"subject_type 只能是 dataset 或 model：{subject_type!r}")
+        if dry_run:
+            total = sum(int(e["size"]) for e in entries)
+            return {
+                "subject": subject_name,
+                "subject_type": subject_type,
+                "dry_run": True,
+                "file_count": len(entries),
+                "total_bytes": total,
+                "total_gb": _gb(total),
+                "files": [
+                    {
+                        "name": e["name"],
+                        "size": int(e["size"]),
+                        "mode": "direct" if int(e["size"]) <= DIRECT_UPLOAD_MAX else "multipart",
+                    }
+                    for e in entries
+                ],
+            }
         info = self.subject_info(subject_name, subject_type) or {}
         if not info.get("id"):
             raise OpenIError(f"找不到 {subject_type} {subject_name}，或当前账号无权访问。")
@@ -835,7 +873,11 @@ class OpenIClient:
         digest = hashlib.md5()
         size = 0
         tmp_path = f"{dest_path}.part"
-        with httpx.stream("GET", url, timeout=None, follow_redirects=True) as response:
+        # 单个文件可能十几 GB，所以总时长不限，但每次读要有超时：否则连接被
+        # 静默挂住时这里会一直卡着，MCP 调用方看不到任何反馈。
+        with httpx.stream(
+            "GET", url, timeout=httpx.Timeout(30.0, read=120.0), follow_redirects=True
+        ) as response:
             if response.status_code >= 400:
                 raise OpenIError(
                     f"下载失败 HTTP {response.status_code}：{file_name}",
@@ -886,6 +928,30 @@ class OpenIClient:
         walk(parent_dir)
         return collected
 
+    def _remote_file_size(
+        self, subject_name: str, subject_type: str, file_name: str
+    ) -> Optional[int]:
+        """查单个文件在平台上的大小，用于 dry_run 预览与 max_bytes 拦截。
+
+        平台没有「按文件名查元数据」的接口，只能在它所在的目录里翻页找。查不到
+        就返回 None，让调用方退回到「不知道大小」的行为。
+        """
+        directory = os.path.dirname(file_name.strip("/"))
+        base = os.path.basename(file_name.strip("/"))
+        marker = ""
+        try:
+            while True:
+                page = self.subject_files(subject_name, subject_type, directory, marker) or {}
+                for row in page.get("file_list") or []:
+                    if (row.get("FileName") or "") == base and not row.get("IsDir"):
+                        return int(row.get("Size") or 0)
+                next_marker = page.get("marker") or ""
+                if not page.get("has_next") or not next_marker or next_marker == marker:
+                    return None
+                marker = next_marker
+        except Exception:  # noqa: BLE001 - 只是预览/拦截用的信息，查不到不算失败
+            return None
+
     def pull_subject(
         self,
         subject_name: str,
@@ -896,6 +962,7 @@ class OpenIClient:
         dry_run: bool = False,
         overwrite: bool = False,
         max_bytes: Optional[int] = None,
+        max_files: Optional[int] = None,
         include_resource_version: bool = False,
     ) -> Dict[str, Any]:
         """把平台托管的文件拉取到本地目录。
@@ -903,6 +970,8 @@ class OpenIClient:
         file 为空时递归下载整个主体（保留目录结构），否则只下载该文件。
         dry_run=True 只列大小不下载。max_bytes 是总字节上限，超出直接报错，
         防止误拉几十 GB 的 ckpt。已存在且大小一致的文件默认跳过，便于续传。
+        max_files 覆盖遍历时的文件数上限（默认 WALK_FILE_LIMIT，可用环境变量
+        OPENI_WALK_FILE_LIMIT 调），文件特别多的数据集需要它才能列全。
         数据集里自带的 openi_resource.version 默认跳过。
         """
         if subject_type not in SUBJECT_TYPES:
@@ -922,18 +991,24 @@ class OpenIClient:
                 )
         if file:
             # file 是相对主体根目录的仓内路径，例如 "imagenet/README.md"。
-            targets = [{"name": file, "size": None}]
+            targets = [{"name": file, "size": self._remote_file_size(subject_name, subject_type, file)}]
             base_dir = ""
         else:
-            targets = self.walk_subject_files(subject_name, subject_type, parent_dir)
+            targets = self.walk_subject_files(
+                subject_name, subject_type, parent_dir, limit=max_files or WALK_FILE_LIMIT
+            )
             base_dir = parent_dir
             if not include_resource_version:
                 targets = [t for t in targets if t["name"] != "openi_resource.version"]
         known_total = sum(t["size"] or 0 for t in targets)
         if max_bytes is not None and known_total > max_bytes:
+            if file:
+                hint = "调大 max_bytes，或者去掉这个参数"
+            else:
+                hint = "改用 file 指定单个文件，或用 parent_dir 缩小范围，或调大 max_bytes"
             raise OpenIError(
                 f"待下载 {known_total} 字节，超过 max_bytes={max_bytes}；"
-                "请改用 file 指定单个文件，或调大 max_bytes。"
+                f"{hint}。"
             )
         plan = {
             "subject": subject_name,
@@ -952,7 +1027,11 @@ class OpenIClient:
         for target in targets:
             rel = target["name"]
             inside = rel[len(base_dir) :].lstrip("/") if base_dir and rel.startswith(base_dir) else rel
-            dest_path = os.path.join(dest_root, inside)
+            dest_path = os.path.normpath(os.path.join(dest_root, inside))
+            # 文件名来自平台元数据，别让 ".." 之类的相对路径写到目标目录外面。
+            if dest_path != dest_root and not dest_path.startswith(dest_root + os.sep):
+                failed.append({"file": rel, "error": f"路径越出目标目录，已跳过：{inside!r}"})
+                continue
             try:
                 if (
                     not overwrite
@@ -1325,6 +1404,22 @@ def _gb(size: Any) -> Optional[float]:
         return round(int(size) / 1024 / 1024 / 1024, 2)
     except (TypeError, ValueError):
         return None
+
+
+def _csv(value: Any) -> str:
+    """把调用方给的过滤条件拼成平台要的逗号串。
+
+    模型经常把列表参数写成 "computer_vision" 这样的字符串，直接 join 会按字符
+    拆开（tags=c,o,m,...）而平台照样返回 200，于是静默搜出 0 条。这里对字符串
+    按逗号切分，两种写法都能用。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        parts = value.split(",")
+    else:
+        parts = list(value)
+    return ",".join(str(p).strip() for p in parts if str(p).strip())
 
 
 def summarize_subject(row: Mapping[str, Any], subject_type: str) -> Dict[str, Any]:

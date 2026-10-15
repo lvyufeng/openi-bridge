@@ -557,6 +557,7 @@ def openi_upload_dataset_files(
     dataset: str,
     paths: list[str],
     remote_dir: str = "",
+    dry_run: bool = False,
 ) -> str:
     """把本地文件/目录上传到数据集。小文件走直传、超过 64MB 自动分片续传。
 
@@ -564,6 +565,8 @@ def openi_upload_dataset_files(
     paths: 本地文件或目录路径列表；目录会递归上传并保留目录结构。建议用绝对路径，
     相对路径按 MCP 服务进程的工作目录解析。
     remote_dir: 仓内前缀目录，例如 "train/images"；留空则放在根目录。
+    dry_run: True 时不联网，只回显会上传哪些文件、总量多大、各走哪条通道——传
+      几十 GB 之前先跑一次。注意它只统计，不查剩余配额。
 
     返回里每个文件带 mode（direct/multipart）与是否成功。数据集里会自带一个
     openi_resource.version，属于正常现象。
@@ -571,7 +574,7 @@ def openi_upload_dataset_files(
     try:
         entries = expand_upload_paths(paths, remote_dir=remote_dir)
         with _client() as client:
-            report = client.upload_files(dataset, "dataset", entries)
+            report = client.upload_files(dataset, "dataset", entries, dry_run=dry_run)
         return dump({"ok": report.get("failed_count", 0) == 0, **report})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -582,6 +585,7 @@ def openi_upload_model_files(
     model: str,
     paths: list[str],
     remote_dir: str = "",
+    dry_run: bool = False,
 ) -> str:
     """把本地文件/目录（例如 ckpt 权重）上传到模型库，规则同数据集上传。
 
@@ -589,13 +593,14 @@ def openi_upload_model_files(
     paths: 本地文件或目录路径列表；目录会递归上传并保留目录结构。建议用绝对路径，
     相对路径按 MCP 服务进程的工作目录解析。
     remote_dir: 仓内前缀目录，例如 "v1"；留空则放在根目录。
+    dry_run: True 时不联网，只回显清单与总量，先确认要传的就是这些。
 
     大文件（>64MB）自动按 64MB 分片上传，可断点续传（重复调用会跳过已完成分片）。
     """
     try:
         entries = expand_upload_paths(paths, remote_dir=remote_dir)
         with _client() as client:
-            report = client.upload_files(model, "model", entries)
+            report = client.upload_files(model, "model", entries, dry_run=dry_run)
         return dump({"ok": report.get("failed_count", 0) == 0, **report})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -674,6 +679,7 @@ def openi_search_datasets(
     order_by: str = "",
     tags: Optional[list[str]] = None,
     tasks: Optional[list[str]] = None,
+    license: Optional[str] = None,
     recommend: bool = False,
     page: int = 1,
     page_size: int = 30,
@@ -686,8 +692,11 @@ def openi_search_datasets(
     order_by: 留空按默认，可选 newest / recentupdate / downloadcount /
       collections / alias_asc / alias。
     tags: 类别过滤，例如 ["computer_vision"]；tasks: 任务过滤，例如 ["image_classification"]。
+      两者也接受逗号分隔的字符串，例如 "computer_vision,natural_language_processing"。
+    license: 许可证过滤，例如 "MIT"、"CC-BY-NC"、"Apache 2.0"（平台支持，实测能筛）。
     recommend: True 只看官方推荐（平台首页那批）。
-    page / page_size: 分页，默认第 1 页、每页 30 条。
+    page / page_size: 分页，默认第 1 页、每页 30 条；page_size 上限 100（再大平台会
+      静默退回 12 条，所以这里直接报错）。平台总量上万，要翻页得自己加 page。
 
     返回里每项含 subject（owner/name，可直接传给 openi_pull_dataset /
     openi_start_task）、id（UUID）、size_gb、downloads、stars、tags、tasks。
@@ -696,7 +705,7 @@ def openi_search_datasets(
         with _client() as client:
             result = client.search_subjects(
                 "dataset", q=q, scope=scope, order_by=order_by, tags=tags,
-                tasks=tasks, recommend=recommend, page=page, page_size=page_size,
+                tasks=tasks, license=license, recommend=recommend, page=page, page_size=page_size,
             )
         return dump({"ok": True, **result})
     except Exception as exc:  # noqa: BLE001
@@ -720,8 +729,11 @@ def openi_search_models(
       collaborated。
     order_by: 留空按默认，可选 newest / recentupdate / downloadcount /
       collections / alias_asc / alias。
-    tags: 标签过滤；recommend: True 只看官方推荐（llama2、chatglm3 等）。
-    page / page_size: 分页，默认第 1 页、每页 30 条。
+    tags: 标签过滤，接受列表或逗号分隔的字符串。
+    recommend: True 只看官方推荐（llama2、chatglm3 等）。
+    page / page_size: 分页，默认第 1 页、每页 30 条，上限 100。
+    注意模型接口实测忽略 tasks / license 过滤（传了也不筛，等于全量），所以这里
+    没有这两个参数；要按类别找模型请用 q 或 tags。
 
     返回里每项含 subject（owner/name，可直接传给 openi_pull_model /
     openi_start_task 的 pretrain_model_id_str）、id（模型 ID）、size_gb、
@@ -739,17 +751,26 @@ def openi_search_models(
 
 
 @mcp.tool()
-def openi_list_subject_files(subject: str, subject_type: str = "dataset", parent_dir: str = "") -> str:
+def openi_list_subject_files(
+    subject: str,
+    subject_type: str = "dataset",
+    parent_dir: str = "",
+    marker: str = "",
+    page_size: int = 1000,
+) -> str:
     """列出某个数据集/模型库里的文件与子目录（含每个文件的大小）。
 
     subject: 全名 owner/name（可用 openi_search_datasets / openi_search_models 查）。
     subject_type: dataset 或 model。
     parent_dir: 仓内子目录，留空为根目录。
+    marker: 翻页游标，留空为第一页。单个目录最多返回 1000 行；返回里 has_next 为
+      true 时，把返回的 marker 原样传回来取下一页（例如 20 万张图片的目录要翻 200 页）。
+    page_size: 每次最多 1000 行，一般不用改。
     用来在 openi_pull_dataset / openi_pull_model 之前确认要拉哪些文件。
     """
     try:
         with _client() as client:
-            page = client.subject_files(subject, subject_type, parent_dir) or {}
+            page = client.subject_files(subject, subject_type, parent_dir, marker, page_size) or {}
         rows = [
             {
                 "name": (f"{parent_dir}/{r.get('FileName')}".strip("/") if parent_dir else r.get("FileName")),
@@ -760,16 +781,17 @@ def openi_list_subject_files(subject: str, subject_type: str = "dataset", parent
             for r in (page.get("file_list") or [])
         ]
         return dump({"ok": True, "subject": subject, "dir": parent_dir, "has_next": page.get("has_next"),
-                     "files": rows})
+                     "marker": page.get("marker") or "", "files": rows})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
 
 def _pull(client: OpenIClient, subject: str, subject_type: str, dest_dir: str, file: Optional[str],
-          parent_dir: str, dry_run: bool, overwrite: bool, max_bytes: Optional[int]) -> str:
+          parent_dir: str, dry_run: bool, overwrite: bool, max_bytes: Optional[int],
+          max_files: Optional[int] = None) -> str:
     report = client.pull_subject(
         subject, subject_type, dest_dir, file=file, parent_dir=parent_dir,
-        dry_run=dry_run, overwrite=overwrite, max_bytes=max_bytes,
+        dry_run=dry_run, overwrite=overwrite, max_bytes=max_bytes, max_files=max_files,
     )
     ok = report.get("failed_count", 0) == 0
     return dump({"ok": ok, **report})
@@ -784,6 +806,7 @@ def openi_pull_dataset(
     dry_run: bool = False,
     overwrite: bool = False,
     max_bytes: Optional[int] = None,
+    max_files: Optional[int] = None,
 ) -> str:
     """把平台托管的数据集文件拉取到本地目录（从 OpenI 直接下载）。
 
@@ -796,13 +819,15 @@ def openi_pull_dataset(
     dry_run: True 时只回显会下载哪些文件、多大，不真正下载——拉大文件前先跑一次。
     overwrite: 默认 False，本地已存在且大小一致的文件会跳过，方便续传。
     max_bytes: 总字节上限，超过直接报错（防止误拉几十 GB）。
+    max_files: 遍历文件数上限，默认 20000（可用环境变量 OPENI_WALK_FILE_LIMIT 改）。
+      文件更多的大数据集要显式调大才拉得全。
 
     数据集里自带的 openi_resource.version 默认跳过。
     """
     try:
         with _client() as client:
             return _pull(client, dataset, "dataset", dest_dir, file, parent_dir,
-                         dry_run, overwrite, max_bytes)
+                         dry_run, overwrite, max_bytes, max_files)
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -816,6 +841,7 @@ def openi_pull_model(
     dry_run: bool = False,
     overwrite: bool = False,
     max_bytes: Optional[int] = None,
+    max_files: Optional[int] = None,
 ) -> str:
     """把平台托管的模型/ckpt 文件拉取到本地目录（从 OpenI 直接下载）。
 
@@ -827,6 +853,7 @@ def openi_pull_model(
     dry_run: True 时只回显文件名与大小，先看清体积再决定。
     overwrite: 默认 False，本地已存在且大小一致的文件跳过，便于续传。
     max_bytes: 总字节上限，超过直接报错。
+    max_files: 遍历文件数上限，默认 20000，分片特别多的库要调大。
 
     ckpt 往往十几 GB，建议先 dry_run，或者直接用 openi_start_task 把它挂到云脑
     任务里（pretrain_model_id_str），不必下载到本地。
@@ -834,7 +861,7 @@ def openi_pull_model(
     try:
         with _client() as client:
             return _pull(client, model, "model", dest_dir, file, parent_dir,
-                         dry_run, overwrite, max_bytes)
+                         dry_run, overwrite, max_bytes, max_files)
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
