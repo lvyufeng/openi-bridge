@@ -13,7 +13,16 @@ Compute (云脑 / ai_task) endpoints that this client uses:
     GET  /api/v1/repos/{owner}/{repo}/contents/{p} read or list one path
     POST /api/v1/repos/{owner}/{repo}/contents/{p} create a file (base64 body)
     PUT  /api/v1/repos/{owner}/{repo}/contents/{p} update a file (needs old sha)
+    GET  /api/v1/repos/{owner}/{repo}/git/trees/{ref}  whole tree (recursive=1)
+    GET  /api/v1/repos/{owner}/{repo}/commits      commit history
+    GET  /api/v1/repos/{owner}/{repo}/archive/{ref}.zip  whole repo as a zip
+    GET  /api/v1/repos/{owner}/{repo}/issues       issue list
+    POST /api/v1/repos/{owner}/{repo}/issues       open an issue
+    POST /api/v1/repos/{owner}/{repo}/issues/{n}/comments  comment on an issue
     DELETE /api/v1/repos/{owner}/{repo}            delete a code repo
+
+The commits endpoint accepts a path filter but this deployment ignores it
+(verified 2026-10: every path returns the full history), so it is not exposed.
 
 File deletion (DELETE .../contents/{p}) is NOT wrapped: the platform route
 hangs and always dies at the 60s proxy timeout (504/502) without removing
@@ -47,6 +56,7 @@ Data subjects (datasets / models) and their files:
     GET  /api/v1/dataset/list/{scope}              dataset square listing
     GET  /api/v1/aimodel/list/{scope}              model square listing
     GET  /api/v1/{dataset|aimodel}/file            301 to the presigned OBS url
+    DELETE /api/v1/{dataset|aimodel}/file          delete one file or subdirectory
     GET  /api/v1/storage/summary                   account or subject quota
     POST /api/v1/dataset/create                    create an empty dataset
     POST /api/v1/aimodel/create                    create an empty model
@@ -342,6 +352,19 @@ def expand_upload_paths(paths: List[str], remote_dir: str = "") -> List[Dict[str
     return entries
 
 
+def subject_endpoint(subject_type: str) -> tuple[str, str]:
+    """把 dataset/model 映射成平台的接口路径与查询参数名。
+
+    主体类接口（详情、文件清单、下载、删除文件）都共用这一对取值，
+    集中在这里免得每个方法各写一遍。
+    """
+    if subject_type == "dataset":
+        return "/dataset", "dataset_name"
+    if subject_type == "model":
+        return "/aimodel", "aimodel_name"
+    raise OpenIError(f"subject_type 只能是 dataset 或 model：{subject_type!r}")
+
+
 class OpenIClient:
     """Synchronous client; the MCP server is single user and calls are cheap."""
 
@@ -446,11 +469,16 @@ class OpenIClient:
     def delete_json(
         self,
         path: str,
+        params: Optional[Mapping[str, Any]] = None,
         json_body: Any = None,
         timeout: Optional[float] = None,
     ) -> Any:
         return _wrap(
-            _unwrap_text(self.request("DELETE", path, json_body=json_body, timeout=timeout))
+            _unwrap_text(
+                self.request(
+                    "DELETE", path, params=params, json_body=json_body, timeout=timeout
+                )
+            )
         )
 
     # ------------------------------------------------------------------- users
@@ -680,6 +708,172 @@ class OpenIClient:
             return data.get("default_branch")
         return None
 
+    def repo_tree(
+        self, subject_name: str, ref: str = "", path: str = "", max_entries: int = WALK_FILE_LIMIT
+    ) -> Dict[str, Any]:
+        """整仓文件树，一条请求拿全（/git/trees/{ref}?recursive=1）。
+
+        比逐层翻 contents 快得多，适合先看清仓里有什么再决定读哪个文件；大仓的
+        返回体可能很大，用 max_entries 截断并在结果里标 truncated。
+        ref 留空用 HEAD（即默认分支的最新提交）。
+        """
+        tree_ref = (ref or "").strip() or "HEAD"
+        data = self.get_json(
+            f"/repos/{subject_name}/git/trees/{tree_ref}", params={"recursive": 1}
+        ) or {}
+        rows = data.get("tree") or []
+        prefix = (path or "").strip().strip("/")
+        if prefix:
+            rows = [
+                row
+                for row in rows
+                if (row.get("path") or "") == prefix
+                or (row.get("path") or "").startswith(prefix + "/")
+            ]
+        truncated = bool(data.get("truncated")) or (
+            max_entries > 0 and len(rows) > max_entries
+        )
+        if max_entries > 0:
+            rows = rows[:max_entries]
+        entries = [
+            {
+                "path": row.get("path"),
+                "type": row.get("type"),
+                "size": row.get("size"),
+                "sha": row.get("sha"),
+            }
+            for row in rows
+        ]
+        return {
+            "repo": subject_name,
+            "ref": tree_ref,
+            "sha": data.get("sha"),
+            "count": len(entries),
+            "truncated": truncated,
+            "entries": entries,
+        }
+
+    def repo_commits(
+        self, subject_name: str, ref: str = "", limit: int = 20, page: int = 1
+    ) -> List[Dict[str, Any]]:
+        """提交历史，按时间倒序。
+
+        平台这套部署忽略了 path 过滤参数（实测：传任何 path 都返回全量历史），
+        所以这里没有暴露该参数，免得给出看起来筛过、其实没筛的结果。
+        """
+        params: Dict[str, Any] = {"limit": int(limit), "page": int(page)}
+        if ref:
+            params["sha"] = ref
+        rows = self.get_json(f"/repos/{subject_name}/commits", params=params) or []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            commit = row.get("commit") or {}
+            author = commit.get("author") or {}
+            out.append(
+                {
+                    "sha": row.get("sha"),
+                    "short_sha": (row.get("sha") or "")[:10],
+                    "message": (commit.get("message") or "").strip(),
+                    "author": author.get("name") or (row.get("author") or {}).get("login"),
+                    "date": author.get("date"),
+                    "parents": [p.get("sha") for p in row.get("parents") or []],
+                }
+            )
+        return out
+
+    def download_repo_archive(
+        self,
+        subject_name: str,
+        save_to: str,
+        ref: str = "",
+        max_bytes: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """把整个代码仓打包成 zip 下载到本地（/repos/{o}/{r}/archive/{ref}.zip）。
+
+        整包边走边写盘，先落在 <目标>.part，下完再改名，中途失败不会留下半截 zip。
+        max_bytes 是大小上限，超了立刻中止并删掉临时文件。ref 留空用默认分支。
+        """
+        if not self.creds.has_token:
+            raise OpenIError("NO_TOKEN: 没有找到启智令牌。")
+        ref = (ref or "").strip() or self.default_branch(subject_name) or "master"
+        if ref.endswith(".zip"):
+            ref = ref[: -len(".zip")]
+        dest = os.path.abspath(os.path.expanduser(save_to))
+        if os.path.isdir(dest):
+            dest = os.path.join(dest, f"{subject_name.split('/')[-1]}-{ref}.zip")
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        tmp_path = f"{dest}.part"
+        digest = hashlib.md5()
+        size = 0
+        try:
+            with self._http.stream(
+                "GET",
+                f"/repos/{subject_name}/archive/{ref}.zip",
+                headers={"Authorization": f"Bearer {self.creds.token}"},
+                timeout=httpx.Timeout(30.0, read=120.0),
+            ) as response:
+                if response.status_code >= 400:
+                    raise OpenIError(
+                        f"打包下载失败 HTTP {response.status_code}：{subject_name}@{ref}",
+                        status_code=response.status_code,
+                        payload=response.read().decode("utf-8", "replace")[:200],
+                    )
+                with open(tmp_path, "wb") as handle:
+                    for chunk in response.iter_bytes(1024 * 1024):
+                        handle.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                        if max_bytes is not None and size > max_bytes:
+                            raise OpenIError(
+                                f"仓库打包超过 max_bytes={max_bytes} 字节，已中止下载。"
+                            )
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+        os.replace(tmp_path, dest)
+        return {
+            "repo": subject_name,
+            "ref": ref,
+            "path": dest,
+            "bytes": size,
+            "mb": round(size / 1024 / 1024, 2),
+            "md5": digest.hexdigest(),
+        }
+
+    def create_repo_issue(self, subject_name: str, title: str, body: str = "") -> Dict[str, Any]:
+        """在代码仓里开一个 issue（/issues）。"""
+        data = self.post_json(
+            f"/repos/{subject_name}/issues",
+            json_body={"title": title, "body": body or ""},
+        )
+        return _slim_issue(data or {})
+
+    def repo_issues(
+        self, subject_name: str, state: str = "open", limit: int = 20, page: int = 1
+    ) -> List[Dict[str, Any]]:
+        """列代码仓的 issue，state 取 open / closed / all。"""
+        rows = self.get_json(
+            f"/repos/{subject_name}/issues",
+            params={"state": state, "limit": int(limit), "page": int(page)},
+        ) or []
+        return [_slim_issue(row) for row in rows]
+
+    def comment_repo_issue(
+        self, subject_name: str, index: Any, body: str
+    ) -> Dict[str, Any]:
+        """在某个 issue 下发表评论（/issues/{index}/comments）。"""
+        data = self.post_json(
+            f"/repos/{subject_name}/issues/{index}/comments",
+            json_body={"body": body},
+        ) or {}
+        return {
+            "id": data.get("id"),
+            "url": data.get("html_url"),
+            "body": data.get("body"),
+            "created_at": data.get("created_at"),
+        }
+
     # ----------------------------------------------------------- data subjects
 
     def dataset_files(
@@ -698,6 +892,65 @@ class OpenIClient:
         if marker:
             params["marker"] = marker
         return self.get_json("/aimodel/files", params=params)
+
+    def _subject_entry(
+        self, subject_name: str, subject_type: str, file_name: str
+    ) -> Optional[Mapping[str, Any]]:
+        """按仓内相对路径在它的父目录里找一条清单行（文件或目录），没有则 None。"""
+        target = (file_name or "").strip().strip("/")
+        parent = os.path.dirname(target)
+        base = os.path.basename(target)
+        if not base:
+            return None
+        marker = ""
+        while True:
+            page = self.subject_files(subject_name, subject_type, parent, marker) or {}
+            for row in page.get("file_list") or []:
+                if (row.get("FileName") or "") == base:
+                    return row
+            next_marker = page.get("marker") or ""
+            if not page.get("has_next") or not next_marker or next_marker == marker:
+                return None
+            marker = next_marker
+
+    def delete_subject_file(
+        self,
+        subject_name: str,
+        subject_type: str,
+        file_name: str,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """删除数据集/模型里的一个文件，或者连同内容删掉整个子目录。
+
+        平台对不存在的路径也回 {"code":0,"msg":"ok"}（实测），只看响应就把"根本
+        没删掉"当成删掉了，所以这里删完重新列一遍父目录：路径确实不在清单里才算
+        成功。删之前先确认它存在，才能区分"删掉了"和"本来就没有"。
+        """
+        path, param = subject_endpoint(subject_type)
+        target = (file_name or "").strip().strip("/")
+        if not target:
+            raise OpenIError("file_name 不能为空。")
+        before = self._subject_entry(subject_name, subject_type, target)
+        if before is None:
+            return {
+                "file": target,
+                "existed": False,
+                "removed": False,
+                "reason": "清单里没有这个文件或目录，平台也不会报错；没有删掉任何东西。",
+            }
+        is_dir = bool(before.get("IsDir"))
+        self.delete_json(
+            f"{path}/file",
+            params={param: subject_name, "file_name": target},
+            timeout=timeout,
+        )
+        return {
+            "file": target,
+            "existed": True,
+            "is_dir": is_dir,
+            "size": None if is_dir else before.get("Size"),
+            "removed": self._subject_entry(subject_name, subject_type, target) is None,
+        }
 
     def search_subjects(
         self,
@@ -789,12 +1042,7 @@ class OpenIClient:
 
         subject_type 取 "dataset" 或 "model"；subject_name 是 owner/name。
         """
-        if subject_type == "dataset":
-            path, param = "/dataset", "dataset_name"
-        elif subject_type == "model":
-            path, param = "/aimodel", "aimodel_name"
-        else:
-            raise OpenIError(f"subject_type 只能是 dataset 或 model：{subject_type!r}")
+        path, param = subject_endpoint(subject_type)
         return self.get_json(path, params={param: subject_name})
 
     def subject_id(self, subject_name: str, subject_type: str) -> str:
@@ -1065,12 +1313,8 @@ class OpenIClient:
         /dataset/file 与 /aimodel/file 对托管在对象存储上的文件返回 301，
         Location 就是带签名的下载地址，无需再带令牌。
         """
-        if subject_type == "dataset":
-            path, param = "/dataset/file", "dataset_name"
-        elif subject_type == "model":
-            path, param = "/aimodel/file", "aimodel_name"
-        else:
-            raise OpenIError(f"subject_type 只能是 dataset 或 model：{subject_type!r}")
+        path, param = subject_endpoint(subject_type)
+        path = f"{path}/file"
         if not self.creds.has_token:
             raise OpenIError("NO_TOKEN: 没有找到启智令牌。")
         headers = {
@@ -1173,21 +1417,13 @@ class OpenIClient:
         平台没有「按文件名查元数据」的接口，只能在它所在的目录里翻页找。查不到
         就返回 None，让调用方退回到「不知道大小」的行为。
         """
-        directory = os.path.dirname(file_name.strip("/"))
-        base = os.path.basename(file_name.strip("/"))
-        marker = ""
         try:
-            while True:
-                page = self.subject_files(subject_name, subject_type, directory, marker) or {}
-                for row in page.get("file_list") or []:
-                    if (row.get("FileName") or "") == base and not row.get("IsDir"):
-                        return int(row.get("Size") or 0)
-                next_marker = page.get("marker") or ""
-                if not page.get("has_next") or not next_marker or next_marker == marker:
-                    return None
-                marker = next_marker
+            row = self._subject_entry(subject_name, subject_type, file_name)
         except Exception:  # noqa: BLE001 - 只是预览/拦截用的信息，查不到不算失败
             return None
+        if row is None or row.get("IsDir"):
+            return None
+        return int(row.get("Size") or 0)
 
     def pull_subject(
         self,
@@ -1683,6 +1919,20 @@ def summarize_subject(row: Mapping[str, Any], subject_type: str) -> Dict[str, An
         summary["label"] = row.get("label") or ""
         summary["external"] = bool(row.get("external_name") or row.get("external_url"))
     return summary
+
+
+def _slim_issue(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """把 issue 压成调用方要的字段（号、标题、状态、链接、作者、评论数）。"""
+    return {
+        "number": row.get("number"),
+        "title": row.get("title"),
+        "state": row.get("state"),
+        "url": row.get("html_url"),
+        "author": (row.get("user") or {}).get("login"),
+        "comments": row.get("comments"),
+        "created_at": row.get("created_at"),
+        "body": row.get("body"),
+    }
 
 
 def dump(value: Any) -> str:

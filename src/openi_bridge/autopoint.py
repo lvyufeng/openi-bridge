@@ -5,6 +5,12 @@
 
     CreateCloudbrainTask  每日运行计算任务  10 分 / 天 / 1 次
 
+其余"每日"类积分项（commit、建公开项目、提 Issue、评论、建数据集/模型、上传附件）
+都能通过本工具的其它 MCP 工具做到，但都要求你确实产出一个东西，规则里每条又有
+每日次数上限，平台明确把重复建公开项目、发空评论后再删当成刷分并追回积分。
+所以 autopoint 只自动化那条零成本的算力积分，别的项只做清点：daily_actions()
+会列出今天每项还能拿几分、对应哪个工具，要做的时候一次调用就能完成。
+
 计费规则是每 0.1 小时（6 分钟）结算一次、不足 6 分钟不计费，官方文档见
 https://openi.pcl.ac.cn/docs/quickstart/resources.md 。实测的账户消耗流水里，
 1 分/卡时的卡最小的一笔是 0.2 分（= 2 个计费单位），从未出现过 0.1 分，
@@ -46,11 +52,31 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .client import COMPUTE_SOURCES as ALL_SOURCES
 from .client import DEFAULT_CLUSTER, OpenIClient, dump
+from .resources import POINT_ACTIONS
 
 BEIJING = timezone(timedelta(hours=8))
 
 # 每天只给一次的算力积分项。
 REWARD_ACTION = "CreateCloudbrainTask"
+
+# 每个"每日"类积分项对应到能产生它的 MCP 工具（空字符串表示这条 MCP 覆盖不到，
+# 只能去平台网页上做，比如邀请好友、被平台推荐、提交镜像）。
+DAILY_ACTION_TOOLS: Dict[str, str] = {
+    "PushCommits": "openi_push_repo_files / openi_write_repo_file",
+    "CreatePublicRepo": "openi_create_repository",
+    "CreateIssue": "openi_create_repo_issue",
+    "CommentIssue": "openi_comment_repo_issue",
+    "TaskCreateDataset": "openi_create_dataset",
+    "TaskCreateAimodel": "openi_create_model",
+    "CreatePullRequest": "",
+    "CreateNewModelTask": "",
+    "CreateImage": "",
+    "UploadAttachment": "",
+    "TaskInviteFriendRegister": "",
+    "DatasetRecommended": "",
+    "TaskAimodelRecommended": "",
+    "ImageRecommend": "",
+}
 
 # 计费窗口：不足 6 分钟不计费（官方文档 + 消耗流水双重验证）。
 FREE_WINDOW_SECONDS = 6 * 60
@@ -118,13 +144,60 @@ def _increase_records(
     return kept
 
 
+def _daily_actions(
+    rules: Sequence[Mapping[str, Any]], records: Sequence[Mapping[str, Any]]
+) -> List[Dict[str, Any]]:
+    """把"每日"类规则和今天的流水对起来，算每项今天做了几次、还剩几次。
+
+    流水里的 SourceTemplateId 就是规则里的 TaskCode。每项都带 daily_limit，
+    所以只有第一笔会到账（翻历史流水没有任何一天超出过一次），done_today 按
+    上限截断，避免重复调用时把次数算虚。
+    """
+    counts: Dict[str, int] = {}
+    for rec in records:
+        code = rec.get("SourceTemplateId") or rec.get("SourceType")
+        if code:
+            counts[code] = counts.get(code, 0) + 1
+    out: List[Dict[str, Any]] = []
+    for rule in rules:
+        if rule.get("RefreshRate") != "DAILY":
+            continue
+        code = rule.get("TaskCode")
+        amount = float(rule.get("AwardAmount") or 0)
+        limit = int(rule.get("LimitNum") or 0)
+        done = min(counts.get(code, 0), limit)
+        remaining = max(0, limit - done)
+        out.append(
+            {
+                "task_code": code,
+                "action": POINT_ACTIONS.get(code, code),
+                "points_per_award": amount,
+                "daily_limit": limit,
+                "done_today": done,
+                "remaining": remaining,
+                "points_remaining": amount * remaining,
+                "tool": DAILY_ACTION_TOOLS.get(code, ""),
+            }
+        )
+    out.sort(key=lambda row: (-row["points_remaining"], row["task_code"]))
+    return out
+
+
+def daily_actions(client: OpenIClient, day: Optional[str] = None) -> List[Dict[str, Any]]:
+    """今天每个"每日"积分项做了几次、还能拿多少分、用哪个工具去做。"""
+    rules = (client.points_rules() or {}).get("TaskRules") or []
+    return _daily_actions(rules, _increase_records(client, day))
+
+
 def daily_status(client: OpenIClient, day: Optional[str] = None) -> Dict[str, Any]:
-    """今天已经拿了多少分、算力那 10 分有没有拿到。"""
+    """今天已经拿了多少分、算力那 10 分有没有拿到，以及每个每日项还剩多少。"""
     day = day or beijing_day()
     account = client.points_account()
     records = _increase_records(client, day)
     points = sum(float(r.get("Amount") or 0) for r in records)
     claimed = any((r.get("SourceTemplateId") or r.get("SourceType")) == REWARD_ACTION for r in records)
+    config = client.points_rules() or {}
+    actions = _daily_actions(config.get("TaskRules") or [], records)
     return {
         "day": day,
         "balance": account.get("Balance"),
@@ -134,6 +207,8 @@ def daily_status(client: OpenIClient, day: Optional[str] = None) -> Dict[str, An
         "today_actions": sorted({(r.get("SourceTemplateId") or r.get("SourceType")) for r in records}),
         "compute_reward_claimed": claimed,
         "compute_reward_missing": not claimed,
+        "daily_actions": actions,
+        "daily_points_remaining": sum(row["points_remaining"] for row in actions),
     }
 
 
@@ -446,6 +521,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         description="自动领取 OpenI 每日算力积分（开任务不足 6 分钟不扣费）。",
     )
     parser.add_argument("--status", action="store_true", help="只打印今天的积分状态")
+    parser.add_argument(
+        "--daily", action="store_true", help="只打印今天每个每日积分项还剩多少、用哪个工具做"
+    )
     parser.add_argument("--dry-run", action="store_true", help="只打印计划，不创建任务")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出")
     parser.add_argument("--repo", default=None, help="任务使用的代码仓 owner/name")
@@ -464,6 +542,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.reap:
             reaped = reap_leftovers(client)
             report = {"ok": True, "action": "reap", "reaped": reaped, "status": daily_status(client)}
+        elif args.daily:
+            report = {"ok": True, **daily_status(client), "action": "daily_plan"}
         elif args.status:
             report = daily_status(client)
         else:
@@ -495,11 +575,24 @@ def _print_human(report: Dict[str, Any]) -> None:
     print(f"余额        {status.get('balance')} 分（累计赚 {status.get('total_earned')}，已消耗 {status.get('total_consumed')}）")
     print(f"今天已得    {status.get('today_points')} 分  明细 {status.get('today_actions')}")
     print(f"算力那 10 分 {'已拿到' if status.get('compute_reward_claimed') else '还没拿到'}")
+    remaining = [row for row in (status.get("daily_actions") or []) if row.get("remaining")]
+    if remaining:
+        print(f"每日项      还能拿 {status.get('daily_points_remaining')} 分")
+        for row in remaining:
+            tool = f"   用 {row['tool']}" if row.get("tool") else ""
+            print(
+                f"            {row['action']}  {row['points_per_award']} 分 ×{row['remaining']}"
+                f" = {row['points_remaining']} 分{tool}"
+            )
     if report.get("action") == "skip":
         print(f"结论        跳过：{report.get('reason')}")
         return
     if report.get("action") == "dry_run":
         print(f"结论        演练：计划用 {report['planned']}")
+        return
+    if report.get("action") == "daily_plan":
+        if not remaining:
+            print("结论        今天的每日项已经全部拿满")
         return
     if "task_id" in report:
         print(f"任务        #{report['task_id']}  spec {report.get('spec', {}).get('spec_id')} "
@@ -513,6 +606,7 @@ def _print_human(report: Dict[str, Any]) -> None:
     if "task_id" in report or report.get("action") in (
         "skip",
         "dry_run",
+        "daily_plan",
         "blocked",
         "error",
         "partial",

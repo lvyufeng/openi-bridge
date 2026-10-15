@@ -4,7 +4,8 @@
 [OpenI 启智社区](https://openi.pcl.ac.cn)的普惠算力：查余额和积分、看当前能开哪些规格
 （spec）和镜像、选代码仓、创建/停止/重启/删除计算任务、读任务状态与日志，以及直接在
 云脑的一张卡上跑一段代码。也可以就地创建数据集和模型库，把本地文件（数据集、ckpt
-权重等）直接传上去，再把返回的 UUID 挂到计算任务里。
+权重等）直接传上去，再把返回的 UUID 挂到计算任务里。代码仓也一并管起来：建仓、读写
+文件、看整仓文件树与提交历史、打包下载、提 issue 与评论。
 
 > www.openi.org.cn 只是社区门户网站，真正的算力平台是
 > [openi.pcl.ac.cn](https://openi.pcl.ac.cn)（启智 AI 协作平台），本工具对接的是后者。
@@ -127,7 +128,10 @@ Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即�
 （每个文件一个提交，不需要本地 git），`openi_read_repo_file` / `openi_write_repo_file`
 读改写代码，再 `openi_start_task` 指定这个仓和分支。`openi_list_repo_files` 传
 `path` 可以翻子目录。建仓和删仓在平台上都要跑几十秒，工具已经放宽了超时；超时不代表
-失败，回查 `openi_list_my_repositories` 确认即可。用完 `openi_delete_repository` 删仓。
+失败，回查 `openi_list_my_repositories` 确认即可。想一次看全仓结构用 `openi_repo_tree`，
+确认提交落地用 `openi_list_repo_commits`，整份备份到本地用 `openi_download_repo_archive`，
+报问题用 `openi_create_repo_issue` / `openi_comment_repo_issue`。用完
+`openi_delete_repository` 删仓。
 
 **收拾现场。** “把我的调试任务都停掉/删掉。”助手用 `openi_list_tasks` 找到任务，再
 `openi_stop_task` / `openi_delete_task`。
@@ -141,7 +145,7 @@ python -m openi_bridge.autopoint --status
 python -m openi_bridge.install_mcp --apply
 ~~~
 
-完整的 47 个工具见下面的[工具全表](#工具全表)。创建任务的顺序是固定的：`openi_whoami`
+完整的 54 个工具见下面的[工具全表](#工具全表)。创建任务的顺序是固定的：`openi_whoami`
 → `openi_list_creation_options` → 选代码仓和分支 → `openi_start_task` →
 `openi_get_task` / `openi_task_debug_url` → 用完 `openi_stop_task`，必要时
 `openi_delete_task`。
@@ -267,8 +271,13 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 ### 自动获取积分
 
 上面那张表里，只有「每日运行计算任务」这 10 分是纯算力侧的行为，可以放心自动化；其余
-每日项（commit、PR、Issue、评论、建公开项目、建数据集/模型/镜像）都是仓库与社交行为，
-平台明确把重复建公开项目、发空评论后删除当成刷分并追回积分，不值得为此冒险。
+每日项（commit、PR、Issue、评论、建公开项目、建数据集/模型/镜像）都得真的产出一个东西，
+平台明确把重复建公开项目、发空评论后删除当成刷分并追回积分，所以不自动刷。但每一项都
+有对应的工具，想做的时候一次调用就能完成：`openi_points_today` 会列出今天每个每日项
+做了几次、还剩几次、还能拿几分、以及用哪个工具——commit 用 `openi_push_repo_files` /
+`openi_write_repo_file`，建公开项目用 `openi_create_repository`，Issue 用
+`openi_create_repo_issue`，评论用 `openi_comment_repo_issue`，建数据集/模型用
+`openi_create_dataset` / `openi_create_model`。
 
 这 10 分可以零成本拿到，依据是两条实测结论：
 
@@ -285,6 +294,7 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 
 ~~~bash
 python -m openi_bridge.autopoint --status    # 只看今天拿了多少分
+python -m openi_bridge.autopoint --daily     # 列出每个每日项还剩多少分、用哪个工具做
 python -m openi_bridge.autopoint --dry-run   # 打印计划，不动算力
 python -m openi_bridge.autopoint             # 没拿到就补一次
 python -m openi_bridge.autopoint --reap      # 回收遗留的 autopoint-* 任务
@@ -336,7 +346,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 
 ## 工具全表
 
-共 47 个工具，都是 `openi_` 前缀。
+共 54 个工具，都是 `openi_` 前缀。
 
 | 工具 | 作用 |
 | --- | --- |
@@ -361,6 +371,12 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_read_repo_file | 读取仓内单个文件（可落盘），用于确认启动入口或超参 |
 | openi_write_repo_file | 新建或覆盖仓内一个文本文件，产生一个提交 |
 | openi_list_repo_files | 列出代码仓某个目录的文件（含类型/大小）与全部分支，用于确定启动文件 |
+| openi_repo_tree | 一次拿到整仓文件树（路径/类型/大小），比逐层翻目录快 |
+| openi_list_repo_commits | 列出提交历史（时间倒序），核对代码是不是真的推上去了 |
+| openi_download_repo_archive | 把整仓打包成 zip 下载到本地；max_bytes 超限即中止，不留残包 |
+| openi_create_repo_issue | 在代码仓里开 issue，返回 issue 号 |
+| openi_list_repo_issues | 列出代码仓的 issue（open / closed / all） |
+| openi_comment_repo_issue | 在指定 issue 下发表评论 |
 | openi_get_task | 按任务 ID 查询详情与状态 |
 | openi_list_tasks | 列出当前账号的全部任务（跨所有代码仓） |
 | openi_list_repo_tasks | 列出某个代码仓下的所有任务 |
@@ -385,6 +401,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_search_datasets | 搜索平台托管的数据集（关键词/类别/任务/许可证/排序/只看推荐，返回体积与 UUID） |
 | openi_search_models | 搜索平台托管的模型与 ckpt（关键词/标签/排序/推荐，返回体积、下载量、是否外链） |
 | openi_list_subject_files | 列出任意数据集/模型库里的文件与子目录及大小（>1000 行用 marker 翻页） |
+| openi_delete_subject_file | 删除数据集/模型库里的一个文件或整个子目录（删完重新列清单核对，本来没有则报 existed=false） |
 | openi_pull_dataset | 从 OpenI 拉取数据集文件到本地（单文件或整库，支持 dry_run 与 max_bytes） |
 | openi_pull_model | 从 OpenI 拉取模型/ckpt 文件到本地（单文件或整库，支持断点跳过） |
 
@@ -397,6 +414,9 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   删仓、`/repos/{owner}/{repo}`、`/branches`、`/right`（写权限）、`/contents` 目录列表，
   以及文件读写 `GET/POST/PUT /repos/{owner}/{repo}/contents/{path}`（POST 新建、PUT 覆盖
   需带旧 blob sha）。
+- 代码仓的 git 面：`/git/trees/{ref}?recursive=1` 一条请求返回整棵树（响应里的
+  `truncated` 表示被平台截断）、`/commits` 提交历史、`/archive/{ref}.zip` 整仓打包、
+  `/issues`（GET 列表 / POST 新建）、`/issues/{n}/comments`（POST 评论）。
 - 资源发现：`/ai_task/creation/required` 返回当前账号在指定 `job_type` + `compute_source`
   + `cluster_type` 下真实可用的规格列表（含数字 `spec_id`、卡型、卡数、CPU/内存、单价）、
   可用镜像、默认任务名、积分余额，以及 `can_create_more` / `not_stop_task_count` 等配额信息。
@@ -439,12 +459,23 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 - 上传前会先查 `/storage/summary` 比对剩余配额；单账号默认 100GB。`/storage/summary`
   带 `subject_id` 时实测仍返回账号级汇总，所以按主体维度的剩余额度只能作参考。
 - 文件本身落在华为 OBS（`obs.cn-south-222.ai.pcl.cn`）上，是持久化存储：上传成功后
-  不随任务或会话消失，删除只能通过 `openi_delete_dataset` / `openi_delete_model`
-  （`batch_delete`）显式触发。
+  不随任务或会话消失，删除走 `openi_delete_subject_file`（单个文件或子目录）或
+  `openi_delete_dataset` / `openi_delete_model`（整个库，`batch_delete`）。
+- 删除单个文件走 `DELETE /{dataset|aimodel}/file?file_name=`，平台对**不存在的路径也
+  返回 `{"code":0,"msg":"ok"}`**（删一个不存在的 `ghost.txt` 也回 ok，实测），只看响应
+  就会把「根本没删」当成删掉了。工具因此先确认路径存在，删完再重新列一遍父目录，清单里
+  确实没有了才报 `removed=true`，本来就没有则报 `existed=false`。
 - 代码仓写入走 Gitea 风格的 `contents` 接口：新建用 `POST`、覆盖用 `PUT` 且必须带旧
   blob 的 sha（工具会先查一次 sha 再决定用哪个动词），因此**每个文件一个提交**。平台的
   多文件提交入口（`POST /repos/{owner}/{repo}/contents` 批量、`POST /git/blobs`）在这套
   部署上都是 404，所以没有批量提交这条路径。
+- `openi_repo_tree` 走 `/git/trees/{ref}?recursive=1`，一条请求拿全，大仓能返回几万条，
+  所以默认截到 20000 条并用 `truncated` 标出来。`openi_list_repo_commits` 走 `/commits`，
+  它的 `path` 过滤参数在这套部署上是空操作（实测传任何 path 都返回全量历史），所以工具
+  没有暴露这个参数；要看某个文件的内容直接 `openi_read_repo_file`。
+- `openi_download_repo_archive` 走 `/archive/{ref}.zip`，边下边写盘，先落在
+  `<目标>.part` 下完再改名，中途失败或超过 `max_bytes` 都会把临时文件删掉，不会留下
+  半截 zip。
 - 单文件走 base64（整个文件进内存），因此 `openi_push_repo_files` 有单文件上限
   `MAX_REPO_FILE_BYTES`（50MB）；更大的文件请改用 local git 推送。
 - 没有做成工具的 `DELETE /repos/{owner}/{repo}/contents/{path}`：这条路由在平台上会一直
@@ -487,9 +518,10 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 - `openi_start_task` 的 `dataset_uuid_str` / `pretrain_model_id_str` 支持逗号分隔的
   `owner/name`，工具会先查回 UUID 再创建任务；挂载靠平台把数据迁到集群
   （任务会经过 `dataMigrating`），所以公开 ckpt 可以直接挂、不必先下载。
-- 整库 zip 接口（`/{dataset|aimodel}/download`）没有单独做成工具：逐文件拉取已经能
-  拿到同样的内容，还多出 `dry_run` 预览、按大小跳过已下载文件和断点续传的能力，
+- 数据集/模型库的整库 zip 接口（`/{dataset|aimodel}/download`）没有单独做成工具：逐文件
+  拉取已经能拿到同样的内容，还多出 `dry_run` 预览、按大小跳过已下载文件和断点续传的能力，
   而 zip 一次性把整包放进内存/磁盘、中途失败要重来。需要 zip 时可直接对该接口发请求。
+  代码仓的打包下载是另一条路由，做成了 `openi_download_repo_archive`。
 - 普通用户可用的集群是 `C2Net`（智算网络）。`cluster` 必须填 `C2Net`，`cluster_type`
   查询参数同理；`openi` 之类的值会返回参数错误或空规格。
 - 创建任务的必填字段是 `job_type`、`display_job_name`、`spec_id`（整数）、

@@ -42,7 +42,10 @@ mcp = _Server(
         "并新建、停止、重启、删除计算任务；也可以创建数据集/模型库并把本地文件"
         "（数据集、ckpt 权重等）上传上去，再把得到的 UUID 挂到计算任务上。"
         "代码仓本身也能读写：openi_create_repository 建仓，openi_push_repo_files / "
-        "openi_write_repo_file 把代码提交上去，不需要本地 git。创建任务前先用 "
+        "openi_write_repo_file 把代码提交上去，不需要本地 git；openi_repo_tree 一次"
+        "拿全文件树，openi_list_repo_commits 看提交历史，openi_download_repo_archive "
+        "打包下载整仓，openi_create_repo_issue / openi_comment_repo_issue 在仓里提 issue "
+        "与评论。数据集/模型库里的文件也能单个删除：openi_delete_subject_file。创建任务前先用 "
         "openi_list_creation_options 拿到实时的 spec_id 与镜像。使用前必须设置 "
         "OPENI_TOKEN 环境变量，令牌在 https://openi.pcl.ac.cn/user/settings/applications 生成。"
     ),
@@ -549,6 +552,124 @@ def openi_list_repo_files(repo: str, ref: Optional[str] = None, path: str = "") 
 
 
 @mcp.tool()
+def openi_repo_tree(
+    repo: str, ref: Optional[str] = None, path: str = "", max_entries: int = 20000
+) -> str:
+    """一次拿到代码仓的完整文件树，用来确认目录结构和启动入口在哪。
+
+    比逐层调 openi_list_repo_files 快得多：平台一条请求就返回整棵树，适合先看清
+    仓里有什么再决定读哪个文件。
+
+    repo: 代码仓全名 owner/name。
+    ref: 分支或提交，留空用 HEAD（默认分支的最新提交）。
+    path: 只看这个子目录；客户端过滤，请求本身仍取全量。
+    max_entries: 最多返回多少条，默认 20000；被截断时 truncated 为 true。
+    """
+    try:
+        with _client() as client:
+            result = client.repo_tree(repo, ref=ref or "", path=path, max_entries=max_entries)
+        return dump({"ok": True, **result})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_repo_commits(
+    repo: str, ref: Optional[str] = None, limit: int = 20, page: int = 1
+) -> str:
+    """列出代码仓的提交历史（按时间倒序），用来核对代码是不是真的推上去了。
+
+    repo: 代码仓全名 owner/name。
+    ref: 分支或提交，留空用默认分支。
+    limit / page: 分页，默认最新 20 条。
+
+    平台的 path 过滤参数在这套部署上是空操作（实测传任何 path 都返回全量历史），
+    所以这里没有这个参数；要看某个具体文件的内容直接 openi_read_repo_file。
+    """
+    try:
+        with _client() as client:
+            commits = client.repo_commits(repo, ref=ref or "", limit=limit, page=page)
+        return dump({"ok": True, "repo": repo, "count": len(commits), "commits": commits})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_download_repo_archive(
+    repo: str, save_to: str, ref: Optional[str] = None, max_bytes: Optional[int] = None
+) -> str:
+    """把整个代码仓打包成 zip 下载到本地（备份，或整份拿到本地再改）。
+
+    只想看单个文件用 openi_read_repo_file，只要目录结构用 openi_repo_tree。
+
+    repo: 代码仓全名 owner/name。
+    save_to: 本地保存路径；如果给的是已存在的目录，会按 <仓名>-<ref>.zip 命名。
+    ref: 分支或提交，留空用默认分支。
+    max_bytes: 大小上限，超了立刻中止并删掉半包，不会留下残缺的 zip。
+    """
+    try:
+        with _client() as client:
+            result = client.download_repo_archive(
+                repo, save_to, ref=ref or "", max_bytes=max_bytes
+            )
+        return dump({"ok": True, **result})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_create_repo_issue(repo: str, title: str, body: str = "") -> str:
+    """在代码仓里开一个 issue，用来报问题或记待办，返回 issue 号。
+
+    repo: 代码仓全名 owner/name。
+    title: 标题（必填）。
+    body: 正文，支持 Markdown，可留空。
+    返回里的 number 可以接着传给 openi_comment_repo_issue。
+    """
+    try:
+        with _client() as client:
+            issue = client.create_repo_issue(repo, title, body)
+        return dump({"ok": True, "repo": repo, "issue": issue})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_repo_issues(
+    repo: str, state: str = "open", limit: int = 20, page: int = 1
+) -> str:
+    """列出代码仓的 issue，拿到 issue 号后可以用 openi_comment_repo_issue 回复。
+
+    repo: 代码仓全名 owner/name。
+    state: open（默认）/ closed / all。
+    limit / page: 分页，默认第 1 页、每页 20 条。
+    """
+    try:
+        with _client() as client:
+            issues = client.repo_issues(repo, state=state, limit=limit, page=page)
+        return dump({"ok": True, "repo": repo, "state": state, "count": len(issues), "issues": issues})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_comment_repo_issue(repo: str, index: int, body: str) -> str:
+    """在某个 issue 下发表评论。
+
+    repo: 代码仓全名 owner/name。
+    index: issue 号，即 openi_list_repo_issues 返回的 number（也可以从
+      openi_create_repo_issue 的返回值里拿）。
+    body: 评论正文，支持 Markdown。
+    """
+    try:
+        with _client() as client:
+            comment = client.comment_repo_issue(repo, index, body)
+        return dump({"ok": True, "repo": repo, "issue": index, "comment": comment})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
 def openi_read_repo_file(
     repo: str,
     path: str,
@@ -1047,6 +1168,30 @@ def openi_list_subject_files(
         return _err(exc)
 
 
+@mcp.tool()
+def openi_delete_subject_file(
+    subject: str, path: str, subject_type: str = "dataset"
+) -> str:
+    """删除数据集/模型库里的一个文件，或者连同内容删掉整个子目录（不可恢复）。
+
+    subject: 全名 owner/name（可用 openi_search_datasets / openi_search_models 查）。
+    path: 仓内相对路径，例如 "a.txt" 或 "ckpt/epoch1.pt"；写成目录名就删掉整个
+      目录连同里面的文件，例如 "ckpt"。
+    subject_type: dataset（默认）或 model。
+
+    删除只影响这一个路径，库本身的其余内容与 UUID 不变。注意这个接口对不存在的
+    路径也回 200/ok，所以工具删完会重新列一遍父目录核对：清单里确实没有了才报
+    removed=true，本来就没有则报 existed=false（什么都没动）。
+    """
+    try:
+        with _client() as client:
+            result = client.delete_subject_file(subject, subject_type, path)
+        return dump({"ok": result.get("removed", False), "subject": subject,
+                     "subject_type": subject_type, **result})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
 def _pull(client: OpenIClient, subject: str, subject_type: str, dest_dir: str, file: Optional[str],
           parent_dir: str, dry_run: bool, overwrite: bool, max_bytes: Optional[int],
           max_files: Optional[int] = None) -> str:
@@ -1438,43 +1583,29 @@ def openi_sdk_code(job_type: str = "DEBUG", compute_source: str = "GPU", visuali
 def openi_points_today() -> str:
     """看今天（北京时间）已经拿到多少积分、还剩哪些没拿。
 
-    返回今天的获取流水、当天的算力 10 分是否已到账，以及规则里"每日"类项目的
-    完成情况。平台的每日结算以北京时间 0 点为界。
+    返回今天的获取流水、当天的算力 10 分是否已到账，以及规则里每一个"每日"类
+    项目的完成情况（今天做了几次、还剩几次、还能拿几分、对应的工具是哪个）。
+    平台的每日结算以北京时间 0 点为界。
     """
     try:
         with _client() as client:
             status = autopoint.daily_status(client)
-            config = client.points_rules()
-        rules = config.get("TaskRules") or []
-        reward = next((r for r in rules if r.get("TaskCode") == autopoint.REWARD_ACTION), {})
-        earned_codes = set(status.get("today_actions") or [])
-        pending_daily = []
-        for rule in rules:
-            if rule.get("RefreshRate") != "DAILY":
-                continue
-            code = rule.get("TaskCode")
-            if code not in earned_codes:
-                pending_daily.append(
-                    {
-                        "action": POINT_ACTIONS.get(code, code),
-                        "task_code": code,
-                        "points_per_cycle": float(rule.get("AwardAmount") or 0)
-                        * float(rule.get("LimitNum") or 0),
-                    }
-                )
-        pending_daily.sort(key=lambda row: -row["points_per_cycle"])
+        daily = status.get("daily_actions") or []
+        reward = next((row for row in daily if row["task_code"] == autopoint.REWARD_ACTION), {})
         return dump(
             {
                 "ok": True,
                 **status,
-                "compute_reward_points": float(reward.get("AwardAmount") or 0),
-                "pending_daily_actions": pending_daily,
+                "compute_reward_points": reward.get("points_per_award", 0.0),
+                "pending_daily_actions": [row for row in daily if row.get("remaining")],
                 "automation": {
                     "automated_action": POINT_ACTIONS.get(autopoint.REWARD_ACTION),
                     "how": "openi_claim_daily_points 会在需要时开一个 1 分/卡时的 DEBUG 任务，"
                     "进入 RUNNING 后立即停止并删除；不足 6 分钟不计费，所以当天净赚 10 分、"
-                    "算力消耗 0 分。其余每日项（commit/PR/issue/评论/建仓建数据集等）属于"
-                    "仓库与社交行为，平台对重复公开项目、空评论等按刷分处理，不做自动化。",
+                    "算力消耗 0 分。其余每日项每条都要产出一个真实的东西（一处 commit、"
+                    "一个 issue、一条评论、一个数据集），平台对重复公开项目、空评论按刷分"
+                    "处理并追回积分，所以不自动刷；要做的时候用 pending_daily_actions 里"
+                    "给出的工具调一次即可。",
                 },
             }
         )
