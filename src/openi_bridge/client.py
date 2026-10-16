@@ -755,19 +755,29 @@ class OpenIClient:
         ]
 
     def repo_collaborators(self, subject_name: str) -> List[Dict[str, Any]]:
-        """GET /repos/{name}/collaborators - 协作者及其权限。"""
+        """GET /repos/{name}/collaborators - 协作者清单。
+
+        平台这个接口实际回的字段是 id / login / full_name / email / is_active /
+        last_login，**没有 permissions**（2026-10-17 实测 OpenModelZoo/ELMo）。
+        所以这里不再编一个恒为 null 的 permissions 字段，改成把平台真的给了的
+        权限相关字段透出来；哪天平台开始回 permissions，也会被带上。
+        """
         rows = self.get_json(f"/repos/{subject_name}/collaborators") or []
         if isinstance(rows, Mapping):
             rows = rows.get("collaborators") or []
-        return [
-            {
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, Mapping):
+                continue
+            entry: Dict[str, Any] = {
                 "login": r.get("login"),
                 "full_name": r.get("full_name"),
-                "permissions": r.get("permissions"),
+                "is_active": r.get("is_active"),
             }
-            for r in rows
-            if isinstance(r, Mapping)
-        ]
+            if "permissions" in r:  # 平台当前不回，回了就透传
+                entry["permissions"] = r.get("permissions")
+            out.append(entry)
+        return out
 
     def repo_stargazers(self, subject_name: str, limit: int = 50, page: int = 1) -> List[Dict[str, Any]]:
         """GET /repos/{name}/stargazers - 收藏该仓的账号。"""

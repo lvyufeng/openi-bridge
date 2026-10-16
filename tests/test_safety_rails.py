@@ -188,6 +188,37 @@ class TestTokenRedaction:
         assert _sslopt("ws://host") is None
 
 
+class TestNoFabricatedFields:
+    """Tools must not invent fields the platform never returns.
+
+    A key that is always None reads as "the platform told us nothing about
+    permissions", when the truth is "the platform has no such field here". The
+    collaborator route was returning a hard-coded ``permissions: None``.
+    """
+
+    def _client(self, payload):
+        from openi_bridge.client import OpenIClient
+
+        client = OpenIClient.__new__(OpenIClient)
+        client.get_json = lambda path, params=None: payload
+        return client
+
+    def test_permissions_absent_when_platform_omits_it(self):
+        client = self._client(
+            [{"login": "cqu-tqy", "full_name": "", "is_active": True}]
+        )
+        rows = client.repo_collaborators("owner/repo")
+        assert rows == [{"login": "cqu-tqy", "full_name": "", "is_active": True}]
+        assert "permissions" not in rows[0]
+
+    def test_permissions_passed_through_when_platform_sends_it(self):
+        client = self._client(
+            [{"login": "x", "full_name": "y", "permissions": {"admin": True}}]
+        )
+        rows = client.repo_collaborators("owner/repo")
+        assert rows[0]["permissions"] == {"admin": True}
+
+
 class TestFreeWindowAccounting:
     """keep_seconds must be measured from RUNNING, and truncation reported."""
 

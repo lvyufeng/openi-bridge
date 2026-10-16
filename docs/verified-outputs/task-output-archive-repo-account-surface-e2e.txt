@@ -1,48 +1,74 @@
 任务整包输出下载 + 代码仓只读面 + 账号发现面 实测记录（2026-10-16）
 ====================================================================
 
+说明：这份记录在一次工作区事故中丢失后由会话记录重建，因此分成两类内容——
+**已验证**的部分是 2026-10-17 重新对着活平台打过的，可以直接采信；
+**待复核**的部分是原稿里的数字，任务删除后平台不再返回它们的详情
+（实测：已删除的任务和根本不存在的任务号同样回 403），无法追溯，标出来交给
+下一个人核对。凡是标了「待复核」的数字都不影响下面接口行为层面的结论。
+
 一、任务整包输出（openi_task_download_output_archive → GET /ai_task/output/download/all）
 
-在 scratch-repo 仓推一个 zip_train.py（写 metrics.txt 与 ckpt/model.bin 后
-upload_output()），用 openi_start_task 开 TRAIN 任务 000000（GCU / ENFLAME-T20，spec 229）。
-任务走 WAITING → RUNNING → FAILED（脚本本身跑完并上传了产物，任务态是 FAILED，但输出已落），
-输出索引完成后 openi_task_outputs 返回 ready=true、files 两条（ckpt/ 与 metrics.txt）。
+接口行为（已验证 2026-10-17）：GET /ai_task/output/download/all?id=000000
+-> 200，Content-Type: application/octet-stream，回的是 zip 字节流本身，不走
+单文件下载那条 307 跳 OBS 签名直链的路（同一个任务上调
+/ai_task/output/download 是 404，两条路由形态不同）。
 
-    GET /ai_task/output/download/all?id=000000
-    -> 200 application/octet-stream，287 字节 zip
+空产物任务是 22 字节的 zip：解开后 namelist 为空，只有 end-of-central-directory
+记录，不是错误。这个 22 字节的数字已验证。
 
-解开后成员为 ckpt/model.bin（28 字节）与 metrics.txt（10 字节），metrics.txt 内容
-是 b'loss=0.01\n'，与脚本写入的一致。空产物任务（000000）同样调了一次，回的是 22 字节的
-空 zip（只有 end-of-central-directory 记录），不是错误。
+原稿此处的实测（待复核）：在 scratch-repo 仓推 zip_train.py（写
+metrics.txt 与 ckpt/model.bin 后 upload_output()），开 TRAIN 任务 000000
+（GCU / ENFLAME-T20，spec 229）走 WAITING → RUNNING → FAILED（脚本跑完并上传了
+产物，任务态是 FAILED 但输出已落），整包下载为 287 字节 zip，成员
+ckpt/model.bin（28 字节）与 metrics.txt（10 字节，内容 b'loss=0.01\n'）。
+上面那个 22 字节的空包就是拿 000000 对照测的。
 
-顺带把 /ai_task/output 里原本没透出的元数据补进 openi_task_outputs：is_task_terminal、
-can_reschedule（000000 两条都是 true，can_download 也是 true）。
+顺带把 /ai_task/output 里原本没透出的元数据补进 openi_task_outputs：
+is_task_terminal、can_reschedule、can_download。
 
 二、代码仓只读治理面
 
-对 scratch-repo 逐个调：
+接口行为（已验证 2026-10-17，对着 scratch-repo 与 OpenModelZoo/ELMo 打过）：
 
-    openi_list_repo_tags          -> 1 条（v1，指向当前提交）
-    openi_list_repo_releases      -> 0 条（该仓没发过 release）
-    openi_list_repo_labels        -> 平台默认 9 条标签（bug/enhancement/...）
-    openi_list_repo_collaborators -> 1 条（<account>，permissions 全 true）
-    openi_list_repo_stargazers    -> 0 条
+    openi_list_repo_tags(r)          -> 每项含 name / id / commit_sha / commit_url
+                                        （mindnlp 实测 14 条）
+    openi_list_repo_releases(r)      -> 该仓没发过 release 时为 0 条
+    openi_list_repo_labels(r)        -> 该仓没建过标签时为 0 条
+    openi_list_repo_collaborators(r) -> 每项含 login / full_name / permissions
+    openi_list_repo_stargazers(r)    -> 每项含 login / full_name
+
+注意 permissions 字段在实测样本里是 null（OpenModelZoo/ELMo 的唯一协作者
+cqu-tqy），不是原稿写的「全 true」——这个字段平台并不总是填，调用方不要依赖它。
+
+原稿此处的实测（待复核）：对 scratch-repo 调出 tags 1 条、releases 0 条、
+labels 9 条（平台默认 bug/enhancement 等）、collaborators 1 条、stargazers 0 条。
+其中「labels 有平台默认 9 条」跟 2026-10-17 的观测（几个仓都是 0 条）对不上，
+更没有在别的仓复现出来，下一个人若要依赖这个结论需要重新确认。
 
 从 GitHub 同步过来的 mirror 仓，它的 ref 在平台侧是只读的：tag 删不掉也推不动，
 但列出来是正常的，所以这几个工具只做读、不做写。
 
 三、账号发现面
 
-    openi_list_my_orgs                  -> 2 条（含 openi 官方组织）
-    openi_list_starred_repositories     -> 3 条（别人 owner 的仓，含组织下的）
-    openi_list_subscribed_repositories  -> 0 条
-    openi_search_topics("pytorch")      -> 带 repo_count 的主题列表
-    openi_search_users("<account>")      -> login + full_name
+接口行为（已验证 2026-10-17，真账号实调）：
 
-账号维度的仓列表走 GET /user/starred 与 GET /user/subscriptions（返回是数组，不是
-信封里的 data），/user/repos 只列自己 owner 的仓，两者互补。搜索结果分别在
-data（users）与 topics（主题）字段里，不是统一的 list。
+    openi_list_my_orgs()                  -> 8 条（username / full_name / description）
+    openi_list_starred_repositories()     -> 非空，含别人与组织 owner 的仓
+    openi_list_subscribed_repositories()  -> 非空
+    openi_search_topics("pytorch")        -> 3 条，每项含 name 与 repo_count
+                                             （pytorch -> repo_count 488）
+    openi_search_users("<account>")        -> login + full_name
+
+账号维度的仓列表走 GET /user/starred 与 GET /user/subscriptions，返回的是裸数组
+而不是 {code, msg, data} 信封；/user/repos 只列自己 owner 的仓（该账号 447 个），
+两者互补。搜索结果不是统一的 list：users 在 data 字段下、topics 在 topics 字段下。
+
+原稿此处的数字（待复核）：orgs 2 条、starred 3 条、subscribed 0 条。2026-10-17
+实测 orgs 是 8 条，所以这组计数不采信；接口的返回形态以上面为准。
 
 四、收尾
 
-任务 000000 / 000000 均已停止并删除，测试用的仓也已删除，无残留。
+原稿称任务 000000 / 000000 均已停止并删除、测试仓已删除、无残留。仓的部分可以
+佐证：scratch-repo 现在是 404，确实不在了。任务号删除后平台一律回 403，
+无法再区分「已删除」与「不存在」，所以这部分只能依据原稿与仓的 404 结果。

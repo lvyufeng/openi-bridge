@@ -632,7 +632,11 @@ def openi_list_repo_labels(repo: str) -> str:
 
 @mcp.tool()
 def openi_list_repo_collaborators(repo: str) -> str:
-    """列出代码仓的协作者与他们的权限。"""
+    """列出代码仓的协作者（login / full_name / is_active）。
+
+    注意平台这个接口不回 permissions 字段（2026-10-17 实测），所以这里不承诺给出
+    每个人的权限。
+    """
     try:
         with _client() as client:
             people = client.repo_collaborators(repo)

@@ -416,7 +416,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_list_repo_tags | 列出代码仓的 tag 及每个 tag 指向的提交 |
 | openi_list_repo_releases | 列出代码仓的 release（含 tag、草稿/预发布标记与时间） |
 | openi_list_repo_labels | 列出代码仓的标签（issue 分类用，含颜色） |
-| openi_list_repo_collaborators | 列出代码仓的协作者与他们的权限 |
+| openi_list_repo_collaborators | 列出代码仓的协作者（平台不回 permissions 字段，故不承诺权限） |
 | openi_list_repo_stargazers | 列出收藏（star）某个代码仓的账号 |
 | openi_list_starred_repositories | 列出当前账号收藏的代码仓（别人的仓，找参考实现的入口） |
 | openi_list_subscribed_repositories | 列出当前账号关注（watch）的代码仓 |
