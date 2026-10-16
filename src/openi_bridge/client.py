@@ -634,6 +634,164 @@ class OpenIClient:
         """Branches of a repo; the create form needs one for the code version."""
         return self.get_json(f"/repos/{subject_name}/branches")
 
+    def repo_tags(self, subject_name: str) -> List[Dict[str, Any]]:
+        """GET /repos/{name}/tags - 代码仓的 tag 列表（每项含指向的 commit）。
+
+        用来确认某个版本打没打过 tag、以及 tag 落在哪个提交上。注意 mirror 仓
+        （从 GitHub 同步过来的那种）上的 ref 是平台只读的，删不掉也推不动。
+        """
+        rows = self.get_json(f"/repos/{subject_name}/tags") or []
+        if isinstance(rows, Mapping):
+            rows = rows.get("tags") or []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            commit = row.get("commit") if isinstance(row.get("commit"), Mapping) else {}
+            out.append(
+                {
+                    "name": row.get("name"),
+                    "id": row.get("id"),
+                    "commit_sha": commit.get("sha"),
+                    "commit_url": commit.get("url"),
+                }
+            )
+        return out
+
+    def repo_releases(self, subject_name: str) -> List[Dict[str, Any]]:
+        """GET /repos/{name}/releases - 代码仓的 release（含附件）。"""
+        rows = self.get_json(f"/repos/{subject_name}/releases") or []
+        if isinstance(rows, Mapping):
+            rows = rows.get("releases") or []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            author = row.get("author") if isinstance(row.get("author"), Mapping) else {}
+            out.append(
+                {
+                    "id": row.get("id"),
+                    "tag_name": row.get("tag_name"),
+                    "name": row.get("name"),
+                    "draft": row.get("draft"),
+                    "prerelease": row.get("prerelease"),
+                    "created_at": row.get("created_at"),
+                    "published_at": row.get("published_at"),
+                    "author": author.get("login"),
+                }
+            )
+        return out
+
+    def repo_labels(self, subject_name: str) -> List[Dict[str, Any]]:
+        """GET /repos/{name}/labels - 代码仓的标签（issue 分类用）。"""
+        rows = self.get_json(f"/repos/{subject_name}/labels") or []
+        if isinstance(rows, Mapping):
+            rows = rows.get("labels") or []
+        return [
+            {"id": r.get("id"), "name": r.get("name"), "color": r.get("color")}
+            for r in rows
+            if isinstance(r, Mapping)
+        ]
+
+    def repo_collaborators(self, subject_name: str) -> List[Dict[str, Any]]:
+        """GET /repos/{name}/collaborators - 协作者及其权限。"""
+        rows = self.get_json(f"/repos/{subject_name}/collaborators") or []
+        if isinstance(rows, Mapping):
+            rows = rows.get("collaborators") or []
+        return [
+            {
+                "login": r.get("login"),
+                "full_name": r.get("full_name"),
+                "permissions": r.get("permissions"),
+            }
+            for r in rows
+            if isinstance(r, Mapping)
+        ]
+
+    def repo_stargazers(self, subject_name: str, limit: int = 50, page: int = 1) -> List[Dict[str, Any]]:
+        """GET /repos/{name}/stargazers - 收藏该仓的账号。"""
+        rows = self.get_json(
+            f"/repos/{subject_name}/stargazers", params={"limit": limit, "page": page}
+        ) or []
+        if isinstance(rows, Mapping):
+            rows = rows.get("stargazers") or []
+        return [
+            {"login": r.get("login"), "full_name": r.get("full_name")}
+            for r in rows
+            if isinstance(r, Mapping)
+        ]
+
+    def account_repos(self, scope: str, limit: int = 50, page: int = 1) -> List[Dict[str, Any]]:
+        """账号维度的仓列表：scope 取 starred（收藏）/ subscriptions（关注）。
+
+        只列自己 owner 的仓用 my_repos（/user/repos），这里补的是“别人的仓”。
+        """
+        paths = {
+            "starred": "/user/starred",
+            "subscriptions": "/user/subscriptions",
+        }
+        if scope not in paths:
+            raise OpenIError(f"scope 只能是 starred 或 subscriptions：{scope!r}")
+        rows = self.get_json(paths[scope], params={"limit": limit, "page": page}) or []
+        if isinstance(rows, Mapping):
+            rows = rows.get("data") or []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            owner = row.get("owner") if isinstance(row.get("owner"), Mapping) else {}
+            out.append(
+                {
+                    "full_name": row.get("full_name"),
+                    "owner": owner.get("login"),
+                    "private": row.get("private"),
+                    "description": row.get("description"),
+                    "updated_at": row.get("updated_at"),
+                }
+            )
+        return out
+
+    def my_orgs(self) -> List[Dict[str, Any]]:
+        """GET /user/orgs - 当前账号加入的组织/团队。"""
+        rows = self.get_json("/user/orgs") or []
+        if isinstance(rows, Mapping):
+            rows = rows.get("data") or []
+        return [
+            {
+                "username": r.get("username") or r.get("name"),
+                "full_name": r.get("full_name"),
+                "description": r.get("description"),
+            }
+            for r in rows
+            if isinstance(r, Mapping)
+        ]
+
+    def search_topics(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """GET /topics/search - 按主题找仓，主题上带仓数量。"""
+        data = self.get_json("/topics/search", params={"q": query, "limit": limit}) or {}
+        rows = data.get("topics") if isinstance(data, Mapping) else []
+        return [
+            {
+                "name": r.get("topic_name"),
+                "repo_count": r.get("repo_count"),
+            }
+            for r in (rows or [])
+            if isinstance(r, Mapping)
+        ]
+
+    def search_users(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """GET /users/search - 按关键字找人。"""
+        data = self.get_json("/users/search", params={"q": query, "limit": limit}) or {}
+        rows = data.get("data") if isinstance(data, Mapping) else []
+        return [
+            {
+                "login": r.get("login"),
+                "full_name": r.get("full_name"),
+            }
+            for r in (rows or [])
+            if isinstance(r, Mapping)
+        ]
+
     def repo_contents(
         self, subject_name: str, ref: Optional[str] = None, path: str = ""
     ) -> Any:
@@ -1901,6 +2059,30 @@ class OpenIClient:
             save_to=save_to,
             max_bytes=max_bytes,
             label=file_name,
+        )
+
+    def task_output_download_all(
+        self,
+        task_id: Any,
+        save_to: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """整包下载任务输出（GET /ai_task/output/download/all?id=）。
+
+        平台把整个输出目录打成一个 zip 直接回（Content-Type 是
+        application/octet-stream，不走 307 跳 OBS 签名直链那条路）。产物多的时候
+        比逐个文件拉省事；任务没产物时它会回一个只有 end-of-central-directory 记
+        录的空 zip（约 22 字节），那不是错误。
+
+        一定要给 save_to：整包可能很大，这条接口是流式落盘的，不适合读进内存。
+        max_bytes 给上是硬上限，超了立即中止并删掉半截包。
+        """
+        return self._download(
+            "/ai_task/output/download/all",
+            {"id": task_id},
+            save_to=save_to,
+            max_bytes=max_bytes,
+            label=f"task-{task_id}-output.zip",
         )
 
     def task_log_download(

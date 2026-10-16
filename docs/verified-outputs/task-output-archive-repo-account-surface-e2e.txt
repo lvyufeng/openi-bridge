@@ -1,0 +1,48 @@
+任务整包输出下载 + 代码仓只读面 + 账号发现面 实测记录（2026-10-16）
+====================================================================
+
+一、任务整包输出（openi_task_download_output_archive → GET /ai_task/output/download/all）
+
+在 scratch-repo 仓推一个 zip_train.py（写 metrics.txt 与 ckpt/model.bin 后
+upload_output()），用 openi_start_task 开 TRAIN 任务 000000（GCU / ENFLAME-T20，spec 229）。
+任务走 WAITING → RUNNING → FAILED（脚本本身跑完并上传了产物，任务态是 FAILED，但输出已落），
+输出索引完成后 openi_task_outputs 返回 ready=true、files 两条（ckpt/ 与 metrics.txt）。
+
+    GET /ai_task/output/download/all?id=000000
+    -> 200 application/octet-stream，287 字节 zip
+
+解开后成员为 ckpt/model.bin（28 字节）与 metrics.txt（10 字节），metrics.txt 内容
+是 b'loss=0.01\n'，与脚本写入的一致。空产物任务（000000）同样调了一次，回的是 22 字节的
+空 zip（只有 end-of-central-directory 记录），不是错误。
+
+顺带把 /ai_task/output 里原本没透出的元数据补进 openi_task_outputs：is_task_terminal、
+can_reschedule（000000 两条都是 true，can_download 也是 true）。
+
+二、代码仓只读治理面
+
+对 scratch-repo 逐个调：
+
+    openi_list_repo_tags          -> 1 条（v1，指向当前提交）
+    openi_list_repo_releases      -> 0 条（该仓没发过 release）
+    openi_list_repo_labels        -> 平台默认 9 条标签（bug/enhancement/...）
+    openi_list_repo_collaborators -> 1 条（<account>，permissions 全 true）
+    openi_list_repo_stargazers    -> 0 条
+
+从 GitHub 同步过来的 mirror 仓，它的 ref 在平台侧是只读的：tag 删不掉也推不动，
+但列出来是正常的，所以这几个工具只做读、不做写。
+
+三、账号发现面
+
+    openi_list_my_orgs                  -> 2 条（含 openi 官方组织）
+    openi_list_starred_repositories     -> 3 条（别人 owner 的仓，含组织下的）
+    openi_list_subscribed_repositories  -> 0 条
+    openi_search_topics("pytorch")      -> 带 repo_count 的主题列表
+    openi_search_users("<account>")      -> login + full_name
+
+账号维度的仓列表走 GET /user/starred 与 GET /user/subscriptions（返回是数组，不是
+信封里的 data），/user/repos 只列自己 owner 的仓，两者互补。搜索结果分别在
+data（users）与 topics（主题）字段里，不是统一的 list。
+
+四、收尾
+
+任务 000000 / 000000 均已停止并删除，测试用的仓也已删除，无残留。

@@ -401,6 +401,16 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_list_repo_issues | 列出代码仓的 issue（open / closed / all） |
 | openi_comment_repo_issue | 在指定 issue 下发表评论 |
 | openi_update_repo_issue | 关闭 / 重开 issue，或改标题与正文（走 issue 路径上的 POST，平台的 PATCH 被反代拦截） |
+| openi_list_repo_tags | 列出代码仓的 tag 及每个 tag 指向的提交 |
+| openi_list_repo_releases | 列出代码仓的 release（含 tag、草稿/预发布标记与时间） |
+| openi_list_repo_labels | 列出代码仓的标签（issue 分类用，含颜色） |
+| openi_list_repo_collaborators | 列出代码仓的协作者与他们的权限 |
+| openi_list_repo_stargazers | 列出收藏（star）某个代码仓的账号 |
+| openi_list_starred_repositories | 列出当前账号收藏的代码仓（别人的仓，找参考实现的入口） |
+| openi_list_subscribed_repositories | 列出当前账号关注（watch）的代码仓 |
+| openi_list_my_orgs | 列出当前账号加入的组织 / 团队 |
+| openi_search_topics | 按主题（topic）找仓，主题上带着仓数量 |
+| openi_search_users | 按关键字找账号（人和组织），拿 login 拼全名 owner/name |
 | openi_get_task | 按任务 ID 查询详情与状态 |
 | openi_list_tasks | 列出当前账号的全部任务（跨所有代码仓） |
 | openi_list_repo_tasks | 列出某个代码仓下的所有任务 |
@@ -414,6 +424,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_task_outputs | 列出任务输出目录的文件（一次一层，子目录用 parent_dir 下翻） |
 | openi_task_output_files | 一次列出任务输出的全部文件（递归，name 即相对路径，可直接下载） |
 | openi_task_download_output | 下载任务输出的某个文件（流式落盘，或直接读进返回） |
+| openi_task_download_output_archive | 把整个输出目录打包成一个 zip 下载（产物多时省事，流式落盘） |
 | openi_task_download_log | 下载任务的完整日志（整段纯文本，非分页；读进返回时默认截到 256KB） |
 | openi_task_loss | 读取训练任务的 loss 曲线（epoch / loss 序列） |
 | openi_task_export_to_dataset | 把任务输出文件搬进已有数据集：产物从“跟着任务走”变成数据集里的普通文件，可挂别的任务或被拉取 |

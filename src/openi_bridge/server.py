@@ -47,7 +47,12 @@ mcp = _Server(
         "openi_write_repo_file 把代码提交上去，不需要本地 git；openi_repo_tree 一次"
         "拿全文件树，openi_list_repo_commits 看提交历史，openi_download_repo_archive "
         "打包下载整仓，openi_create_repo_issue / openi_comment_repo_issue 在仓里提 issue "
-        "与评论，openi_update_repo_issue 关闭或改动 issue。通知用 openi_notifications "
+        "与评论，openi_update_repo_issue 关闭或改动 issue。仓的只读治理面另有 "
+        "openi_list_repo_tags / openi_list_repo_releases / openi_list_repo_labels / "
+        "openi_list_repo_collaborators / openi_list_repo_stargazers；想找别人的仓用 "
+        "openi_list_starred_repositories / openi_list_subscribed_repositories / "
+        "openi_search_topics / openi_search_users，自己加入的组织用 openi_list_my_orgs。"
+        "通知用 openi_notifications "
         "列表、openi_notification_detail 看正文、openi_mark_all_notifications_read 全部标已读。"
         "数据集/模型库里的文件也能单个删除：openi_delete_subject_file。创建任务前先用 "
         "openi_list_creation_options 拿到实时的 spec_id 与镜像；openi_list_task_templates "
@@ -58,7 +63,8 @@ mcp = _Server(
         "使用前必须设置 "
         "OPENI_TOKEN 环境变量，令牌在 https://openi.pcl.ac.cn/user/settings/applications 生成。"
         "任务跑完后用 openi_task_outputs / openi_task_output_files 看产出文件、"
-        "openi_task_download_output 取文件、openi_task_download_log 取整份日志；"
+        "openi_task_download_output 取单个文件、openi_task_download_output_archive 整包"
+        "打 zip 下载、openi_task_download_log 取整份日志；"
         "任务排队或失败时用 openi_task_events 看调度时间线，openi_task_nodes 看节点，"
         "openi_task_loss 看训练 loss 曲线。训练产物要长期留存就用 "
         "openi_task_export_to_dataset / openi_task_export_to_model 把它导成数据集或模型库，"
@@ -560,6 +566,124 @@ def openi_search_repositories(query: str, limit: int = 20) -> str:
             if isinstance(r, dict)
         ]
         return dump({"ok": True, "count": len(slim), "repositories": slim})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_repo_tags(repo: str) -> str:
+    """列出代码仓的 tag 及每个 tag 指向的提交。
+
+    用来确认某个版本打没打过 tag、tag 落在哪个提交上。注意从 GitHub 同步过来的
+    mirror 仓，它的 ref 在平台侧是只读的：tag 删不掉、也推不动，返回里会正常列出。
+    """
+    try:
+        with _client() as client:
+            tags = client.repo_tags(repo)
+        return dump({"ok": True, "repo": repo, "count": len(tags), "tags": tags})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_repo_releases(repo: str) -> str:
+    """列出代码仓的 release（版本发布），含 tag、草稿/预发布标记与时间。"""
+    try:
+        with _client() as client:
+            releases = client.repo_releases(repo)
+        return dump({"ok": True, "repo": repo, "count": len(releases), "releases": releases})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_repo_labels(repo: str) -> str:
+    """列出代码仓的标签（issue 分类用），含颜色。"""
+    try:
+        with _client() as client:
+            labels = client.repo_labels(repo)
+        return dump({"ok": True, "repo": repo, "count": len(labels), "labels": labels})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_repo_collaborators(repo: str) -> str:
+    """列出代码仓的协作者与他们的权限。"""
+    try:
+        with _client() as client:
+            people = client.repo_collaborators(repo)
+        return dump({"ok": True, "repo": repo, "count": len(people), "collaborators": people})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_repo_stargazers(repo: str, limit: int = 50, page: int = 1) -> str:
+    """列出收藏（star）某个代码仓的账号。"""
+    try:
+        with _client() as client:
+            people = client.repo_stargazers(repo, limit=limit, page=page)
+        return dump({"ok": True, "repo": repo, "count": len(people), "stargazers": people})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_starred_repositories(limit: int = 50, page: int = 1) -> str:
+    """列出当前账号收藏（star）的代码仓。
+
+    和 openi_list_my_repositories 不同：那个只列自己 owner 的仓，这里列的是别人
+    的仓（含组织下的），是找参考实现和可复用代码的入口。
+    """
+    try:
+        with _client() as client:
+            repos = client.account_repos("starred", limit=limit, page=page)
+        return dump({"ok": True, "count": len(repos), "repositories": repos})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_subscribed_repositories(limit: int = 50, page: int = 1) -> str:
+    """列出当前账号关注（watch）的代码仓。"""
+    try:
+        with _client() as client:
+            repos = client.account_repos("subscriptions", limit=limit, page=page)
+        return dump({"ok": True, "count": len(repos), "repositories": repos})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_list_my_orgs() -> str:
+    """列出当前账号加入的组织 / 团队。"""
+    try:
+        with _client() as client:
+            orgs = client.my_orgs()
+        return dump({"ok": True, "count": len(orgs), "orgs": orgs})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_search_topics(query: str = "", limit: int = 20) -> str:
+    """按主题（topic）找仓，主题上带着仓数量。"""
+    try:
+        with _client() as client:
+            topics = client.search_topics(query, limit=limit)
+        return dump({"ok": True, "count": len(topics), "topics": topics})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_search_users(query: str, limit: int = 20) -> str:
+    """按关键字找账号（人和组织），拿 login 用于拼全名 owner/name。"""
+    try:
+        with _client() as client:
+            users = client.search_users(query, limit=limit)
+        return dump({"ok": True, "count": len(users), "users": users})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -1647,7 +1771,9 @@ def openi_task_outputs(task_id: str, parent_dir: str = "") -> str:
                 "parent_dir": parent_dir,
                 "ready": status == 0,
                 "status": status,
+                "is_task_terminal": out.get("is_task_terminal"),
                 "can_download": out.get("can_download"),
+                "can_reschedule": out.get("can_reschedule"),
                 "output_size_limit": out.get("output_size_limit"),
                 "files": _slim_output_files(out.get("file_list")),
             }
@@ -1704,6 +1830,28 @@ def openi_task_download_output(
                 task_id, file_name, parent_dir=parent_dir, save_to=save_to
             )
         return dump({"ok": True, "task_id": task_id, "file_name": file_name, **payload})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_download_output_archive(task_id: str, save_to: str, max_bytes: Optional[int] = None) -> str:
+    """把任务的整个输出目录打成一个 zip 下到本地（产物多时比逐个文件拉省事）。
+
+    task_id: 任务号。
+    save_to: 本地保存路径（给目录或以 / 结尾就按 task-<id>-output.zip 存）。
+      这条接口是流式落盘的，必须给落盘路径；文件很大时不会把内容读进内存。
+    max_bytes: 大小硬上限，超了立即中止并删掉半截包（默认不限）。
+
+    任务没有产物时平台会回一个空的 zip（约 22 字节），那是正常结果不是错误；
+    下载前后可以用 openi_task_output_files 核对清单。
+    """
+    try:
+        with _client() as client:
+            payload = client.task_output_download_all(
+                task_id, save_to=save_to, max_bytes=max_bytes
+            )
+        return dump({"ok": True, "task_id": task_id, **payload})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
