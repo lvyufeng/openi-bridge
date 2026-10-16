@@ -10,6 +10,11 @@ dependencies = [
   "websocket-client>=1.6.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
 [project.scripts]
 openi-bridge = "openi_bridge.server:main"
 openi-autopoint = "openi_bridge.autopoint:main"
@@ -22,4 +27,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/openi_bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 

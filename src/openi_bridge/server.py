@@ -78,7 +78,18 @@ def _client() -> OpenIClient:
 
 
 def _err(exc: Exception) -> str:
-    return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2)
+    """Render an exception as the tool's error envelope.
+
+    ``status_code`` is carried through on purpose: callers branch on 401/403
+    versus "no token" (see the 403 handling in the repo-file tools), and
+    without it the only way to tell them apart is string matching on the
+    message, which breaks the moment the wording changes.
+    """
+    payload: dict[str, Any] = {"ok": False, "error": str(exc)}
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        payload["status_code"] = status
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _ok(value: Any, **extra: Any) -> str:
@@ -87,6 +98,18 @@ def _ok(value: Any, **extra: Any) -> str:
         merged.update(extra)
         return dump(merged)
     return dump({"result": value, **extra})
+
+
+def _bounded_ok(report: Any) -> dict[str, Any]:
+    """去掉 report 自带的 ok，让调用方显式决定这个字段。
+
+    批量操作返回的 report 里可能也带一个 ok；用 ``{"ok": X, **report}`` 拼结果时
+    它会被 report 的值盖掉，于是判定结果和实际内容不一致。约定是：先摊开 report，
+    再显式写 ok。
+    """
+    if not isinstance(report, dict):
+        return {"report": report}
+    return {k: v for k, v in report.items() if k != "ok"}
 
 
 def _slim_output_files(files: Any) -> list[dict[str, Any]]:
@@ -1137,10 +1160,17 @@ def openi_create_model(
     name: 模型短名（URL 标识），规则同数据集。
     alias: 中文显示名，可留空。
     is_private: True 为私有模型，默认公开。
-    engine: 引擎代号，默认 0（不指定）。
+    engine: 引擎代号，默认 0（不指定）。平台没有公布取值表，所以这里只校验它是
+      个非负整数；传错值平台会拒绝建库，不会静默建出一个错引擎的库。
     label / license: 展示用标签与许可证，可留空。
     """
     try:
+        # name / alias 的规则与数据集一致，交给 client 校验；engine 平台没给取值表，
+        # 只拦住明显非法的值（负数、非整数），而不是编一套平台不认的枚举。
+        if isinstance(engine, bool) or not isinstance(engine, int):
+            return dump({"ok": False, "error": f"engine 必须是整数：{engine!r}"})
+        if engine < 0:
+            return dump({"ok": False, "error": f"engine 不能为负数：{engine}"})
         with _client() as client:
             result = client.create_model(
                 name=name,
@@ -1214,7 +1244,8 @@ def openi_upload_dataset_files(
         entries = expand_upload_paths(paths, remote_dir=remote_dir)
         with _client() as client:
             report = client.upload_files(dataset, "dataset", entries, dry_run=dry_run)
-        return dump({"ok": report.get("failed_count", 0) == 0, **report})
+        # ok 写在后面：**report 里也可能有 ok，让它盖掉判定结果就等于自欺。
+        return dump({**_bounded_ok(report), "ok": report.get("failed_count", 0) == 0})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -1240,7 +1271,7 @@ def openi_upload_model_files(
         entries = expand_upload_paths(paths, remote_dir=remote_dir)
         with _client() as client:
             report = client.upload_files(model, "model", entries, dry_run=dry_run)
-        return dump({"ok": report.get("failed_count", 0) == 0, **report})
+        return dump({**_bounded_ok(report), "ok": report.get("failed_count", 0) == 0})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -2291,31 +2322,47 @@ def openi_start_task_raw(repo: str, payload_json: str, dry_run: bool = False) ->
 
 
 @mcp.tool()
-def openi_stop_task(task_id: str) -> str:
-    """停止任务并释放算力（停止后立即停止计费）。"""
+def openi_stop_task(task_id: str, wait_seconds: float = 30.0) -> str:
+    """停止任务并释放算力（停止后停止计费），并回读确认状态真的变成了已停止。
+
+    平台的停止接口一受理就返回成功，任务本身还要走一段 STOPPING 才真正停。所以
+    这里会轮询到状态确实变化为止，再把观测到的状态报回来。
+    wait_seconds: 最长等多少秒确认状态（默认 30）。超时不会取消停止操作，只是还没
+    观察到结果，返回里 ok=false 并带上 status_at_timeout——如果那时仍是 RUNNING，
+    任务还在计费，需要过一会儿再用 openi_get_task 确认。
+    """
     try:
         with _client() as client:
-            return _ok(client.task_action("stop", task_id), ok=True)
+            return dump(client.task_action_verified("stop", task_id, wait_seconds=wait_seconds))
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
 
 @mcp.tool()
-def openi_restart_task(task_id: str) -> str:
-    """重启一个已停止的任务。"""
+def openi_restart_task(task_id: str, wait_seconds: float = 60.0) -> str:
+    """重启一个已停止的任务，并回读确认状态真的变了。
+
+    平台受理重启后任务会经过 QUEUED / PREPARING 再到 RUNNING，所以这里等到任务
+    离开"已停止"就算确认成功（不要求等到 RUNNING，那样排队久了会超时）。
+    wait_seconds: 最长等多少秒确认状态，超时只影响确认，不影响重启本身。
+    """
     try:
         with _client() as client:
-            return _ok(client.task_action("restart", task_id), ok=True)
+            return dump(client.task_action_verified("restart", task_id, wait_seconds=wait_seconds))
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
 
 @mcp.tool()
-def openi_delete_task(task_id: str) -> str:
-    """删除任务（不可恢复）。任务需先处于已停止状态。"""
+def openi_delete_task(task_id: str, wait_seconds: float = 30.0) -> str:
+    """删除任务（不可恢复），并回读确认任务确实消失了。
+
+    任务需先处于已停止状态，否则平台可能拒绝。删除之后查不到任务是正常结果，
+    这时 ok=true。wait_seconds 超时不会取消删除，只是没观察到结果。
+    """
     try:
         with _client() as client:
-            return _ok(client.task_action("del", task_id), ok=True)
+            return dump(client.task_action_verified("del", task_id, wait_seconds=wait_seconds))
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 

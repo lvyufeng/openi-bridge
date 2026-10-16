@@ -48,7 +48,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .client import COMPUTE_SOURCES as ALL_SOURCES
 from .client import DEFAULT_CLUSTER, OpenIClient, dump
@@ -80,6 +80,10 @@ DAILY_ACTION_TOOLS: Dict[str, str] = {
 
 # 计费窗口：不足 6 分钟不计费（官方文档 + 消耗流水双重验证）。
 FREE_WINDOW_SECONDS = 6 * 60
+
+# 在免费窗口里留出的安全余量：结算不是瞬时的，从发出停止请求到卡真正释放之间有
+# 延迟，留窄了就会跨进下一个 6 分钟计费单位。这个值只影响 keep_seconds 的上限。
+BILLING_MARGIN_SECONDS = 45.0
 
 # 自动化创建的任务统一用这个前缀命名，方便只回收自己留下的任务。
 TASK_NAME_PREFIX = "autopoint"
@@ -226,8 +230,18 @@ def _active_tasks(client: OpenIClient) -> List[Dict[str, Any]]:
     return out
 
 
-def _stop_and_delete(client: OpenIClient, task_id: Any) -> Dict[str, Any]:
-    """停止并删除一个任务，两步都尽力而为地报告结果。"""
+def _stop_and_delete(
+    client: OpenIClient, task_id: Any, timeout: float = 60.0
+) -> Dict[str, Any]:
+    """停止并删除一个任务，两步都尽力而为地报告结果。
+
+    "尽力而为" 只适用于报告，不适用于等待：任务在 RUNNING 状态下是被计费的，
+    所以这里必须确认它真的停了才收手。早期版本碰到一次 brief 查询异常就 break，
+    然后照样报 deleted=True，结果就是把一个还在跑的任务说成已清理干净。
+
+    因此这里改成：重试用指数退避、以 timeout 为硬期限，并且把"最后观察到什么
+    状态"一起报出来。deleted=None 表示请求发出去了但没能确认任务已经离开。
+    """
     report: Dict[str, Any] = {"task_id": task_id}
     try:
         client.task_action("stop", task_id)
@@ -235,14 +249,42 @@ def _stop_and_delete(client: OpenIClient, task_id: Any) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         report["stopped"] = False
         report["stop_error"] = str(exc)
-    for _ in range(6):
+
+    # 等到任务进入终态；单次查询失败只是没读到，不代表任务停了，所以继续退避重试。
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    status = ""
+    delay = 2.0
+    read_errors = 0
+    while True:
         try:
             brief = client.task_brief(task_id)
-        except Exception:  # noqa: BLE001
+            status = (brief.get("status") or "").upper() if isinstance(brief, dict) else ""
+        except Exception as exc:  # noqa: BLE001 - 读不到就退避重试，不当成已停
+            read_errors += 1
+            status = ""
+            report["last_read_error"] = str(exc)
+        if status in ENDED_STATUSES:
             break
-        if (brief.get("status") or "").upper() in ENDED_STATUSES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
-        time.sleep(3)
+        # 退避但不能睡过期限，否则会跳过最后一次查询、把"没确认"当成"没停"。
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 1.5, 10.0)
+
+    report["status_at_delete"] = status or None
+    report["status_confirmed_stopped"] = status in ENDED_STATUSES
+    if read_errors:
+        report["status_read_errors"] = read_errors
+    if not report["status_confirmed_stopped"] and report.get("stopped"):
+        # 停止请求被受理了，但没等到终态。仍然尝试删除：平台会拒绝删运行中的任务，
+        # 那样 deleted 为 False，调用方由此知道还得再收一次尾。
+        report["warning"] = (
+            f"停止请求已发出，但 {timeout:g}s 内没确认任务进入终态"
+            f"（最后观察到 {status or '未知'}）。若任务仍在 RUNNING 则仍在计费。"
+        )
+
+    report["del_attempted"] = True
     try:
         client.task_action("del", task_id)
         report["deleted"] = True
@@ -250,6 +292,17 @@ def _stop_and_delete(client: OpenIClient, task_id: Any) -> Dict[str, Any]:
         report["deleted"] = False
         report["delete_error"] = str(exc)
     return report
+
+
+def _cleanup_ok(report: Mapping[str, Any]) -> bool:
+    """清理是否真的把任务收干净了（供 ok 字段使用）。
+
+    只要任务可能还在运行就不能算成功——这正是这个模块存在的理由。
+    """
+    if report.get("deleted") is not True:
+        return False
+    # 删除成功即任务已不在，状态未确认也不影响结论；只有删除失败才需要状态佐证。
+    return True
 
 
 def reap_leftovers(client: OpenIClient) -> List[Dict[str, Any]]:
@@ -472,10 +525,25 @@ def claim_daily_points(
             time.sleep(3)
         report["reached_running"] = reached_running
         report["status_at_create"] = last_status
+        # 免费窗口从"任务真正 RUNNING"开始算，不是从建任务开始算：排队和
+        # PREPARING 都不计费，如果拿建任务的时刻当起点，队列一慢 remaining
+        # 就算成负数，keep_seconds 会被静默吞掉。
+        running_since = time.monotonic()
 
         if reached_running and keep_seconds > 0:
-            remaining = FREE_WINDOW_SECONDS - 45 - (time.monotonic() - started)
-            time.sleep(max(0.0, min(keep_seconds, remaining)))
+            remaining = FREE_WINDOW_SECONDS - BILLING_MARGIN_SECONDS - (
+                time.monotonic() - running_since
+            )
+            kept = max(0.0, min(float(keep_seconds), remaining))
+            report["keep_seconds_requested"] = float(keep_seconds)
+            report["keep_seconds_actual"] = round(kept, 1)
+            report["keep_truncated"] = kept < float(keep_seconds)
+            if report["keep_truncated"]:
+                report["keep_note"] = (
+                    f"免费窗口只剩约 {remaining:.0f}s，keep_seconds 被压到 {kept:.0f}s；"
+                    f"再久就会进入下一个 6 分钟计费单位。"
+                )
+            time.sleep(kept)
         outcome = _stop_and_delete(client, task_id)
         report["cleanup"] = outcome
         report["ran_seconds"] = round(time.monotonic() - started, 1)
@@ -495,7 +563,7 @@ def claim_daily_points(
 
     report["status_after"] = daily_status(client)
     report["changed"] = True
-    report["ok"] = bool(outcome.get("deleted"))
+    report["ok"] = _cleanup_ok(outcome)
     if not report["ok"]:
         report["action"] = "partial"
     elif not report.get("reached_running"):
@@ -503,7 +571,10 @@ def claim_daily_points(
     else:
         report["action"] = "claimed"
     if not report["ok"]:
-        report["reason"] = "任务没能完全清理，请检查 report.cleanup"
+        report["reason"] = (
+            "任务没能确认清理干净，请检查 report.cleanup"
+            "（deleted=False 说明删除被拒，任务可能还在运行并计费）"
+        )
     elif report["action"] == "timeout":
         report["reason"] = (
             f"任务在 {timeout:.0f} 秒内没进入 RUNNING（集群排队），已停止并删除；"

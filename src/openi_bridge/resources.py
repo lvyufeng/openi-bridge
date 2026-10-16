@@ -11,6 +11,8 @@ openi_list_creation_options; this file is only the coarse, offline catalog.
 
 from __future__ import annotations
 
+import re
+
 # 消耗积分 = 单价 * 卡时 * 节点数，每 6 分钟结算一次（不满 6 分钟不扣费）。
 CARDS: dict[str, dict[str, object]] = {
     "A100": {"vendor": "NVIDIA", "price": 9, "source": "GPU"},
@@ -76,35 +78,42 @@ IMAGE_NOTES: dict[str, str] = {
 # 每个 spec 实测能拉起来的镜像（image_id -> image_name）。创建任务不指定镜像时
 # client 会优先用这里的值，找不到再退回平台列出的第一个 image_id。GPU 用 image_url，
 # 不在这个表里。key 是 spec_id 的字符串形式。实测时间 2026-10。
+#
+# 只有 verified=True 的条目才允许覆盖平台默认镜像；未经核实的条目即使写在这里也
+# 只是线索，client 会跳过它们退回平台默认。这一层是刻意加的：这张表的价值全在
+# “实测过” 三个字上，一旦混入未经核实的值，它就变成了会覆盖正确默认值的风险源。
 VERIFIED_IMAGES: dict[str, dict[str, str]] = {
     "389": {  # NPU ASCEND-D910B
         "image_id": "8c8d460801974a98945d26d8a06cf2d2",
         "image_name": "swr.cn-east-3.myhuaweicloud.com-llama-torchfold",
-    },
-    "328": {  # NPU ASCEND910 (910A)
-        "image_id": "5b9d7a3c8e2f1d4e0a6b7c8d9e0f1a2b",
-        "image_name": "cann8_3_rc1_mindspore2_7",
+        "verified": "yes",
     },
     "229": {  # GCU ENFLAME-T20
         "image_id": "13646ee29cd19cb89bf6966f8e4ce004",
         "image_name": "enflame-t20",
+        "verified": "yes",
     },
     "184": {  # MLU MLU290
         "image_id": "13646ee29cd19cb89bf6966f8e4ce120",
         "image_name": "cambricon-pytorch",
+        "verified": "yes",
     },
     "342": {  # DCU K100_AI
         "image_id": "471f9d39e02e4e73ae4639b78d9e229f",
         "image_name": "jupyterlab-pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.11-devel",
+        "verified": "yes",
     },
     "388": {  # ILUVATAR-GPGPU MR-V100
         "image_id": "fc19818a89cf4f7ba9a220b1c9d158dc",
         "image_name": "vllm0.11.2-4.4.0-v9",
+        "verified": "yes",
     },
-    "347": {  # BIREN-GPU BIREN106M
-        "image_id": "bi646ee29cd19cb89bf6966f8e4ce3a8",
-        "image_name": "birensupa-pytorch-c2net:v1.0.0",
-    },
+    # 下面两条留作线索，暂不采信（见 test_resources.py 的说明）：
+    # - 328 (910A)：docs/verified-outputs 里的 910A 实测输出只记录了 npu-smi 回显，
+    #   没有记录 image_id，无法证明原来那个值真的能拉起来；它的形态也不像平台下发的
+    #   uuid。已从表中移除，需要时用平台默认镜像（_image_source=platform_default_image）。
+    # - 347 (BIREN106M)：image_id 带 "bi" 前缀，不是平台 image_id 的形态，疑似被
+    #   误填成了仓库/镜像地址。同样退回平台默认。
 }
 
 
@@ -215,6 +224,33 @@ POINT_NOTES: dict[str, str] = {
     "cheapest_card": "最便宜的算力是 1 分/卡时，所以“每日运行计算任务”的 10 分正好等于当天 10 卡时的用量。",
     "page": "余额与明细见 https://openi.pcl.ac.cn/reward/point 。",
 }
+
+
+# 平台的 image_id 是 32 位小写十六进制（无连字符的 uuid）。不合这个形态的值一律
+# 不采信：VERIFIED_IMAGES 里的值一旦被误填成镜像地址或手敲的占位符，它会被当作
+# “实测可信”去覆盖平台自己的可用默认镜像，任务随后以镜像拉取失败告终。
+IMAGE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def trusted_verified_image(spec_id: str) -> dict[str, str] | None:
+    """Return the verified image for spec_id, or None when it may not be trusted.
+
+    Two independent gates, both required before an entry is allowed to override
+    the platform's own default image:
+
+    1. it must carry ``verified: "yes"`` — an entry may be recorded here as a
+       lead without being cleared for use;
+    2. its ``image_id`` must look like a platform image id (32 hex digits).
+
+    Returning None simply means "fall back to the platform default", which is
+    always the safe answer: the platform listed that image itself.
+    """
+    row = VERIFIED_IMAGES.get(str(spec_id))
+    if not row or row.get("verified") != "yes":
+        return None
+    if not IMAGE_ID_RE.match(str(row.get("image_id") or "")):
+        return None
+    return row
 
 
 def describe_resources() -> str:

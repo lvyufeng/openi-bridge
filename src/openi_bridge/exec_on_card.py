@@ -53,6 +53,41 @@ EXEC_TASK_PREFIX = autopoint.EXEC_TASK_PREFIX
 READY_POLL_SECONDS = 8.0
 DEBUG_URL_POLL_SECONDS = 5.0
 
+# 平台 notebook 入口用的是它自己的证书链，Python 的默认信任库不一定认。默认仍然
+# 校验证书；确实握手失败时用 OPENI_TLS_INSECURE=1 显式放行，这样"不校验"是一个
+# 看得见的决定，而不是一个没人注意的默认值（token 和代码都要经过这条连接）。
+TLS_INSECURE_ENV = "OPENI_TLS_INSECURE"
+
+
+def _tls_insecure() -> bool:
+    return os.getenv(TLS_INSECURE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _sslopt(base: str) -> Optional[Dict[str, Any]]:
+    """wss 连接的 TLS 选项；ws:// 不需要。"""
+    if not base.startswith("wss://"):
+        return None
+    import ssl as _ssl
+
+    if _tls_insecure():
+        return {"cert_reqs": _ssl.CERT_NONE, "check_hostname": False}
+    return {"cert_reqs": _ssl.CERT_REQUIRED}
+
+
+def _redact(exc: BaseException, secret: str) -> BaseException:
+    """把异常文本里的 token 抹掉，保留异常类型。
+
+    websocket-client 的报错经常带完整 URL，而 URL 上有一次性 token；这些文本会
+    进 stdout / MCP transcript / 日志，所以必须在离开本模块之前处理掉。
+    """
+    if not secret:
+        return exc
+    text = str(exc).replace(secret, "<redacted>")
+    try:
+        return type(exc)(text)
+    except Exception:  # noqa: BLE001 - 构造不出来的异常类型就退回通用异常
+        return RuntimeError(text)
+
 
 def split_debug_url(url: str) -> Tuple[str, str]:
     """把 debug_url 拆成 (Jupyter 根地址, token)。
@@ -101,11 +136,14 @@ class JupyterConsole:
         base_url: str,
         token: str = "",
         timeout: float = 60.0,
-        verify: bool = False,
+        verify: Optional[bool] = None,
     ) -> None:
         self.base = base_url.rstrip("/")
         self.token = token
         params = {"token": token} if token else None
+        # 默认校验证书；只有显式设了 OPENI_TLS_INSECURE=1 才放行自签证书。
+        if verify is None:
+            verify = not _tls_insecure()
         self.client = httpx.Client(
             base_url=self.base,
             params=params,
@@ -211,15 +249,28 @@ class JupyterConsole:
         try:
             ws_base = self.base.replace("https://", "wss://").replace("http://", "ws://")
             ws_url = f"{ws_base}/api/kernels/{kernel_id}/channels"
+            headers: List[str] = []
             if self.token:
+                # token 走 header 而不是查询串：查询串会被 websocket-client 写进
+                # 异常文本，而那些文本会进入 result.stdout / report["error"]，
+                # 也就是 MCP transcript、终端回滚和 cron 日志。
+                headers = [f"Authorization: token {self.token}"]
+                # 有些 Jupyter 部署只认查询串，header 不作为通用替代，所以同时
+                # 保留查询串形式（平台实测接受 header，见 README 的验证记录）。
                 ws_url += f"?token={self.token}"
             ws = websocket.create_connection(
-                ws_url, timeout=timeout, sslopt={"cert_reqs": ssl.CERT_NONE}
+                ws_url,
+                timeout=timeout,
+                header=headers or None,
+                sslopt=_sslopt(self.base),
             )
             try:
                 return self._collect(ws, code, timeout)
             finally:
                 ws.close()
+        except Exception as exc:
+            # 兜底：任何异常文本里的 token 都抹掉再往外抛。
+            raise _redact(exc, self.token) from None
         finally:
             try:
                 self.request("DELETE", f"/api/kernels/{kernel_id}", timeout=30)
@@ -431,7 +482,17 @@ def run_on_card(
                     "用完记得停掉并删除，否则按分钟计费。"
                 )
         elif task_id:
-            report["cleanup"] = autopoint._stop_and_delete(client, task_id)
+            cleanup = autopoint._stop_and_delete(client, task_id)
+            report["cleanup"] = cleanup
+            # 清理失败必须反映到 ok 上。只放在 report["cleanup"] 里的话，任何
+            # 只检查 ok 的调用方都会把"留下一个正在计费的任务"当成一次成功。
+            if not autopoint._cleanup_ok(cleanup):
+                report["ok"] = False
+                report["action"] = "cleanup_failed"
+                report["error"] = (
+                    "代码已执行，但任务没能确认清理干净，可能仍在运行并计费："
+                    f"{cleanup.get('delete_error') or cleanup.get('warning') or cleanup}"
+                )
 
 
 def _read_code(args: argparse.Namespace) -> str:

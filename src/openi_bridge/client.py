@@ -106,7 +106,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import httpx
 
 from .auth import Credentials, resolve_credentials
-from .resources import VERIFIED_IMAGES
+from .resources import trusted_verified_image
 
 DEFAULT_USER_AGENT = "openi-bridge/0.1 (+mcp)"
 DEFAULT_CLUSTER = "C2Net"
@@ -119,6 +119,11 @@ DIRECT_UPLOAD_MAX = CHUNK_SIZE
 SUBJECT_TYPES = {"dataset": "1", "model": "2"}
 # 往代码仓提交单个文件的上限：contents API 用 base64 传，整个文件会进内存。
 MAX_REPO_FILE_BYTES = 50 * 1024 * 1024
+# 不落盘（返回文本/base64）时的默认读取上限。任务输出里可能是几十 GB 的 ckpt，
+# 没有上限的内存读取会把 MCP 进程直接撑爆；要完整内容就给 save_to 落盘。
+IN_MEMORY_DOWNLOAD_MAX_BYTES = int(
+    os.getenv("OPENI_IN_MEMORY_MAX_BYTES", str(8 * 1024 * 1024))
+)
 
 # 数据集 / 模型广场的列表范围（对应平台前端 getCardList 的 tab url）。
 SUBJECT_LIST_SCOPES = ("public", "owned", "collected", "collaborated")
@@ -141,6 +146,22 @@ TEMPLATE_LIST_SCOPES = ("public", "all", "created", "collected")
 TEMPLATE_LIST_ORDER = ("newest", "usecount", "collections")
 # 递归列目录时的文件数上限，避免误对超大主体做全量 crawl。
 WALK_FILE_LIMIT = int(os.getenv("OPENI_WALK_FILE_LIMIT", "20000"))
+
+# 任务状态的终态与非终态。计费只在任务处于非终态（还在排队/准备/跑）时发生，
+# 所以"任务是否还在烧积分"这个问题永远可以退回这一组取值来回答。
+_TASK_TERMINAL_STATUSES = frozenset(
+    {"STOPPED", "SUCCEEDED", "FAILED", "CREATED_FAILED", "DELETED", "KILLED"}
+)
+# stop / restart / del 各自"做完了"对应哪些状态。平台会先回一个过渡态
+# （STOPPING / DELETING / QUEUED），只有走到这里列出的状态才算真的生效。
+_TASK_ACTION_EXPECTED = {
+    "stop": frozenset({"STOPPED", "CREATED_FAILED", "FAILED"}),
+    "restart": frozenset(
+        {"WAITING", "QUEUED", "PENDING", "PREPARING", "CREATING",
+         "RUNNING", "STARTING", "STOPPED"}
+    ),
+    "del": frozenset({"DELETED"}),
+}
 
 # 平台前端对数据集 name / alias 的校验（services/... 与 create 页面一致）。
 SUBJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-_.]{0,98}[a-zA-Z0-9]$")
@@ -336,6 +357,46 @@ def _total_chunks(size: int, chunk_size: int = CHUNK_SIZE) -> int:
     if size <= 0:
         return 1
     return math.ceil(size / chunk_size)
+
+
+def _uploaded_chunk_numbers(
+    chunks_info: Mapping[str, Any], total: int, name: str
+) -> List[int]:
+    """取出续传接口报告的"已经传完的分片号"，并校验它是一个连续前缀。
+
+    /upload/get_chunks 回的 ``chunks`` 有两种可能：已经传完的分片编号列表，或者
+    只是一个数量。这个区别至关重要——调用方用它决定续传从第几片开始。按"长度"
+    推导分片号只在编号恰好是 1..N 连续前缀时才成立；如果平台回的是稀疏编号
+    （例如 [1, 3]），按长度会从第 3 片接着传、第 2 片永远缺失，而 complete 仍然
+    成功，结果是一个内容损坏却报成功的对象。
+
+    这里宁可报错也不猜：稀疏或越界的编号一律拒绝，让调用方重传整个文件。
+    """
+    raw = chunks_info.get("chunks")
+    if not raw:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        # 只回了数量（int）时无法判断编号分布，当作"没有可信的续传信息"处理。
+        # 这是安全的方向：重传已传过的分片只是浪费流量，漏传分片是数据损坏。
+        return []
+    try:
+        numbers = sorted({int(n) for n in raw})
+    except (TypeError, ValueError):
+        raise OpenIError(f"{name} 的续传分片信息无法解析：{raw!r}") from None
+    if not numbers:
+        return []
+    expected = list(range(1, len(numbers) + 1))
+    if numbers != expected:
+        raise OpenIError(
+            f"{name} 的续传分片编号不是连续的 1..{len(numbers)}（平台返回 {numbers[:20]}）。"
+            "无法安全地从中间续传，请重传该文件（或换一个 uuid 重新开始分片上传）。"
+        )
+    if total and numbers[-1] > total:
+        raise OpenIError(
+            f"{name} 的续传分片编号 {numbers[-1]} 超出该文件的总分片数 {total}，"
+            "续传信息与本地文件不一致，请重传。"
+        )
+    return numbers
 
 
 def _iter_chunks(path: str, chunk_size: int = CHUNK_SIZE, start_from: int = 1):
@@ -971,6 +1032,7 @@ class OpenIClient:
         succeeded = [r for r in results if r.get("ok")]
         return {
             "repo": subject_name,
+            "ok": len(succeeded) == len(results),
             "committed_count": len(succeeded),
             "failed_count": len(results) - len(succeeded),
             "committed_bytes": sum(r["size"] for r in succeeded),
@@ -1504,8 +1566,11 @@ class OpenIClient:
                 raise OpenIError(f"创建分片上传失败：{name}")
             uploaded_chunks: List[int] = []
         else:
-            uploaded_chunks = list(chunks_info.get("chunks") or [])
-        start_from = len(uploaded_chunks) or 1
+            uploaded_chunks = _uploaded_chunk_numbers(chunks_info, _total_chunks(size), name)
+        # 只有"已经传完 1..N 连续一片前缀"才能用长度推下一个分片号。平台如果回的是
+        # 稀疏编号，按长度推导会跳过分片却照常 complete，得到一个内容损坏但报成功的
+        # 对象——所以上面先校验，这里只做单纯的续传续点。
+        start_from = (len(uploaded_chunks) + 1) if uploaded_chunks else 1
         for number, chunk in _iter_chunks(path, start_from=start_from):
             url_data = self.get_json(
                 "/upload/get_multipart_url",
@@ -1595,12 +1660,16 @@ class OpenIClient:
         self._complete_direct(subject_id, subject_type, direct_names)
 
         succeeded = [r for r in results if r.get("ok")]
+        failed = [r for r in results if not r.get("ok")]
         return {
             "subject": subject_name,
             "subject_type": subject_type,
             "subject_id": subject_id,
+            # 顶层 ok：全部文件都成功才算成功。只有 failed_count 的话，调用方
+            # result["ok"] 会 KeyError，或者把 {failed_count: N} 当成没问题。
+            "ok": not failed,
             "uploaded_count": len(succeeded),
-            "failed_count": len(results) - len(succeeded),
+            "failed_count": len(failed),
             "uploaded_bytes": sum(r["size"] for r in succeeded),
             "storage_warning": storage_warning,
             "files": results,
@@ -1827,6 +1896,7 @@ class OpenIClient:
                 failed.append({"file": rel, "error": str(exc)})
         return {
             **plan,
+            "ok": not failed,
             "downloaded_count": len(downloaded),
             "skipped_count": len(skipped),
             "failed_count": len(failed),
@@ -2299,18 +2369,31 @@ class OpenIClient:
                 "mb": round(size / 1024 / 1024, 3),
                 "md5": digest.hexdigest(),
             }
-        response = self._http.get(path, params=params, headers=headers, timeout=timeout)
-        if response.status_code >= 400:
-            raise OpenIError(
-                f"下载失败 HTTP {response.status_code}：{path}",
-                status_code=response.status_code,
-                payload=response.text[:200],
-            )
-        blob = response.content
+        # 内存模式也必须边读边停：任务输出里的 ckpt 能有几十 GB，先 response.content
+        # 再截断等于限制还没生效就先把进程撑爆了。所以这里流式读取，够了就断开。
+        chunks: List[bytes] = []
+        total = 0
         truncated = False
-        if max_bytes is not None and len(blob) > max_bytes:
-            blob = blob[:max_bytes]
-            truncated = True
+        with self._http.stream(
+            "GET", path, params=params, headers=headers, timeout=timeout
+        ) as response:
+            if response.status_code >= 400:
+                raise OpenIError(
+                    f"下载失败 HTTP {response.status_code}：{path}",
+                    status_code=response.status_code,
+                    payload=response.read().decode("utf-8", "replace")[:200],
+                )
+            # 没给 max_bytes 时也要有个上限，避免一次调用把整个大文件读进内存。
+            budget = max_bytes if max_bytes is not None else IN_MEMORY_DOWNLOAD_MAX_BYTES
+            for chunk in response.iter_bytes(1024 * 1024):
+                if total + len(chunk) > budget:
+                    chunks.append(chunk[: budget - total])
+                    total = budget
+                    truncated = True
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        blob = b"".join(chunks)
         result: Dict[str, Any] = {"bytes": len(blob)}
         try:
             result["text"] = blob.decode("utf-8")
@@ -2318,6 +2401,11 @@ class OpenIClient:
             result["base64"] = base64.b64encode(blob).decode("ascii")
         if truncated:
             result["truncated"] = True
+            result["truncated_at_bytes"] = total
+            result["hint"] = (
+                "内容超过上限已被截断；要完整拿到请给 save_to 落盘"
+                "（落盘模式没有这个限制，且不会把内容读进内存）。"
+            )
         return result
 
     def list_tasks(self, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
@@ -2408,10 +2496,97 @@ class OpenIClient:
 
         All three accept id only; the repo scoped variants only exist for a
         subset and are not required.
+
+        This only reports that the request was accepted. Use
+        :meth:`task_action_verified` when the caller must know whether the task
+        actually reached the new state — these calls are billed while a task is
+        still RUNNING, so a silent no-op here means paying for nothing.
         """
         if action not in ("stop", "restart", "del"):
             raise ValueError(f"unsupported action: {action}")
         return self.post_json(f"/ai_task/{action}", params={"id": task_id}, json_body={})
+
+    def task_action_verified(
+        self,
+        action: str,
+        task_id: Any,
+        wait_seconds: float = 30.0,
+        interval: float = 2.0,
+    ) -> Dict[str, Any]:
+        """Run stop/restart/del and confirm the task actually changed state.
+
+        The platform's POST returns success as soon as the request is accepted;
+        the task then walks through transitional states (STOPPING, DELETING,
+        QUEUED...). Stamping ``ok: true`` on that response tells the caller
+        nothing about whether the card was actually released.
+
+        So after the mutation this polls ``/ai_task/brief`` until the status
+        reaches a state consistent with the action, and reports what it saw.
+        ``ok`` is true only when the transition was observed before the deadline;
+        on timeout it is false and ``status_at_timeout`` says where the task is,
+        because a task left in RUNNING is still burning points.
+        """
+        if action not in ("stop", "restart", "del"):
+            raise ValueError(f"unsupported action: {action}")
+        before = self._safe_task_status(task_id)
+        payload = self.task_action(action, task_id)
+        expected = _TASK_ACTION_EXPECTED.get(action, set())
+
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        status = before
+        polls = 0
+        while True:
+            status = self._safe_task_status(task_id)
+            polls += 1
+            if not status:
+                # del removes the task entirely: "gone" is the success signal.
+                if action == "del":
+                    return {
+                        "ok": True, "action": action, "task_id": task_id,
+                        "status_before": before, "status": None, "polls": polls,
+                        "note": "任务已不存在，删除完成。",
+                    }
+                break
+            if status.upper() in expected:
+                return {
+                    "ok": True, "action": action, "task_id": task_id,
+                    "status_before": before, "status": status, "polls": polls,
+                    "payload": payload,
+                }
+            if action == "del" and status.upper() in _TASK_TERMINAL_STATUSES:
+                # The listing no longer serves the row but it is not an error.
+                return {
+                    "ok": True, "action": action, "task_id": task_id,
+                    "status_before": before, "status": status, "polls": polls,
+                    "note": "任务已离开列表，删除完成。",
+                }
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(max(0.1, float(interval)))
+
+        return {
+            "ok": False, "action": action, "task_id": task_id,
+            "status_before": before, "status_at_timeout": status, "polls": polls,
+            "payload": payload,
+            "error": (
+                f"{wait_seconds:g}s 内任务状态没有变为 {'/'.join(sorted(expected)) or '终态'}"
+                f"（现在仍是 {status!r}）。若为 stop 且状态仍为 RUNNING，任务仍在计费，"
+                f"请稍后再查 openi_get_task。"
+            ),
+        }
+
+    def _safe_task_status(self, task_id: Any) -> str:
+        """Read a task's status, tolerating the shapes the brief endpoint uses."""
+        try:
+            brief = self.task_brief(task_id)
+        except Exception:  # noqa: BLE001 - a transient read must not mask the action
+            return ""
+        if isinstance(brief, Mapping):
+            for key in ("status", "Status", "task_status", "TaskStatus"):
+                value = brief.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return ""
 
     def batch_delete(self, task_ids: List[Any]) -> Any:
         return self.post_json("/ai_task/batch_del", json_body={"id": list(task_ids)})
@@ -2604,7 +2779,7 @@ class OpenIClient:
                 image_url = DEFAULT_IMAGE_URL
                 image_source = "fallback_image_url"
             else:
-                verified = VERIFIED_IMAGES.get(str(spec_id))
+                verified = trusted_verified_image(str(spec_id))
                 if verified:
                     image_id = verified["image_id"]
                     image_name = image_name or verified.get("image_name")

@@ -22,6 +22,7 @@
 - [积分](#积分)：领取规则与每日自动领分
 - [在卡上跑代码](#在卡上跑代码)
 - [工具全表](#工具全表)
+- [测试](#测试)
 - [实现说明与已知限制](#实现说明与已知限制)
 
 ## 快速开始
@@ -219,6 +220,12 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 `image_id`，没命中再退回平台列出的第一个。返回里的 `_image_source` 会说明走了哪条路径
 （`fallback_image_url` / `verified_image` / `platform_default_image` / `explicit`）。
 
+`VERIFIED_IMAGES` 里的条目要**同时**满足两个条件才会被采用：带 `verified: "yes"` 标记，
+且 `image_id` 是 32 位十六进制（平台 image_id 的形态）。只写进表里、但没核实过的值不会
+覆盖平台默认镜像——这张表一旦混入错误的值，代价是任务起不来还照常扣积分，所以宁可退回
+平台自己列的镜像。910A（spec 328）与 BIREN106M（spec 347）先前记的两个值没有可追溯的
+实测证据，已按此规则停用。
+
 除 NVIDIA GPU 外，创建任务**必须带 `branch_name`**（代码分支），否则集群会以
 `Fail to load code` 失败（`CREATED_FAILED`）。工具在你不传时默认用代码仓的默认分支，
 `_branch_source` 会说明来源。
@@ -346,6 +353,11 @@ crontab -e
 建内核，再连它的内核 WebSocket 发 `execute_request`，把 stdout、返回值、异常收回来，
 最后无论成功失败都在 `finally` 里停掉并删除任务。
 
+清理是否成功会反映到返回的 `ok` 上：如果任务没能确认停掉（比如删除被平台拒绝），
+`ok=false`、`action=cleanup_failed`，并带上 `cleanup` 明细——留一个还在跑的任务等于
+持续扣积分，这不能算一次成功的调用。连接 notebook 的 TLS 默认校验证书；
+平台证书链握手失败时再用 `OPENI_TLS_INSECURE=1` 显式放行。
+
 ~~~bash
 python -m openi_bridge.exec_on_card --code "print(1+1)"
 python -m openi_bridge.exec_on_card --source GCU --code "!efsmi"
@@ -436,9 +448,9 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_start_task_from_template | 照着模板开任务：仓/分支/启动文件/挂载自动带上，spec 由卡型+卡数实时配对 |
 | openi_start_task | 新建并启动计算任务（调试/训练/推理） |
 | openi_start_task_raw | 用自定义 JSON 请求体创建任务（兜底/调试用） |
-| openi_stop_task | 停止任务、释放算力、停止计费 |
-| openi_restart_task | 重启已停止的任务 |
-| openi_delete_task | 删除任务（需先停止） |
+| openi_stop_task | 停止任务、释放算力、停止计费（会回读确认状态真的变成已停止） |
+| openi_restart_task | 重启已停止的任务（会回读确认任务确实离开了已停止状态） |
+| openi_delete_task | 删除任务（需先停止；会回读确认任务确实消失了） |
 | openi_sdk_code | 生成容器内访问数据集/模型的示例代码 |
 | openi_create_dataset | 新建空数据集（返回 UUID，可作 dataset_uuid_str） |
 | openi_create_model | 新建空模型库（返回模型 ID，可作 pretrain_model_id_str） |
@@ -454,6 +466,25 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_delete_subject_file | 删除数据集/模型库里的一个文件或整个子目录（删完重新列清单核对，本来没有则报 existed=false） |
 | openi_pull_dataset | 从 OpenI 拉取数据集文件到本地（单文件或整库，支持 dry_run 与 max_bytes） |
 | openi_pull_model | 从 OpenI 拉取模型/ckpt 文件到本地（单文件或整库，支持断点跳过） |
+
+## 测试
+
+有一份不依赖网络与令牌的测试，跑的是"错了会悄悄报成功"的那几处逻辑：
+
+~~~bash
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest
+~~~
+
+覆盖的内容：
+
+- `tests/test_resources.py`：`VERIFIED_IMAGES` 的信任闸门（未核实/形态不对的 image_id
+  不得覆盖平台默认镜像），以及离线算力目录与实测清单的一致性。
+- `tests/test_safety_rails.py`：分片续传的编号校验（稀疏编号必须报错而不是跳片）、
+  停止/删除任务的回读确认、autopoint 清理不能把"还在跑的任务"报成已清理干净。
+
+这些测试的价值在于它们是**回归**测试：每一条都对应一个真实发生过的静默失败，
+把修复回退掉就会红。
 
 ## 实现说明与已知限制
 
