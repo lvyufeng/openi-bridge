@@ -100,6 +100,7 @@ import json
 import math
 import os
 import re
+import time
 from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
@@ -261,6 +262,13 @@ def _wrap(data: Any) -> Any:
         if code not in (0, "0", None):
             raise OpenIError(f"platform error {code}: {data.get('msg')}", payload=data)
         return data["data"]
+    # 少数接口（例如 /ai_task/export2aimodel 的权限层）回的是大写信封
+    # {Code, Msg, Data}，同一个平台上两种拼法并存，这里一并拆掉。
+    if isinstance(data, Mapping) and "Code" in data and "Data" in data:
+        code = data.get("Code")
+        if code not in (0, "0", None):
+            raise OpenIError(f"platform error {code}: {data.get('Msg')}", payload=data)
+        return data["Data"]
     return data
 
 
@@ -513,6 +521,23 @@ class OpenIClient:
             )
         )
 
+    def post_form(
+        self,
+        path: str,
+        params: Optional[Mapping[str, Any]] = None,
+        data: Optional[Mapping[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """POST 一个 application/x-www-form-urlencoded 请求。
+
+        导出类接口（/ai_task/export2dataset、/ai_task/export2aimodel）只认表单体，
+        传 JSON 体会被平台前置的反向代理直接 403。参数名按平台 Go 侧的字段名转
+        蛇形：TaskId 写 task_id、FileListStr 写 file_list_str。
+        """
+        return _wrap(
+            _unwrap_text(self.request("POST", path, params=params, data=data, timeout=timeout))
+        )
+
     # ------------------------------------------------------------------- users
 
     def current_user(self) -> Dict[str, Any]:
@@ -532,6 +557,66 @@ class OpenIClient:
     def unread_notification_count(self) -> Any:
         """GET /notifications/new - 未读通知数量。"""
         return self.get_json("/notifications/new")
+
+    def notification_thread(self, thread_id: Any) -> Dict[str, Any]:
+        """GET /notifications/threads/{id} - 单条通知的完整内容。
+
+        列表接口（notifications）只给标题和链接，正文、最新一条评论、订阅状态都
+        在这里。线程 id 就是列表里每项的 id。
+        """
+        row = self.get_json(f"/notifications/threads/{thread_id}") or {}
+        subject = row.get("subject") if isinstance(row.get("subject"), Mapping) else {}
+        repository = row.get("repository") if isinstance(row.get("repository"), Mapping) else {}
+        return {
+            "id": row.get("id"),
+            "unread": row.get("unread"),
+            "pinned": row.get("pinned"),
+            "updated_at": row.get("updated_at"),
+            "subject_type": subject.get("type"),
+            "title": subject.get("title"),
+            "url": (subject.get("url") or "").replace("/api/v1/repos/", "/"),
+            "latest_comment_url": (subject.get("latest_comment_url") or "").replace(
+                "/api/v1/repos/", "/"
+            ),
+            "repo": repository.get("full_name"),
+        }
+
+    def notification_thread_comments(self, thread_id: Any) -> List[Dict[str, Any]]:
+        """GET /notifications/threads/{id}/comments - 通知线程里的评论正文。"""
+        rows = self.get_json(f"/notifications/threads/{thread_id}/comments") or []
+        if isinstance(rows, Mapping):
+            rows = rows.get("comments") or []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            out.append(
+                {
+                    "id": row.get("id"),
+                    "body": row.get("body"),
+                    "author": (row.get("user") or {}).get("login")
+                    if isinstance(row.get("user"), Mapping)
+                    else None,
+                    "created_at": row.get("created_at"),
+                }
+            )
+        return out
+
+    def mark_notifications_read(self, thread_id: Optional[Any] = None) -> Any:
+        """把未读通知一次全部标为已读（PUT /notifications?all=true）。
+
+        平台只开放了“全部已读”这一条接口：Gitea 那套单条标记走的
+        PATCH /notifications/threads/{id} 被前置反向代理挡掉，同名的 PUT /
+        POST(带 _method=PATCH) 都没有注册（404）。前端标单条是走带 _csrf
+        cookie 的网页表单，令牌方式用不了，所以这里只做全清。
+        传 thread_id 只是想标单条时，直接抛错说明限制，不静默失败。
+        """
+        if thread_id is not None:
+            raise OpenIError(
+                "平台不提供“标记单条通知已读”的接口（PATCH 被反向代理拦截、"
+                "PUT/POST 路由未注册），只能用 openi_mark_notifications_read() 全部标已读。"
+            )
+        return self.put_json("/notifications", params={"all": "true"})
 
     # -------------------------------------------------------------------- repos
 
@@ -905,6 +990,34 @@ class OpenIClient:
             "body": data.get("body"),
             "created_at": data.get("created_at"),
         }
+
+    def update_repo_issue(
+        self,
+        subject_name: str,
+        index: Any,
+        state: Optional[str] = None,
+        title: Optional[str] = None,
+        body: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """改一个已有 issue（POST /repos/{name}/issues/{index}）。
+
+        state 取 open / closed，用来关闭或重开；title / body 改标题与正文。
+        平台前置的反向代理把 PATCH 一律挡掉（回空 400），编辑走的是同一个 issue
+        路径上的 POST + JSON 体。三个字段至少要给一个，空改动会被平台拒绝。
+        """
+        payload: Dict[str, Any] = {}
+        if state is not None:
+            if state not in ("open", "closed"):
+                raise OpenIError(f"state 只能是 open 或 closed：{state!r}")
+            payload["state"] = state
+        if title is not None:
+            payload["title"] = title
+        if body is not None:
+            payload["body"] = body
+        if not payload:
+            raise OpenIError("至少要给 state / title / body 里的一个，平台不接受空改动。")
+        data = self.post_json(f"/repos/{subject_name}/issues/{index}", json_body=payload)
+        return _slim_issue(data or {})
 
     # ----------------------------------------------------------- data subjects
 
@@ -1816,6 +1929,134 @@ class OpenIClient:
         返回 [{epoch, loss}, ...]；任务没上报 loss 时是空列表。
         """
         return self.get_json("/ai_task/loss", params={"id": task_id})
+
+    # --------------------------------------------------------------- task output
+
+    def export_task_to_dataset(
+        self, task_id: Any, dataset_id: str, file_list: Any
+    ) -> Dict[str, Any]:
+        """把任务输出文件搬到已有的数据集里（POST /ai_task/export2dataset）。
+
+        这是任务产物落库的通道：训练跑完的输出（ckpt、metrics、生成语料）本来只
+        存在于该任务的输出目录里，跟着任务走；导出之后就是数据集里的普通文件，
+        可以挂到别的任务上、被别人拉取，也不受任务清理影响。
+
+        参数不是常规 JSON：查询串收 dataset_id 与 id，表单体收 task_id 与
+        file_list_str（平台 Go 字段名 FileListStr 的蛇形写法）。JSON 体会被平台
+        前置的反向代理直接 403，所以这里固定走 post_form。
+
+        file_list 是相对输出根的路径，用逗号分隔，即 task_output_all() 里每项的
+        FileName；子目录要连同父目录一起写（"ckpt/model.bin"）。导出是异步的，
+        返回的是进度 id，用 export_progress("dataset", id) 查进度。
+        """
+        files = _csv(file_list)
+        if not files:
+            raise OpenIError("file_list 不能为空，先看 openi_task_output_files 拿到路径。")
+        data = self.post_form(
+            "/ai_task/export2dataset",
+            params={"dataset_id": dataset_id, "id": task_id},
+            data={"task_id": task_id, "file_list_str": files},
+        )
+        return {
+            "subject_type": "dataset",
+            "subject_id": dataset_id,
+            "task_id": task_id,
+            "file_list": files,
+            "process_id": (data or {}).get("id") if isinstance(data, Mapping) else data,
+        }
+
+    def export_task_to_model(
+        self,
+        task_id: Any,
+        name: str,
+        file_list: Any,
+        alias: Optional[str] = None,
+        license: str = "",
+        label: str = "",
+        engine: int = 0,
+        is_private: bool = False,
+        owner_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """把任务输出文件建成一个新模型库（POST /ai_task/export2aimodel）。
+
+        和导出到数据集不同，这个接口不是“放进已有的库”，而是就地新建一个模型，
+        所以 name 必须是当前账号下还不存在的英文名。查询串收 id，表单体收
+        name / alias / owner_id / aimodel_type / is_private / engine / label /
+        license / task_id / file_list_str（默认字段 file_list 会被平台无视，
+        报 "file list is empty"）。
+
+        返回的 process_id 用 export_progress("model", id) 查进度。
+        """
+        validate_subject_name(name)
+        validate_subject_alias(alias or "")
+        files = _csv(file_list)
+        if not files:
+            raise OpenIError("file_list 不能为空，先看 openi_task_output_files 拿到路径。")
+        if owner_id is None:
+            owner_id = int(self.current_user().get("id"))
+        data = self.post_form(
+            "/ai_task/export2aimodel",
+            params={"id": task_id},
+            data={
+                "name": name,
+                "alias": alias or name,
+                "owner_id": int(owner_id),
+                "aimodel_type": 0,
+                "is_private": "true" if is_private else "false",
+                "engine": int(engine),
+                "label": label or "",
+                "license": license or "",
+                "task_id": task_id,
+                "file_list_str": files,
+            },
+        )
+        data = data if isinstance(data, Mapping) else {}
+        return {
+            "subject_type": "model",
+            "subject_id": data.get("id") or name,
+            "name": data.get("name") or name,
+            "task_id": task_id,
+            "file_list": files,
+            "process_id": data.get("process_id"),
+        }
+
+    def export_progress(self, subject_type: str, process_id: str) -> Dict[str, Any]:
+        """查一次导出进度（GET /{dataset|aimodel}/get_export_process?id=）。
+
+        返回 {file: 百分比}：100 表示该文件导出完成，-1 / -2 / -3 是失败
+        （源文件读不到、目标已存在同名文件、超出存储限额），0 是刚开始。
+        """
+        if subject_type == "dataset":
+            path = "/dataset/get_export_process"
+        elif subject_type == "model":
+            path = "/aimodel/get_export_process"
+        else:
+            raise OpenIError(f"subject_type 只能是 dataset 或 model：{subject_type!r}")
+        raw = self.get_json(path, params={"id": process_id}) or {}
+        if not isinstance(raw, Mapping):
+            return {"files": {}, "finished": False, "raw": raw}
+        files = {k: v for k, v in raw.items() if k != "##type##"}
+        done = [k for k, v in files.items() if v == 100]
+        failed = [k for k, v in files.items() if v in (-1, -2, -3)]
+        return {
+            "files": files,
+            "finished": bool(files) and len(done) + len(failed) == len(files),
+            "succeeded": done,
+            "failed": failed,
+        }
+
+    def wait_export(
+        self, subject_type: str, process_id: str, wait_seconds: int = 60, interval: float = 3.0
+    ) -> Dict[str, Any]:
+        """轮询导出进度直到全部结束或等满 wait_seconds，返回最后一次进度。"""
+        deadline = time.monotonic() + max(0, int(wait_seconds))
+        progress = self.export_progress(subject_type, process_id)
+        while not progress["finished"] and time.monotonic() < deadline:
+            time.sleep(interval)
+            progress = self.export_progress(subject_type, process_id)
+        progress["process_id"] = process_id
+        progress["subject_type"] = subject_type
+        return progress
 
     def _download(
         self,

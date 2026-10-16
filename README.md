@@ -164,7 +164,7 @@ python -m openi_bridge.autopoint --status
 python -m openi_bridge.install_mcp --apply
 ~~~
 
-完整的 67 个工具见下面的[工具全表](#工具全表)。从零创建任务的顺序是固定的：`openi_whoami`
+完整的 73 个工具见下面的[工具全表](#工具全表)。从零创建任务的顺序是固定的：`openi_whoami`
 → `openi_list_creation_options` → 选代码仓和分支 → `openi_start_task` →
 `openi_get_task` / `openi_task_debug_url` → 用完 `openi_stop_task`，必要时
 `openi_delete_task`。想省掉“自己找仓、自己配 spec、自己挂数据集”这几步，就先用
@@ -366,7 +366,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 
 ## 工具全表
 
-共 67 个工具，都是 `openi_` 前缀。
+共 73 个工具，都是 `openi_` 前缀。
 
 | 工具 | 作用 |
 | --- | --- |
@@ -374,6 +374,8 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_list_resources | 列出集群、卡型、积分单价与计费规则（离线目录） |
 | openi_list_compute_resources | 查平台实时在线的算力中心（城市）与卡型（含离线目录没有的 CPU/5090/A800 等） |
 | openi_notifications | 查看账号通知（评论、@、issue），可只看未读并带未读总数 |
+| openi_notification_detail | 看单条通知的完整内容（标题、仓库、最新评论链接）与评论正文（列表接口只给标题与链接） |
+| openi_mark_all_notifications_read | 把所有未读通知一次标为已读（平台只提供“全部已读”，单条标记无可用接口） |
 | openi_list_creation_options | 列出当前账号实时可开的规格（含 spec_id）与镜像、余额 |
 | openi_estimate_runtime | 按当前积分余额估算每个规格还能开多少机时（小时/天，已按 6 分钟向下取整） |
 | openi_points | 查看积分余额、单日获取上限与平台公布的完整获取规则 |
@@ -398,6 +400,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_create_repo_issue | 在代码仓里开 issue，返回 issue 号 |
 | openi_list_repo_issues | 列出代码仓的 issue（open / closed / all） |
 | openi_comment_repo_issue | 在指定 issue 下发表评论 |
+| openi_update_repo_issue | 关闭 / 重开 issue，或改标题与正文（走 issue 路径上的 POST，平台的 PATCH 被反代拦截） |
 | openi_get_task | 按任务 ID 查询详情与状态 |
 | openi_list_tasks | 列出当前账号的全部任务（跨所有代码仓） |
 | openi_list_repo_tasks | 列出某个代码仓下的所有任务 |
@@ -413,6 +416,9 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_task_download_output | 下载任务输出的某个文件（流式落盘，或直接读进返回） |
 | openi_task_download_log | 下载任务的完整日志（整段纯文本，非分页；读进返回时默认截到 256KB） |
 | openi_task_loss | 读取训练任务的 loss 曲线（epoch / loss 序列） |
+| openi_task_export_to_dataset | 把任务输出文件搬进已有数据集：产物从“跟着任务走”变成数据集里的普通文件，可挂别的任务或被拉取 |
+| openi_task_export_to_model | 把任务输出文件建成一个新模型库（就地新建，英文名全平台唯一），适合放 ckpt |
+| openi_task_export_progress | 查上面两条导出的进度（{文件: 百分比}，可原地轮询等待） |
 | openi_list_task_templates | 浏览任务模板广场：别人配好的一键开任务模板（含代码仓、分支、启动文件、卡型卡数、镜像、数据集/模型挂载） |
 | openi_get_task_template | 按模板 ID 查一个模板的完整配置 |
 | openi_collect_task_template | 收藏 / 取消收藏任务模板 |
@@ -479,6 +485,18 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   相对路径都能命中）。
 - 任务变更：`POST /{owner}/{repo}/ai_task/create`、`/ai_task/stop`、`/ai_task/restart`、
   `/ai_task/del`、`/ai_task/batch_del`。
+- 任务产物落库：`POST /ai_task/export2dataset`（查询串收 `dataset_id` 与 `id`，表单体收
+  `task_id` 与 `file_list_str`）与 `POST /ai_task/export2aimodel`（查询串收 `id`，表单体
+  收 `name` / `alias` / `owner_id` / `aimodel_type` / `is_private` / `engine` / `label` /
+  `license` / `task_id` / `file_list_str`）。两条都只认
+  `application/x-www-form-urlencoded`，JSON 体会被反向代理直接 403；字段名按平台 Go 侧
+  转蛇形，清单字段少了 `_str`（写成 `file_list`）平台会回 "file list is empty"。导出是
+  异步的，进度查 `GET /dataset/get_export_process?id=` 与 `GET /aimodel/get_export_process?id=`。
+- 代码仓 issue 编辑：`POST /repos/{owner}/{repo}/issues/{n}` 带 JSON 体（`state` / `title` /
+  `body`）可改，返回 201 与更新后的 issue；Gitea 原生的 `PATCH` 被前置反向代理挡成空 400，
+  `PUT` 与带 `_method=PATCH` 的 POST 都没注册（404），所以工具走的是这条 POST。
+- 通知：`GET /notifications`、`GET /notifications/new`、`GET /notifications/threads/{id}`
+  与 `/threads/{id}/comments`（正文）、`PUT /notifications?all=true`（全部标已读，回 205）。
 - 数据集与模型：`GET /dataset?dataset_name=`、`GET /aimodel?aimodel_name=`（拿 UUID 与
   `can_edit_file`）、`GET /dataset/files`、`GET /aimodel/files`、`GET /storage/summary`；
   创建走 `POST /dataset/create` 与 `POST /aimodel/create`（JSON 体，`owner_id` 必须是整数），
@@ -536,6 +554,9 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   （如 `sub/mid.txt`）或者“文件名 + `parent_dir`”两种写法都行。
 - 单文件走 base64（整个文件进内存），因此 `openi_push_repo_files` 有单文件上限
   `MAX_REPO_FILE_BYTES`（50MB）；更大的文件请改用 local git 推送。
+- 通知只能“全部标已读”：Gitea 的 `PATCH /notifications/threads/{id}` 被前置反向代理
+  拦截，同名的 `PUT` 与带 `_method=PATCH` 的 `POST` 都没注册（404），平台前端标单条走的是
+  带 `_csrf` cookie 的网页表单，令牌方式用不了，所以没有做单条标记的接口。
 - 没有做成工具的 `DELETE /repos/{owner}/{repo}/contents/{path}`：这条路由在平台上会一直
   挂到代理的 60 秒超时（504/502）且不删文件，包一层只会给出假的成功，所以故意不提供。
   要换内容就覆盖写，要清空就删掉整个仓。

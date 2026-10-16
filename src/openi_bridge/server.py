@@ -47,7 +47,9 @@ mcp = _Server(
         "openi_write_repo_file 把代码提交上去，不需要本地 git；openi_repo_tree 一次"
         "拿全文件树，openi_list_repo_commits 看提交历史，openi_download_repo_archive "
         "打包下载整仓，openi_create_repo_issue / openi_comment_repo_issue 在仓里提 issue "
-        "与评论。数据集/模型库里的文件也能单个删除：openi_delete_subject_file。创建任务前先用 "
+        "与评论，openi_update_repo_issue 关闭或改动 issue。通知用 openi_notifications "
+        "列表、openi_notification_detail 看正文、openi_mark_all_notifications_read 全部标已读。"
+        "数据集/模型库里的文件也能单个删除：openi_delete_subject_file。创建任务前先用 "
         "openi_list_creation_options 拿到实时的 spec_id 与镜像；openi_list_task_templates "
         "列出别人配好的一键运行模板，openi_start_task_from_template 可以直接照着模板开任务"
         "（模板自带代码仓/分支/启动文件/数据集挂载），openi_list_compute_resources 看平台"
@@ -58,7 +60,9 @@ mcp = _Server(
         "任务跑完后用 openi_task_outputs / openi_task_output_files 看产出文件、"
         "openi_task_download_output 取文件、openi_task_download_log 取整份日志；"
         "任务排队或失败时用 openi_task_events 看调度时间线，openi_task_nodes 看节点，"
-        "openi_task_loss 看训练 loss 曲线。"
+        "openi_task_loss 看训练 loss 曲线。训练产物要长期留存就用 "
+        "openi_task_export_to_dataset / openi_task_export_to_model 把它导成数据集或模型库，"
+        "openi_task_export_progress 查导出进度。"
     ),
 )
 
@@ -186,6 +190,39 @@ def openi_notifications(limit: int = 20, page: int = 1, unread_only: bool = Fals
         ]
         unread = count.get("new") if isinstance(count, dict) else count
         return dump({"ok": True, "unread": unread, "count": len(slim), "notifications": slim})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_notification_detail(thread_id: str, with_comments: bool = True) -> str:
+    """看单条通知的完整内容（列表接口只给标题和链接）。
+
+    thread_id: openi_notifications 返回里每项的 id。
+    with_comments: True（默认）时连这条通知下的评论正文一起返回，省一次调用。
+    """
+    try:
+        with _client() as client:
+            thread = client.notification_thread(thread_id)
+            comments = (
+                client.notification_thread_comments(thread_id) if with_comments else []
+            )
+        return dump({"ok": True, **thread, "comments": comments})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_mark_all_notifications_read() -> str:
+    """把所有未读通知一次标为已读。
+
+    平台只提供“全部已读”这一条接口；Gitea 那套“标记单条通知”走的是被前置
+    反向代理挡掉的 PATCH，令牌方式用不了，所以这里只做全清。
+    """
+    try:
+        with _client() as client:
+            client.mark_notifications_read()
+        return dump({"ok": True, "marked_all_read": True})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -734,6 +771,33 @@ def openi_comment_repo_issue(repo: str, index: int, body: str) -> str:
         with _client() as client:
             comment = client.comment_repo_issue(repo, index, body)
         return dump({"ok": True, "repo": repo, "issue": index, "comment": comment})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_update_repo_issue(
+    repo: str,
+    index: int,
+    state: Optional[str] = None,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+) -> str:
+    """改一个已有 issue：关闭 / 重开、改标题、改正文。
+
+    repo: 代码仓全名 owner/name。
+    index: issue 号，即 openi_list_repo_issues 返回的 number。
+    state: open（重开）或 closed（关闭），不改就留空。
+    title / body: 新的标题或正文，支持 Markdown，不改就留空。
+
+    平台不接受空改动，state / title / body 至少要给一个。
+    """
+    try:
+        with _client() as client:
+            issue = client.update_repo_issue(
+                repo, index, state=state, title=title, body=body
+            )
+        return dump({"ok": True, "repo": repo, "issue": issue})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
@@ -1679,6 +1743,96 @@ def openi_task_loss(task_id: str) -> str:
         with _client() as client:
             data = client.task_loss(task_id)
         return dump({"ok": True, "task_id": task_id, "loss": data})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_export_to_dataset(task_id: str, dataset: str, files: list[str]) -> str:
+    """把任务输出文件搬进一个已有的数据集（训练产物落库的第一条路）。
+
+    训练跑完的输出（ckpt、metrics、生成语料）默认只活在该任务的输出目录里，
+    跟着任务走、任务清了就没了。导出之后它们变成数据集里的普通文件，可以挂到
+    别的任务上、被别人拉取，也不受任务清理影响。
+
+    task_id: 产出这些文件的任务号。
+    dataset: 目标数据集全名 owner/name（数据集要已存在，用 openi_create_dataset
+      新建后上传，或直接用别人的公开数据集）。
+    files: 要导出的文件路径列表，相对输出根，即 openi_task_output_files 里的
+      name；子目录里的文件要连父目录一起写，例如 ["metrics.txt","ckpt/model.bin"]。
+
+    导出是异步的：返回里的 process_id 喂给 openi_task_export_progress 查进度。
+    """
+    try:
+        with _client() as client:
+            info = client.subject_info(dataset, "dataset")
+            dataset_id = info.get("id") if isinstance(info, dict) else None
+            if not dataset_id:
+                raise OpenIError(f"没拿到数据集 {dataset} 的 UUID，确认名字 owner/name 是否正确。")
+            result = client.export_task_to_dataset(task_id, dataset_id, files)
+        return dump({"ok": True, "dataset": dataset, **result})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_export_to_model(
+    task_id: str,
+    name: str,
+    files: list[str],
+    alias: Optional[str] = None,
+    license: str = "",
+    is_private: bool = False,
+) -> str:
+    """把任务输出文件建成一个新模型库（训练产物落库的第二条路，适合放 ckpt）。
+
+    和导出到数据集不同，这个接口是就地新建一个模型，所以 name 必须是当前账号下
+    还不存在的英文名（全平台英文名唯一，重名会报 Model English name already exists）。
+
+    task_id: 产出这些文件的任务号。
+    name: 新模型库的英文名，例如 my-bert-ckpt。
+    files: 要导出的文件路径列表，相对输出根，取自 openi_task_output_files 的
+      name，例如 ["ckpt/model.bin"]。
+    alias: 展示用的中文名，留空则与 name 相同。
+    license: 许可证，例如 MIT / Apache-2.0，可留空。
+    is_private: 是否私有模型库（默认 False，公开可见）。
+
+    导出是异步的：返回里的 process_id 喂给 openi_task_export_progress 查进度。
+    """
+    try:
+        with _client() as client:
+            result = client.export_task_to_model(
+                task_id,
+                name,
+                files,
+                alias=alias,
+                license=license,
+                is_private=is_private,
+            )
+        return dump({"ok": True, **result})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_export_progress(
+    process_id: str, subject_type: str = "dataset", wait_seconds: int = 60
+) -> str:
+    """查任务导出进度（openi_task_export_to_dataset / _to_model 返回的 process_id）。
+
+    subject_type: dataset 或 model，要和导出时选的那个一致。
+    wait_seconds: 在这里就地轮询等待的秒数，0 表示只查一次立刻返回。导出通常
+      几秒到一两分钟完成。
+
+    返回 files 是 {文件: 百分比}：100 已完成，0 刚开始，-1 / -2 / -3 是失败
+    （源文件读不到 / 目标已有同名文件 / 超出存储限额），failed 列出卖掉的文件。
+    """
+    try:
+        with _client() as client:
+            progress = client.wait_export(
+                subject_type, process_id, wait_seconds=wait_seconds
+            )
+        return dump({"ok": True, **progress})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
