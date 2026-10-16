@@ -6,6 +6,8 @@
 云脑的一张卡上跑一段代码。也可以就地创建数据集和模型库，把本地文件（数据集、ckpt
 权重等）直接传上去，再把返回的 UUID 挂到计算任务里。代码仓也一并管起来：建仓、读写
 文件、看整仓文件树与提交历史、打包下载、提 issue 与评论。
+任务跑完还能把产出收回来：列输出目录、下载输出文件、拉整份日志，任务排队或失败时看
+调度事件时间线与节点，训练任务可以读 loss 曲线。
 
 > www.openi.org.cn 只是社区门户网站，真正的算力平台是
 > [openi.pcl.ac.cn](https://openi.pcl.ac.cn)（启智 AI 协作平台），本工具对接的是后者。
@@ -145,6 +147,14 @@ Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即�
 **收拾现场。** “把我的调试任务都停掉/删掉。”助手用 `openi_list_tasks` 找到任务，再
 `openi_stop_task` / `openi_delete_task`。
 
+**收产出、查为什么排队。** “任务跑完了，把 output 里的结果拿下来”“这个任务怎么一直排队？”
+助手用 `openi_task_outputs` / `openi_task_output_files` 列任务产出的文件，
+`openi_task_download_output` 把文件取下来（小文件直接读进返回，大文件给 `save_to` 流式
+落盘），`openi_task_download_log` 取整份日志；任务排队、被抢占或失败时用
+`openi_task_events` 看调度时间线（分配节点→拉镜像→建容器→启动→结束），
+`openi_task_nodes` 看跑在哪些节点上，`openi_task_loss` 读训练 loss 曲线。注意任务输出在
+平台侧是异步索引的，刚 SUCCEEDED 时可能还列不到文件，隔一两分钟重试。
+
 想手动调工具或写脚本，命令行入口和 MCP 工具是一一对应的：
 
 ~~~bash
@@ -154,7 +164,7 @@ python -m openi_bridge.autopoint --status
 python -m openi_bridge.install_mcp --apply
 ~~~
 
-完整的 60 个工具见下面的[工具全表](#工具全表)。从零创建任务的顺序是固定的：`openi_whoami`
+完整的 67 个工具见下面的[工具全表](#工具全表)。从零创建任务的顺序是固定的：`openi_whoami`
 → `openi_list_creation_options` → 选代码仓和分支 → `openi_start_task` →
 `openi_get_task` / `openi_task_debug_url` → 用完 `openi_stop_task`，必要时
 `openi_delete_task`。想省掉“自己找仓、自己配 spec、自己挂数据集”这几步，就先用
@@ -356,7 +366,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 
 ## 工具全表
 
-共 60 个工具，都是 `openi_` 前缀。
+共 67 个工具，都是 `openi_` 前缀。
 
 | 工具 | 作用 |
 | --- | --- |
@@ -396,6 +406,13 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_task_debug_url | 获取调试任务的 Jupyter / SSH 入口 |
 | openi_task_visualize_url | 获取训练任务的 TensorBoard 入口 |
 | openi_task_service_url | 获取在线推理（ONLINEINFERENCE）任务的对外服务地址 |
+| openi_task_events | 看任务的调度事件时间线（分配节点→拉镜像→建容器→启动→结束），定位为什么排队/失败 |
+| openi_task_nodes | 列出任务实际跑在哪些节点上（多机任务多条） |
+| openi_task_outputs | 列出任务输出目录的文件（一次一层，子目录用 parent_dir 下翻） |
+| openi_task_output_files | 一次列出任务输出的全部文件（递归，name 即相对路径，可直接下载） |
+| openi_task_download_output | 下载任务输出的某个文件（流式落盘，或直接读进返回） |
+| openi_task_download_log | 下载任务的完整日志（整段纯文本，非分页；读进返回时默认截到 256KB） |
+| openi_task_loss | 读取训练任务的 loss 曲线（epoch / loss 序列） |
 | openi_list_task_templates | 浏览任务模板广场：别人配好的一键开任务模板（含代码仓、分支、启动文件、卡型卡数、镜像、数据集/模型挂载） |
 | openi_get_task_template | 按模板 ID 查一个模板的完整配置 |
 | openi_collect_task_template | 收藏 / 取消收藏任务模板 |
@@ -453,6 +470,13 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 - 任务读写：`/ai_task`、`/ai_task/brief`、`/ai_task/log`、`/ai_task/resource_usage`、
   `/ai_task/debug_url`、`/ai_task/visualize_url`、`/ai_task/self_endpoint_url`（在线推理
   的对外地址）、`/ai_task/my_list`（账号级任务列表）、`/{owner}/{repo}/ai_task`（按仓列表）。
+- 任务观测：`/ai_task/log/download`（整份日志纯文本，不是 JSON）、
+  `/ai_task/operation_profile`（调度事件时间线，每条含 reason/timestamp/message，时间戳
+  是 UTC）、`/ai_task/node_info`（节点清单）、`/ai_task/loss`（训练 loss 曲线）、
+  `/ai_task/output`（输出目录，一次一层，`parent_dir` 下翻）、`/ai_task/output/all`
+  （一次返回递归全量清单，`FileName` 就是相对路径）、`/ai_task/output/download`
+  （下载单个输出文件，平台先答 307 再跳到 OBS 签名直链，`file_name` 给纯文件名或
+  相对路径都能命中）。
 - 任务变更：`POST /{owner}/{repo}/ai_task/create`、`/ai_task/stop`、`/ai_task/restart`、
   `/ai_task/del`、`/ai_task/batch_del`。
 - 数据集与模型：`GET /dataset?dataset_name=`、`GET /aimodel?aimodel_name=`（拿 UUID 与
@@ -504,6 +528,12 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 - `openi_download_repo_archive` 走 `/archive/{ref}.zip`，边下边写盘，先落在
   `<目标>.part` 下完再改名，中途失败或超过 `max_bytes` 都会把临时文件删掉，不会留下
   半截 zip。
+- 任务输出（`/ai_task/output*`）在平台侧是**异步索引**的：任务刚进 `SUCCEEDED` 时
+  `output.status` 是 1、`file_list` 是空的，通常要等一两分钟才变成 `status=0` 并列出
+  文件（实测 000000 / 000000 都在约两分钟后才刷出来）。所以 `openi_task_outputs` /
+  `openi_task_output_files` 带 `ready` 标记：刚跑完看不到文件不代表任务没有输出，隔一会儿
+  重试即可。输出目录里的子目录以 `IsDir=true` 标出，下载子目录里的文件用相对路径
+  （如 `sub/mid.txt`）或者“文件名 + `parent_dir`”两种写法都行。
 - 单文件走 base64（整个文件进内存），因此 `openi_push_repo_files` 有单文件上限
   `MAX_REPO_FILE_BYTES`（50MB）；更大的文件请改用 local git 推送。
 - 没有做成工具的 `DELETE /repos/{owner}/{repo}/contents/{path}`：这条路由在平台上会一直

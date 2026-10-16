@@ -55,6 +55,10 @@ mcp = _Server(
         "建，容器里的服务监听 8000 端口，RUNNING 之后用 openi_task_service_url 取对外地址。"
         "使用前必须设置 "
         "OPENI_TOKEN 环境变量，令牌在 https://openi.pcl.ac.cn/user/settings/applications 生成。"
+        "任务跑完后用 openi_task_outputs / openi_task_output_files 看产出文件、"
+        "openi_task_download_output 取文件、openi_task_download_log 取整份日志；"
+        "任务排队或失败时用 openi_task_events 看调度时间线，openi_task_nodes 看节点，"
+        "openi_task_loss 看训练 loss 曲线。"
     ),
 )
 
@@ -73,6 +77,23 @@ def _ok(value: Any, **extra: Any) -> str:
         merged.update(extra)
         return dump(merged)
     return dump({"result": value, **extra})
+
+
+def _slim_output_files(files: Any) -> list[dict[str, Any]]:
+    """把 /ai_task/output* 的 file_list 压成 name / is_dir / size / modified。"""
+    slim: list[dict[str, Any]] = []
+    for entry in files or []:
+        if not isinstance(entry, dict):
+            continue
+        slim.append(
+            {
+                "name": entry.get("FileName"),
+                "is_dir": bool(entry.get("IsDir")),
+                "size": entry.get("Size"),
+                "modified": entry.get("ModTime") or None,
+            }
+        )
+    return slim
 
 
 @mcp.tool()
@@ -1502,6 +1523,162 @@ def openi_task_service_url(task_id: str) -> str:
     try:
         with _client() as client:
             return dump({"ok": True, "service": client.service_url(task_id)})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_events(task_id: str) -> str:
+    """看一个任务的调度事件时间线，用来定位“为什么排队 / 为什么失败”。
+
+    平台按“分配节点 → 拉镜像 → 建容器 → 启动 → 结束”逐步记录，每条含
+    message（人读的说明）、reason（阶段名，如 Scheduled / Pulled / Created /
+    Started / Killing / Exit）、timestamp（UTC）与 action。任务长期卡在 WAITING、
+    被抢占、镜像拉不动或异常退出时，这里能看出卡在哪一步、为什么。
+    """
+    try:
+        with _client() as client:
+            data = client.task_operation_profile(task_id)
+        events = data.get("events") if isinstance(data, dict) else data
+        return dump({"ok": True, "task_id": task_id, "events": events})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_nodes(task_id: str) -> str:
+    """列出任务实际跑在哪些节点上（多机任务会有多条）。
+
+    返回每个节点 {id, log_file_name}；配合 openi_task_logs 的 node_id 可以分别
+    读取各节点的日志。
+    """
+    try:
+        with _client() as client:
+            return dump({"ok": True, "task_id": task_id, "nodes": client.task_node_info(task_id)})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_outputs(task_id: str, parent_dir: str = "") -> str:
+    """列出任务输出目录里的文件（一次一层，子目录用 parent_dir 继续往下翻）。
+
+    parent_dir: 相对输出根的子目录，留空看根目录。想一次拿全量递归清单就用
+    openi_task_output_files。
+
+    重要：平台对输出是异步索引的。任务刚跑完时 ready=false、file_list 为空
+    （平台字段 status=1），通常要等一两分钟才会变成 ready=true 并列出文件
+    （status=0）。刚结束查不到文件时，隔一会儿重试，别当成任务没有输出。
+    """
+    try:
+        with _client() as client:
+            data = client.task_output(task_id, parent_dir=parent_dir)
+        out = data.get("output") if isinstance(data, dict) else {}
+        out = out if isinstance(out, dict) else {}
+        status = out.get("status")
+        return dump(
+            {
+                "ok": True,
+                "task_id": task_id,
+                "parent_dir": parent_dir,
+                "ready": status == 0,
+                "status": status,
+                "can_download": out.get("can_download"),
+                "output_size_limit": out.get("output_size_limit"),
+                "files": _slim_output_files(out.get("file_list")),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_output_files(task_id: str) -> str:
+    """一次列出任务输出的全部文件（递归，含子目录里的）。
+
+    返回每项的 name 就是相对输出根的完整路径，可以直接作为
+    openi_task_download_output 的 file_name。刚跑完时同样要等平台索引完成
+    （见 openi_task_outputs 的说明），列表为空不代表没有输出。
+    """
+    try:
+        with _client() as client:
+            data = client.task_output_all(task_id)
+        out = data.get("output") if isinstance(data, dict) else {}
+        out = out if isinstance(out, dict) else {}
+        return dump(
+            {
+                "ok": True,
+                "task_id": task_id,
+                "files": _slim_output_files(out.get("file_list")),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_download_output(
+    task_id: str,
+    file_name: str,
+    parent_dir: str = "",
+    save_to: Optional[str] = None,
+) -> str:
+    """把任务输出的某个文件下载到本地（或直接读进返回里）。
+
+    file_name: 文件名或相对输出根的完整路径。用 openi_task_output_files 拿到的
+      name 直接填这里即可；根目录下的文件也可以只给文件名。
+    parent_dir: file_name 只给纯文件名时，指定它所在子目录；用完整路径时留空。
+    save_to: 本地保存路径。给目录（或以 / 结尾）时按原文件名存进去；不给则把
+      内容读进返回（能按文本解码就直接给，二进制给 base64）。
+
+    小文件（几 MB 以内）不带 save_to 直接读进来最省事；大文件务必给 save_to
+    让它流式落盘。
+    """
+    try:
+        with _client() as client:
+            payload = client.task_output_download(
+                task_id, file_name, parent_dir=parent_dir, save_to=save_to
+            )
+        return dump({"ok": True, "task_id": task_id, "file_name": file_name, **payload})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_download_log(
+    task_id: str,
+    save_to: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+) -> str:
+    """下载任务的完整日志（整段纯文本，不分页）。
+
+    和 openi_task_logs 的区别：那个是分页读、适合跟进进度；这个是平台一次性给出
+    的完整日志文本，适合整段留存或喂给别的工具分析。
+    save_to: 本地保存路径（给目录就按 task-<id>.log 存）；不给则把文本读进返回
+      （默认最多 256KB，超过截断并带 truncated 标记，防止日志把返回撑爆）。
+    max_bytes: 自定义上限。给 save_to 时它是硬上限（超了立即中止，不落盘）；
+      不给 save_to 时它是内存里的截断上限。
+    """
+    try:
+        limit = max_bytes if (max_bytes is not None or save_to) else 256 * 1024
+        with _client() as client:
+            payload = client.task_log_download(task_id, save_to=save_to, max_bytes=limit)
+        return dump({"ok": True, "task_id": task_id, **payload})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def openi_task_loss(task_id: str) -> str:
+    """读取训练任务的 loss 曲线（epoch / loss 序列）。
+
+    任务没上报 loss 时返回空列表；这是平台侧记录的曲线，训练脚本没按平台方式
+    输出 loss 时会为空。
+    """
+    try:
+        with _client() as client:
+            data = client.task_loss(task_id)
+        return dump({"ok": True, "task_id": task_id, "loss": data})
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 

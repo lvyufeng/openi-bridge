@@ -16,6 +16,11 @@
 取对外服务地址 → 对地址发 GET / POST 拿到容器里服务的响应 → 停止 → 删除。这份记录了
 平台默认端口 8000、地址在 WAITING 阶段就已返回、以及自定义路径/端口会被平台拒的细节。
 
+`task-observability-e2e-task-000000.txt` 是任务观测链路的实测记录：跑一个短 TRAIN 任务 →
+看调度事件时间线（operation_profile）、节点清单、输出目录（含子目录）、下载输出文件、
+下载整份日志、读 loss。这份记录了输出的异步索引行为（刚 SUCCEEDED 时 file_list 为空、
+约两分钟后才刷出）和下载接口 307 跳 OBS 签名直链的细节。
+
 | 文件 | 算力 | spec_id | 任务号 | 关键内容 |
 | --- | --- | --- | --- | --- |
 | `gpu-v100-task-000000.txt` | NVIDIA GPU | 210 | 000000 | `nvidia-smi`：Tesla V100S-PCIE-32GB，32768 MiB，驱动 570.124.06 / CUDA 12.8 |
@@ -30,6 +35,7 @@
 | `code-repo-e2e-task-000000.txt` | NVIDIA GPU | 210 | 000000 | 代码仓链路：建仓/推文件/覆盖写/用该仓跑 TRAIN，日志出现被写入的 `print` |
 | `task-template-e2e-task-000000.txt` | 昇腾 NPU | 328 | 000000 | 任务模板链路：模板 → 实时 spec 配对 → 开任务 → RUNNING → 停止并删除 |
 | `online-inference-e2e-task-000000.txt` | NVIDIA GPU | 237 | 000000 | 在线推理链路：建 ONLINEINFERENCE → 取服务地址 → GET/POST 拿到响应 → 停止并删除 |
+| `task-observability-e2e-task-000000.txt` | 燧原 GCU | 229 | 000000 | 任务观测链路：调度事件/节点/输出目录/下载文件/整份日志/loss；输出异步索引约两分钟 |
 
 `METAX-GPGPU`（沐曦 C500，spec 333）没有输出。2026-10-14 连续 9 次 DEBUG 任务都没
 调度到卡，而且失败方式不一致：前 7 次（含 000000、000000）一直停在 `centerPending`

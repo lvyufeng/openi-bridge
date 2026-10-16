@@ -34,6 +34,13 @@ delete the whole repo instead.
     GET  /api/v1/ai_task?id=                       one task detail (with sync)
     GET  /api/v1/ai_task/brief?id=                 compact status
     GET  /api/v1/ai_task/log?id=                   task log
+    GET  /api/v1/ai_task/log/download?id=          whole log as plain text
+    GET  /api/v1/ai_task/operation_profile?id=     scheduling event timeline
+    GET  /api/v1/ai_task/node_info?id=             multi-node task node list
+    GET  /api/v1/ai_task/output?id=                task output dir (one level)
+    GET  /api/v1/ai_task/output/all?id=            task output (recursive)
+    GET  /api/v1/ai_task/output/download?id=       download one output file
+    GET  /api/v1/ai_task/loss?id=                  training loss curve
     GET  /api/v1/ai_task/resource_usage?id=        live card/CPU usage
     GET  /api/v1/ai_task/debug_url?id=             Jupyter / SSH entry point
     GET  /api/v1/ai_task/visualize_url?id=         TensorBoard entry point
@@ -207,6 +214,11 @@ DEFAULT_IMAGE_URL = os.getenv(
 
 # Compute sources whose advertised images cannot be pulled, checked live.
 SOURCES_NEEDING_IMAGE_URL = frozenset({"GPU"})
+
+# 任务输出（/ai_task/output）在平台侧是异步索引的：任务刚进 SUCCEEDED 时
+# output.status 是 1、file_list 是空的，等一两分钟再查才变成 status 0 并列出文件
+# （2026-10 实测，a task / a task 都在约两分钟后才刷出来）。所以输出工具要把
+# “刚跑完查不到文件”当成还没索引，而不是任务没有输出。
 
 # Platform validation (services/ai_task_service/task/opt_handler.go).
 JOB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{1,34}[a-z0-9-]$")
@@ -1722,6 +1734,168 @@ class OpenIClient:
 
     def task_node_info(self, task_id: Any) -> Any:
         return self.get_json("/ai_task/node_info", params={"id": task_id})
+
+    def task_operation_profile(self, task_id: Any) -> Any:
+        """GET /api/v1/ai_task/operation_profile?id= - 任务调度事件时间线。
+
+        平台按“分配节点 → 拉镜像 → 建容器 → 启动 → 结束”逐条记录，每条含
+        message / name / reason / timestamp / action，时间戳是 UTC。任务卡在
+        WAITING、被抢占或异常退出时，这里能看出卡在哪一步、为什么。
+        """
+        return self.get_json("/ai_task/operation_profile", params={"id": task_id})
+
+    def task_output(self, task_id: Any, parent_dir: str = "") -> Any:
+        """GET /api/v1/ai_task/output?id= - 列出任务输出目录（一次一层）。
+
+        parent_dir 是相对输出根的子目录，留空看根目录。返回 output.file_list 每项
+        有 FileName / IsDir / Size / ModTime。注意 output.status 为 1 时平台还在
+        索引，file_list 通常为空；任务跑完后要等一两分钟才刷得出文件。
+        """
+        params: Dict[str, Any] = {"id": task_id}
+        if parent_dir:
+            params["parent_dir"] = parent_dir
+        return self.get_json("/ai_task/output", params=params)
+
+    def task_output_all(self, task_id: Any) -> Any:
+        """GET /api/v1/ai_task/output/all?id= - 输出目录的完整递归清单。
+
+        和 task_output 不同，这里一次给全（含子目录），每项的 FileName 就是相对
+        输出根的完整路径，可直接用作 task_output_download 的 file_name。
+        """
+        return self.get_json("/ai_task/output/all", params={"id": task_id})
+
+    def task_output_download(
+        self,
+        task_id: Any,
+        file_name: str,
+        parent_dir: str = "",
+        save_to: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """下载任务输出里的一个文件（GET /ai_task/output/download）。
+
+        file_name 可以是纯文件名（再配 parent_dir），也可以是相对输出根的完整
+        路径（如 "sub/mid.txt"，此时 parent_dir 留空），两种都能命中。给 save_to
+        就流式落盘并回大小与 md5；不给则把内容读进内存（能按 UTF-8 解码就当文本，
+        否则给 base64），max_bytes 是内存里的截断上限。
+        """
+        params: Dict[str, Any] = {"id": task_id, "file_name": file_name}
+        if parent_dir:
+            params["parent_dir"] = parent_dir
+        return self._download(
+            "/ai_task/output/download",
+            params,
+            save_to=save_to,
+            max_bytes=max_bytes,
+            label=file_name,
+        )
+
+    def task_log_download(
+        self,
+        task_id: Any,
+        save_to: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """整份任务日志（GET /ai_task/log/download?id=）。
+
+        和分页的 task_log 不同，这个接口一次性返回完整日志纯文本，适合把日志整段
+        留存或喂给别的工具分析。给 save_to 就写文件，否则把文本带回内存；max_bytes
+        在落盘时是硬上限、在内存里是截断上限（截断时带 truncated 标记）。
+        """
+        return self._download(
+            "/ai_task/log/download",
+            {"id": task_id},
+            save_to=save_to,
+            max_bytes=max_bytes,
+            label=f"task-{task_id}.log",
+        )
+
+    def task_loss(self, task_id: Any) -> Any:
+        """GET /api/v1/ai_task/loss?id= - 训练任务的 loss 曲线。
+
+        返回 [{epoch, loss}, ...]；任务没上报 loss 时是空列表。
+        """
+        return self.get_json("/ai_task/loss", params={"id": task_id})
+
+    def _download(
+        self,
+        path: str,
+        params: Mapping[str, Any],
+        *,
+        save_to: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+        label: str = "",
+    ) -> Dict[str, Any]:
+        """流式下载一个返回原始文件（非 JSON）的接口。
+
+        给 save_to 时边走边写 <目标>.part，下完再改名，中途失败不留半截文件，
+        同时算出 md5；不给 save_to 时把内容读进内存：能按 UTF-8 解码就当文本
+        返回，否则给 base64。max_bytes 在落盘时是硬上限（超了立即中止），在内存
+        模式里是截断上限（截断时 truncated 为 True）。
+        """
+        if not self.creds.has_token:
+            raise OpenIError("NO_TOKEN: 没有找到启智令牌。")
+        headers = {"Authorization": f"Bearer {self.creds.token}"}
+        timeout = httpx.Timeout(30.0, read=120.0)
+        if save_to:
+            dest = os.path.abspath(os.path.expanduser(save_to))
+            if os.path.isdir(dest) or save_to.endswith(os.sep):
+                os.makedirs(dest, exist_ok=True)
+                dest = os.path.join(dest, os.path.basename(label) or "download.bin")
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            tmp_path = f"{dest}.part"
+            digest = hashlib.md5()
+            size = 0
+            try:
+                with self._http.stream(
+                    "GET", path, params=params, headers=headers, timeout=timeout
+                ) as response:
+                    if response.status_code >= 400:
+                        raise OpenIError(
+                            f"下载失败 HTTP {response.status_code}：{path}",
+                            status_code=response.status_code,
+                            payload=response.read().decode("utf-8", "replace")[:200],
+                        )
+                    with open(tmp_path, "wb") as handle:
+                        for chunk in response.iter_bytes(1024 * 1024):
+                            handle.write(chunk)
+                            digest.update(chunk)
+                            size += len(chunk)
+                            if max_bytes is not None and size > max_bytes:
+                                raise OpenIError(
+                                    f"{label or path} 超过 max_bytes={max_bytes} 字节，已中止下载。"
+                                )
+            except BaseException:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+            os.replace(tmp_path, dest)
+            return {
+                "path": dest,
+                "bytes": size,
+                "mb": round(size / 1024 / 1024, 3),
+                "md5": digest.hexdigest(),
+            }
+        response = self._http.get(path, params=params, headers=headers, timeout=timeout)
+        if response.status_code >= 400:
+            raise OpenIError(
+                f"下载失败 HTTP {response.status_code}：{path}",
+                status_code=response.status_code,
+                payload=response.text[:200],
+            )
+        blob = response.content
+        truncated = False
+        if max_bytes is not None and len(blob) > max_bytes:
+            blob = blob[:max_bytes]
+            truncated = True
+        result: Dict[str, Any] = {"bytes": len(blob)}
+        try:
+            result["text"] = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            result["base64"] = base64.b64encode(blob).decode("ascii")
+        if truncated:
+            result["truncated"] = True
+        return result
 
     def list_tasks(self, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """GET /api/v1/ai_task/my_list - every task of the account."""
