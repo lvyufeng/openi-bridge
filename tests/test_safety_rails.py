@@ -301,6 +301,9 @@ class TestDownloadDoesNotClobber:
         except BaseException:
             os.replace(previous, dest)
         assert dest.read_bytes() == b"GOOD-OLD-CONTENT"
+
+
+class TestFreeWindowAccounting:
     """keep_seconds must be measured from RUNNING, and truncation reported."""
 
     def test_margin_constant_is_sane(self):
@@ -308,6 +311,167 @@ class TestDownloadDoesNotClobber:
 
     def test_free_window_matches_billing_docs(self):
         assert autopoint.FREE_WINDOW_SECONDS == 6 * 60
+
+
+class TestPaginationBounds:
+    """Listing tools must refuse absurd pagination instead of forwarding it.
+
+    These parameters used to go straight to the platform: limit=100000 returned
+    tens of thousands of rows into a single MCP response, and page=0 has
+    undefined behaviour. The bounds are a guard rail, not a platform limit.
+    """
+
+    def _check(self, **kw):
+        from openi_bridge.server import _check_pagination
+
+        _check_pagination(**kw)
+
+    def test_reasonable_values_pass(self):
+        self._check(limit=20)
+        self._check(limit=200, page=1)
+        self._check(page_size=100, pages=50)
+        self._check()  # nothing given
+
+    def test_limit_above_ceiling_is_rejected(self):
+        from openi_bridge.server import MAX_LIST_LIMIT, _InputError
+
+        with pytest.raises(_InputError, match="limit 必须在"):
+            self._check(limit=MAX_LIST_LIMIT + 1)
+
+    def test_page_zero_is_rejected(self):
+        from openi_bridge.server import _InputError
+
+        with pytest.raises(_InputError, match="page 必须在"):
+            self._check(page=0)
+        with pytest.raises(_InputError, match="page 必须在"):
+            self._check(page=-5)
+
+    def test_page_size_above_ceiling_is_rejected(self):
+        from openi_bridge.server import MAX_LIST_PAGE_SIZE, _InputError
+
+        with pytest.raises(_InputError, match="page_size 必须在"):
+            self._check(page_size=MAX_LIST_PAGE_SIZE + 1)
+
+    def test_pages_above_ceiling_is_rejected(self):
+        from openi_bridge.server import MAX_PAGES, _InputError
+
+        with pytest.raises(_InputError, match="pages 必须在"):
+            self._check(pages=MAX_PAGES + 1)
+
+    def test_non_integer_is_rejected(self):
+        from openi_bridge.server import _InputError
+
+        with pytest.raises(_InputError, match="必须是整数"):
+            self._check(limit="20")
+        with pytest.raises(_InputError, match="必须是整数"):
+            self._check(page=1.5)
+
+    def test_bool_is_not_accepted_as_int(self):
+        """True == 1 in Python, but a bool is a caller mistake, not a page number."""
+        from openi_bridge.server import _InputError
+
+        with pytest.raises(_InputError, match="必须是整数"):
+            self._check(limit=True)
+
+    def test_input_error_renders_as_error_envelope(self):
+        """_InputError subclasses ValueError so the tools' except catches it."""
+        import json as _json
+
+        from openi_bridge.server import _InputError, _err
+
+        payload = _json.loads(_err(_InputError("limit 必须在 1-200 之间：99999")))
+        assert payload["ok"] is False
+        assert "limit" in payload["error"]
+
+
+class TestStartTaskRawGuards:
+    """The generic raw-POST tool must not be reachable by accident."""
+
+    def test_repo_must_be_owner_slash_name(self):
+        from openi_bridge.server import _REPO_FULLNAME_RE
+
+        assert _REPO_FULLNAME_RE.match("owner/name")
+        assert _REPO_FULLNAME_RE.match("scratch-repo")
+        # these would otherwise be spliced into f"/{repo}/ai_task/create"
+        assert not _REPO_FULLNAME_RE.match("no-slash")
+        assert not _REPO_FULLNAME_RE.match("../etc/passwd")
+        assert not _REPO_FULLNAME_RE.match("a/b/c")
+        assert not _REPO_FULLNAME_RE.match("")
+        assert not _REPO_FULLNAME_RE.match("/leading")
+
+    def test_safe_default_flag_exists(self):
+        """A bool guard exists for the raw path; document the current default."""
+        import inspect
+
+        from openi_bridge.server import openi_start_task_raw
+
+        sig = inspect.signature(openi_start_task_raw)
+        assert "dry_run" in sig.parameters
+
+
+class TestToolDecoratorInvariant:
+    """Every @mcp.tool() function must be exception-guarded.
+
+    The guard used to be an 83-times-repeated try/except inside each body; it is
+    now the @tool decorator. That only works if @tool sits *below* @mcp.tool():
+    decorators apply bottom-up, so @mcp.tool() must wrap the guarded function.
+    Written the other way round, @mcp.tool() registers the raw function and an
+    exception escapes to the client as UnexpectedToolError instead of coming
+    back as an {"ok": false} envelope.
+    """
+
+    def _source(self):
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "src/openi_bridge/server.py").read_text(
+            encoding="utf-8"
+        )
+
+    def test_tool_decorator_is_defined(self):
+        import openi_bridge.server as server
+
+        assert callable(server.tool)
+
+    def test_no_tool_inverts_the_decorator_order(self):
+        import re
+
+        text = self._source()
+        inverted = re.findall(r"^@tool\n@mcp\.tool\(\)\n", text, re.M)
+        assert not inverted, (
+            "@tool must come after @mcp.tool(), not before; the guard would be "
+            "applied to a discarded wrapper"
+        )
+
+    def test_every_tool_is_guarded(self):
+        import re
+
+        text = self._source()
+        # a tool is guarded if it is immediately followed by @tool, or is one of
+        # the two that genuinely cannot raise and carry no try at all
+        unguarded = []
+        for m in re.finditer(r"^@mcp\.tool\(\)\n(?:@tool\n)?def (openi_[a-z_]+)\(", text, re.M):
+            followed_by_tool = text[m.start():m.end()].count("@tool") == 1
+            if not followed_by_tool:
+                unguarded.append(m.group(1))
+        # these raise nothing: one returns a static catalog, the other only asks
+        # the scheduler a question and formats it
+        allowed = {"openi_list_resources"}
+        assert set(unguarded) <= allowed, (
+            f"tools without the @tool guard: {sorted(set(unguarded) - allowed)}"
+        )
+
+    def test_guard_turns_exception_into_envelope(self):
+        import json as _json
+
+        import openi_bridge.server as server
+
+        @server.tool
+        def boom():
+            raise ValueError("kaboom")
+
+        payload = _json.loads(boom())
+        assert payload["ok"] is False
+        assert "kaboom" in payload["error"]
 
 
 class TestTaskActionVerified:

@@ -22,6 +22,7 @@
 - [积分](#积分)：领取规则与每日自动领分
 - [在卡上跑代码](#在卡上跑代码)
 - [工具全表](#工具全表)
+- [参数上限](#参数上限)
 - [测试](#测试)
 - [实现说明与已知限制](#实现说明与已知限制)
 
@@ -417,6 +418,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_list_repo_releases | 列出代码仓的 release（含 tag、草稿/预发布标记与时间） |
 | openi_list_repo_labels | 列出代码仓的标签（issue 分类用，含颜色） |
 | openi_list_repo_collaborators | 列出代码仓的协作者（平台不回 permissions 字段，故不承诺权限） |
+| openi_repo_permission | 查当前账号对某个代码仓的写权限（协作者列表不回权限，用这个判断） |
 | openi_list_repo_stargazers | 列出收藏（star）某个代码仓的账号 |
 | openi_list_starred_repositories | 列出当前账号收藏的代码仓（别人的仓，找参考实现的入口） |
 | openi_list_subscribed_repositories | 列出当前账号关注（watch）的代码仓 |
@@ -466,6 +468,18 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_delete_subject_file | 删除数据集/模型库里的一个文件或整个子目录（删完重新列清单核对，本来没有则报 existed=false） |
 | openi_pull_dataset | 从 OpenI 拉取数据集文件到本地（单文件或整库，支持 dry_run 与 max_bytes） |
 | openi_pull_model | 从 OpenI 拉取模型/ckpt 文件到本地（单文件或整库，支持断点跳过） |
+
+## 参数上限
+
+列表类工具（通知、任务、仓、issue、数据集/模型、文件清单、模板）的 `limit` /
+`page` / `page_size` / `pages` 有一层防呆上限：`limit` ≤ 200、`page` ≤ 1000、
+`page_size` ≤ 100、`pages` ≤ 50。这些不是平台限制，而是因为这个工具把平台响应
+原样交给模型——不设上限时一个 `limit=100000` 就能把几万条记录塞进一次返回。
+要更多数据请翻页，不要一次要完。
+
+`openi_start_task_raw` 是自定义 JSON 创建任务的兜底入口，因为它不做字段校验，
+`repo` 必须是 `owner/name`、`payload_json` 必须是非空 JSON 对象，且执行前
+建议先 `dry_run=True` 看一遍请求体。
 
 ## 测试
 

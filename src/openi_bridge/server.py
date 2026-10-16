@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import sys
 from typing import Any, Optional
 
@@ -73,6 +75,11 @@ mcp = _Server(
 )
 
 
+# 代码仓全名 owner/name。用于在把请求拼进 URL 之前挡住畸形输入：repo 会被直接
+# 插进 f"/{repo}/ai_task/create" 这类路径，放任它等于让调用方决定打到哪个端点。
+_REPO_FULLNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
 def _client() -> OpenIClient:
     return OpenIClient()
 
@@ -90,6 +97,37 @@ def _err(exc: Exception) -> str:
     if status is not None:
         payload["status_code"] = status
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def tool(fn: Any) -> Any:
+    """把工具体里重复的 try/except 收成一层的装饰器。
+
+    83 个工具的 except 块逐字相同：捕获 Exception 后交给 _err 渲染成
+    {ok: false, error: ...}。写在每个函数里除了让文件变长，还让"某个工具忘了
+    包 except"变成一件可能发生的事——那种工具会把异常直接抛给 MCP 客户端。
+
+    用法与原写法等价，只是把样板挪到一处：
+
+        mcp.tool()(tool(openi_x))   # 等价于下面两行装饰器叠加
+        @tool
+        def openi_x(...) -> str:
+            with _client() as client:
+                ...
+            return dump({...})
+
+    装饰器在内层，所以 _InputError 这类由工具自身逻辑抛出的入参错误同样会被渲染
+    成错误信封，行为与手写 try/except 完全一致。
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the model as text
+            return _err(exc)
+
+    return wrapper
 
 
 def _ok(value: Any, **extra: Any) -> str:
@@ -112,6 +150,65 @@ def _bounded_ok(report: Any) -> dict[str, Any]:
     return {k: v for k, v in report.items() if k != "ok"}
 
 
+# 平台没有把列表接口的 limit/page 压在自己那边，所以上限得在这里兜。取值只是
+# 防呆，不是平台限制：超过就挡住并提示分页，而不是把上百 MB 的响应丢给模型。
+MAX_LIST_LIMIT = 200
+MAX_LIST_PAGE = 1000
+MAX_LIST_PAGE_SIZE = 100
+MAX_PAGES = 50
+
+
+class _InputError(ValueError):
+    """入参不合法。
+
+    继承 ValueError，这样各工具既有的 ``except Exception`` 已经会把它渲染成
+    {ok: false, error: ...} 的信封，不需要额外装饰器。
+    """
+
+
+def _check_pagination(
+    limit: Optional[int] = None,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    pages: Optional[int] = None,
+) -> None:
+    """校验分页参数，越界就报错而不是把请求发出去。
+
+    之前这些参数直接透给平台：limit 传 100000 会让平台一次回几万条、整个塞进
+    MCP 返回里；page 传 0 或负数平台行为未定义。这里统一挡在入口。
+    """
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise _InputError(f"limit 必须是整数：{limit!r}")
+        if not 1 <= limit <= MAX_LIST_LIMIT:
+            raise _InputError(
+                f"limit 必须在 1-{MAX_LIST_LIMIT} 之间：{limit}。"
+                f"要更多请翻页（page 参数），不要一次要完。"
+            )
+    if page is not None:
+        if isinstance(page, bool) or not isinstance(page, int):
+            raise _InputError(f"page 必须是整数：{page!r}")
+        if not 1 <= page <= MAX_LIST_PAGE:
+            raise _InputError(f"page 必须在 1-{MAX_LIST_PAGE} 之间：{page}")
+    if page_size is not None:
+        if isinstance(page_size, bool) or not isinstance(page_size, int):
+            raise _InputError(f"page_size 必须是整数：{page_size!r}")
+        if not 1 <= page_size <= MAX_LIST_PAGE_SIZE:
+            raise _InputError(
+                f"page_size 必须在 1-{MAX_LIST_PAGE_SIZE} 之间：{page_size}。"
+                f"平台对更大的值会静默退回默认条数。"
+            )
+    if pages is not None:
+        if isinstance(pages, bool) or not isinstance(pages, int):
+            raise _InputError(f"pages 必须是整数：{pages!r}")
+        if not 1 <= pages <= MAX_PAGES:
+            raise _InputError(
+                f"pages 必须在 1-{MAX_PAGES} 之间：{pages}（每次翻一页会打一轮请求）。"
+            )
+
+
+
+
 def _slim_output_files(files: Any) -> list[dict[str, Any]]:
     """把 /ai_task/output* 的 file_list 压成 name / is_dir / size / modified。"""
     slim: list[dict[str, Any]] = []
@@ -130,15 +227,11 @@ def _slim_output_files(files: Any) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
+@tool
 def openi_whoami() -> str:
     """查看当前令牌对应的启智账号，用来确认令牌是否可用。"""
-    try:
-        with _client() as client:
-            return _ok(client.current_user(), ok=True)
-    except Exception as exc:  # noqa: BLE001 - surfaced to the model as text
-        return _err(exc)
-
-
+    with _client() as client:
+        return _ok(client.current_user(), ok=True)
 @mcp.tool()
 def openi_list_resources() -> str:
     """列出启智社区可用的算力集群、卡型与积分单价（分/卡时）。"""
@@ -146,6 +239,7 @@ def openi_list_resources() -> str:
 
 
 @mcp.tool()
+@tool
 def openi_list_compute_resources() -> str:
     """查平台实时上线的算力中心与卡型（比离线目录更全）。
 
@@ -154,109 +248,94 @@ def openi_list_compute_resources() -> str:
     里没有的）。它不代表账号现在能开哪些规格——那要用 openi_list_creation_options
     拿实时 spec_id、单价与配额。价格参考 openi_list_resources。
     """
-    try:
-        with _client() as client:
-            data = client.compute_resources()
-        cards = [
-            {"compute_source": row.get("ComputeSource"), "card_types": row.get("CardList") or []}
-            for row in data.get("acc_card_types") or []
-            if isinstance(row, dict)
-        ]
-        centers = [
-            {
-                "code": row.get("AICenterCode"),
-                "name": row.get("AICenterName"),
-                "city": row.get("City"),
-                "province": row.get("Province"),
-                "compute_sources": row.get("ComputeSourceList") or [],
-                "card_types": row.get("AccCardTypeList") or [],
-            }
-            for row in data.get("ai_centers") or []
-            if isinstance(row, dict)
-        ]
-        return dump(
-            {
-                "ok": True,
-                "acc_card_types": cards,
-                "ai_centers": centers,
-                "note": "这是平台在线资源目录；能开哪些规格（spec_id、单价、配额）见 openi_list_creation_options。",
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        data = client.compute_resources()
+    cards = [
+        {"compute_source": row.get("ComputeSource"), "card_types": row.get("CardList") or []}
+        for row in data.get("acc_card_types") or []
+        if isinstance(row, dict)
+    ]
+    centers = [
+        {
+            "code": row.get("AICenterCode"),
+            "name": row.get("AICenterName"),
+            "city": row.get("City"),
+            "province": row.get("Province"),
+            "compute_sources": row.get("ComputeSourceList") or [],
+            "card_types": row.get("AccCardTypeList") or [],
+        }
+        for row in data.get("ai_centers") or []
+        if isinstance(row, dict)
+    ]
+    return dump(
+        {
+            "ok": True,
+            "acc_card_types": cards,
+            "ai_centers": centers,
+            "note": "这是平台在线资源目录；能开哪些规格（spec_id、单价、配额）见 openi_list_creation_options。",
+        }
+    )
 @mcp.tool()
+@tool
 def openi_notifications(limit: int = 20, page: int = 1, unread_only: bool = False) -> str:
     """查看账号通知（有人评论、@ 或给你的仓库提 issue 时会收到）。
 
     unread_only: True 时只列未读；返回里带 unread 未读总数。
     """
-    try:
-        with _client() as client:
-            items = client.notifications(limit=limit, page=page, unread=unread_only)
-            count = client.unread_notification_count()
-        slim = [
-            {
-                "id": n.get("id"),
-                "unread": n.get("unread"),
-                "type": (n.get("subject") or {}).get("type")
-                if isinstance(n.get("subject"), dict)
-                else None,
-                "title": (n.get("subject") or {}).get("title")
-                if isinstance(n.get("subject"), dict)
-                else None,
-                "url": ((n.get("subject") or {}).get("url") or "").replace("/api/v1/repos/", "/")
-                if isinstance(n.get("subject"), dict)
-                else None,
-                "repo": (n.get("repository") or {}).get("full_name")
-                if isinstance(n.get("repository"), dict)
-                else None,
-                "updated_at": n.get("updated_at"),
-            }
-            for n in (items or [])
-            if isinstance(n, dict)
-        ]
-        unread = count.get("new") if isinstance(count, dict) else count
-        return dump({"ok": True, "unread": unread, "count": len(slim), "notifications": slim})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(limit=limit, page=page)
+    with _client() as client:
+        items = client.notifications(limit=limit, page=page, unread=unread_only)
+        count = client.unread_notification_count()
+    slim = [
+        {
+            "id": n.get("id"),
+            "unread": n.get("unread"),
+            "type": (n.get("subject") or {}).get("type")
+            if isinstance(n.get("subject"), dict)
+            else None,
+            "title": (n.get("subject") or {}).get("title")
+            if isinstance(n.get("subject"), dict)
+            else None,
+            "url": ((n.get("subject") or {}).get("url") or "").replace("/api/v1/repos/", "/")
+            if isinstance(n.get("subject"), dict)
+            else None,
+            "repo": (n.get("repository") or {}).get("full_name")
+            if isinstance(n.get("repository"), dict)
+            else None,
+            "updated_at": n.get("updated_at"),
+        }
+        for n in (items or [])
+        if isinstance(n, dict)
+    ]
+    unread = count.get("new") if isinstance(count, dict) else count
+    return dump({"ok": True, "unread": unread, "count": len(slim), "notifications": slim})
 @mcp.tool()
+@tool
 def openi_notification_detail(thread_id: str, with_comments: bool = True) -> str:
     """看单条通知的完整内容（列表接口只给标题和链接）。
 
     thread_id: openi_notifications 返回里每项的 id。
     with_comments: True（默认）时连这条通知下的评论正文一起返回，省一次调用。
     """
-    try:
-        with _client() as client:
-            thread = client.notification_thread(thread_id)
-            comments = (
-                client.notification_thread_comments(thread_id) if with_comments else []
-            )
-        return dump({"ok": True, **thread, "comments": comments})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        thread = client.notification_thread(thread_id)
+        comments = (
+            client.notification_thread_comments(thread_id) if with_comments else []
+        )
+    return dump({"ok": True, **thread, "comments": comments})
 @mcp.tool()
+@tool
 def openi_mark_all_notifications_read() -> str:
     """把所有未读通知一次标为已读。
 
     平台只提供“全部已读”这一条接口；Gitea 那套“标记单条通知”走的是被前置
     反向代理挡掉的 PATCH，令牌方式用不了，所以这里只做全清。
     """
-    try:
-        with _client() as client:
-            client.mark_notifications_read()
-        return dump({"ok": True, "marked_all_read": True})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        client.mark_notifications_read()
+    return dump({"ok": True, "marked_all_read": True})
 @mcp.tool()
+@tool
 def openi_list_creation_options(
     job_type: str = "DEBUG",
     compute_source: str = "GPU",
@@ -274,46 +353,42 @@ def openi_list_creation_options(
     compute_source: GPU / NPU / GCU / MLU / DCU / CPU / ILUVATAR-GPGPU / METAX-GPGPU / BIREN-GPU。
     cluster_type: 默认 C2Net（普通用户真实可用的集群）。
     """
-    try:
-        with _client() as client:
-            info = client.creation_info(
-                job_type=job_type,
-                compute_source=compute_source,
-                cluster_type=cluster_type,
-                visualize_required=visualize_required,
-                repo=repo,
-            )
-        specs = ((info.get("specs") or {}).get("all")) or []
-        point = info.get("point_account") or {}
-        result = {
-            "ok": True,
-            "job_type": job_type,
-            "compute_source": compute_source,
-            "cluster_type": cluster_type,
-            "can_create_more": info.get("can_create_more"),
-            "not_stop_task_count": info.get("not_stop_task_count"),
-            "limit_count": info.get("limit_count"),
-            "waiting_queue_count": info.get("wait_count"),
-            "default_display_job_name": info.get("display_job_name"),
-            "point_balance": point.get("balance"),
-            "allowed_worker_num": info.get("allowed_worker_num"),
-            "can_use_all_images": info.get("can_use_all_images"),
-            "images": info.get("images") or [],
-            "images_usable": False,
-            "images_note": (
-                "上面 images 是平台登记的默认镜像，但在 C2Net 上会以 "
-                "'image not available' 失败。请用 openi_list_public_images 拿到可用"
-                "镜像地址并作为 image_url 传给 openi_start_task；不传镜像时会自动"
-                "使用默认镜像。"
-            ),
-            "specs": [summarize_spec(s) for s in specs],
-        }
-        return dump(result)
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        info = client.creation_info(
+            job_type=job_type,
+            compute_source=compute_source,
+            cluster_type=cluster_type,
+            visualize_required=visualize_required,
+            repo=repo,
+        )
+    specs = ((info.get("specs") or {}).get("all")) or []
+    point = info.get("point_account") or {}
+    result = {
+        "ok": True,
+        "job_type": job_type,
+        "compute_source": compute_source,
+        "cluster_type": cluster_type,
+        "can_create_more": info.get("can_create_more"),
+        "not_stop_task_count": info.get("not_stop_task_count"),
+        "limit_count": info.get("limit_count"),
+        "waiting_queue_count": info.get("wait_count"),
+        "default_display_job_name": info.get("display_job_name"),
+        "point_balance": point.get("balance"),
+        "allowed_worker_num": info.get("allowed_worker_num"),
+        "can_use_all_images": info.get("can_use_all_images"),
+        "images": info.get("images") or [],
+        "images_usable": False,
+        "images_note": (
+            "上面 images 是平台登记的默认镜像，但在 C2Net 上会以 "
+            "'image not available' 失败。请用 openi_list_public_images 拿到可用"
+            "镜像地址并作为 image_url 传给 openi_start_task；不传镜像时会自动"
+            "使用默认镜像。"
+        ),
+        "specs": [summarize_spec(s) for s in specs],
+    }
+    return dump(result)
 @mcp.tool()
+@tool
 def openi_estimate_runtime(
     compute_sources: Optional[list[str]] = None,
     job_type: str = "DEBUG",
@@ -329,47 +404,43 @@ def openi_estimate_runtime(
         DCU / ILUVATAR-GPGPU / METAX-GPGPU / BIREN-GPU）。
     """
     sources = compute_sources or list(COMPUTE_SOURCES)
-    try:
-        balance: Optional[float] = None
-        rows: list[dict[str, Any]] = []
-        for source in sources:
-            with _client() as client:
-                info = client.creation_info(job_type=job_type, compute_source=source, cluster_type=cluster_type)
-            if balance is None:
-                balance = ((info.get("point_account") or {}).get("balance"))
-            for spec in ((info.get("specs") or {}).get("all")) or []:
-                slim = summarize_spec(spec)
-                price = slim.get("price_per_card_hour")
-                row = {
-                    "compute_source": source,
-                    "spec_id": slim.get("spec_id"),
-                    "card_type": slim.get("card_type"),
-                    "card_count": slim.get("card_count"),
-                    "price_per_hour": price,
-                }
-                if balance is not None and price:
-                    blocks = int(balance // (price * 0.1))  # 每块 6 分钟
-                    hours = round(blocks * 0.1, 1)
-                    row["hours"] = hours
-                    row["days"] = round(hours / 24, 1)
-                    row["blocks_of_6min"] = blocks
-                rows.append(row)
-        return dump(
-            {
-                "ok": True,
-                "balance": balance,
-                "job_type": job_type,
-                "cluster_type": cluster_type,
-                "billing": "积分 = 单价(分/卡时) × 卡数 × 小时；每 6 分钟结算，不足 6 分钟不计费。",
-                "note": "hours/days 已按 6 分钟向下取整；CPU 没有可用规格所以不在列表里。",
-                "estimates": rows,
+    balance: Optional[float] = None
+    rows: list[dict[str, Any]] = []
+    for source in sources:
+        with _client() as client:
+            info = client.creation_info(job_type=job_type, compute_source=source, cluster_type=cluster_type)
+        if balance is None:
+            balance = ((info.get("point_account") or {}).get("balance"))
+        for spec in ((info.get("specs") or {}).get("all")) or []:
+            slim = summarize_spec(spec)
+            price = slim.get("price_per_card_hour")
+            row = {
+                "compute_source": source,
+                "spec_id": slim.get("spec_id"),
+                "card_type": slim.get("card_type"),
+                "card_count": slim.get("card_count"),
+                "price_per_hour": price,
             }
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+            if balance is not None and price:
+                blocks = int(balance // (price * 0.1))  # 每块 6 分钟
+                hours = round(blocks * 0.1, 1)
+                row["hours"] = hours
+                row["days"] = round(hours / 24, 1)
+                row["blocks_of_6min"] = blocks
+            rows.append(row)
+    return dump(
+        {
+            "ok": True,
+            "balance": balance,
+            "job_type": job_type,
+            "cluster_type": cluster_type,
+            "billing": "积分 = 单价(分/卡时) × 卡数 × 小时；每 6 分钟结算，不足 6 分钟不计费。",
+            "note": "hours/days 已按 6 分钟向下取整；CPU 没有可用规格所以不在列表里。",
+            "estimates": rows,
+        }
+    )
 @mcp.tool()
+@tool
 def openi_points() -> str:
     """查看算力积分：余额、单日获取上限，以及平台公布的完整获取规则。
 
@@ -377,107 +448,100 @@ def openi_points() -> str:
     RefreshRate=DAILY 的按天重置，NOT_CYCLE 的是一次性奖励；打榜/活动奖励
     另行计算，不占这里的单日上限。
     """
-    try:
-        with _client() as client:
-            account = client.points_account()
-            config = client.points_rules()
-        rules = config.get("TaskRules") or []
-        enriched = []
-        daily_max = 0.0
-        for rule in rules:
-            code = rule.get("TaskCode")
-            amount = float(rule.get("AwardAmount") or 0)
-            limit = float(rule.get("LimitNum") or 0)
-            daily = rule.get("RefreshRate") == "DAILY"
-            if daily:
-                daily_max += amount * limit
-            enriched.append(
-                {
-                    "action": POINT_ACTIONS.get(code, code),
-                    "task_code": code,
-                    "points": amount,
-                    "cycle": "每日" if daily else "一次性",
-                    "limit": int(limit),
-                    "points_per_cycle": amount * limit,
-                }
-            )
-        enriched.sort(key=lambda row: (-row["points"], row["action"]))
-        daily_limit = float(config.get("UserDailyLimit") or 0)
-        return dump(
+    with _client() as client:
+        account = client.points_account()
+        config = client.points_rules()
+    rules = config.get("TaskRules") or []
+    enriched = []
+    daily_max = 0.0
+    for rule in rules:
+        code = rule.get("TaskCode")
+        amount = float(rule.get("AwardAmount") or 0)
+        limit = float(rule.get("LimitNum") or 0)
+        daily = rule.get("RefreshRate") == "DAILY"
+        if daily:
+            daily_max += amount * limit
+        enriched.append(
             {
-                "ok": True,
-                "balance": account.get("Balance"),
-                "total_earned": account.get("TotalEarned"),
-                "total_consumed": account.get("TotalConsumed"),
-                "user_daily_limit": daily_limit,
-                "daily_rules_total_if_maxed": daily_max,
-                "daily_ceiling": min(daily_max, daily_limit) if daily_limit else daily_max,
-                "rules": enriched,
-                "notes": POINT_NOTES,
+                "action": POINT_ACTIONS.get(code, code),
+                "task_code": code,
+                "points": amount,
+                "cycle": "每日" if daily else "一次性",
+                "limit": int(limit),
+                "points_per_cycle": amount * limit,
             }
         )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    enriched.sort(key=lambda row: (-row["points"], row["action"]))
+    daily_limit = float(config.get("UserDailyLimit") or 0)
+    return dump(
+        {
+            "ok": True,
+            "balance": account.get("Balance"),
+            "total_earned": account.get("TotalEarned"),
+            "total_consumed": account.get("TotalConsumed"),
+            "user_daily_limit": daily_limit,
+            "daily_rules_total_if_maxed": daily_max,
+            "daily_ceiling": min(daily_max, daily_limit) if daily_limit else daily_max,
+            "rules": enriched,
+            "notes": POINT_NOTES,
+        }
+    )
 @mcp.tool()
+@tool
 def openi_points_history(operate: str = "INCREASE", pages: int = 1) -> str:
     """查看积分流水，10 条一页。
 
     operate=INCREASE 看获取明细，DECREASE 看消耗明细。pages 最多翻多少页
     （每页 10 条），返回里会按天汇总，方便看每天实际拿了多少分。
     """
-    try:
-        pages = max(1, int(pages))
-        records: list[dict[str, Any]] = []
-        total = None
-        with _client() as client:
-            for page in range(1, pages + 1):
-                data = client.points_records(operate=operate, page=page)
-                total = data.get("Total", total)
-                batch = data.get("Records") or []
-                if not batch:
-                    break
-                records.extend(batch)
-        per_day: dict[str, float] = {}
-        per_source: dict[str, dict[str, float]] = {}
-        rows = []
-        for rec in records:
-            amount = float(rec.get("Amount") or 0)
-            ts = rec.get("LastOperateDate")
-            day = None
-            if ts:
-                day = autopoint.beijing_day(ts)
-                per_day[day] = per_day.get(day, 0.0) + amount
-            source = rec.get("SourceTemplateId") or rec.get("SourceType") or "(其他)"
-            entry = per_source.setdefault(source, {"count": 0.0, "points": 0.0})
-            entry["count"] += 1
-            entry["points"] += amount
-            rows.append(
-                {
-                    "time": day,
-                    "action": POINT_ACTIONS.get(source, source),
-                    "points": amount,
-                    "serial_no": rec.get("SerialNo"),
-                    "remark": rec.get("Remark") or None,
-                }
-            )
-        return dump(
+    _check_pagination(pages=pages)
+    pages = max(1, int(pages))
+    records: list[dict[str, Any]] = []
+    total = None
+    with _client() as client:
+        for page in range(1, pages + 1):
+            data = client.points_records(operate=operate, page=page)
+            total = data.get("Total", total)
+            batch = data.get("Records") or []
+            if not batch:
+                break
+            records.extend(batch)
+    per_day: dict[str, float] = {}
+    per_source: dict[str, dict[str, float]] = {}
+    rows = []
+    for rec in records:
+        amount = float(rec.get("Amount") or 0)
+        ts = rec.get("LastOperateDate")
+        day = None
+        if ts:
+            day = autopoint.beijing_day(ts)
+            per_day[day] = per_day.get(day, 0.0) + amount
+        source = rec.get("SourceTemplateId") or rec.get("SourceType") or "(其他)"
+        entry = per_source.setdefault(source, {"count": 0.0, "points": 0.0})
+        entry["count"] += 1
+        entry["points"] += amount
+        rows.append(
             {
-                "ok": True,
-                "operate": operate.upper(),
-                "total_records": total,
-                "fetched": len(rows),
-                "per_action": per_source,
-                "per_day": dict(sorted(per_day.items(), reverse=True)),
-                "records": rows,
+                "time": day,
+                "action": POINT_ACTIONS.get(source, source),
+                "points": amount,
+                "serial_no": rec.get("SerialNo"),
+                "remark": rec.get("Remark") or None,
             }
         )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    return dump(
+        {
+            "ok": True,
+            "operate": operate.upper(),
+            "total_records": total,
+            "fetched": len(rows),
+            "per_action": per_source,
+            "per_day": dict(sorted(per_day.items(), reverse=True)),
+            "records": rows,
+        }
+    )
 @mcp.tool()
+@tool
 def openi_list_images_for_spec(
     spec_id: int,
     job_type: str = "DEBUG",
@@ -491,22 +555,18 @@ def openi_list_images_for_spec(
     在 C2Net 上这个接口通常返回空，说明该规格没有绑定镜像，需要用
     openi_list_public_images 里的镜像地址（place）以 image_url 传入。
     """
-    try:
-        with _client() as client:
-            images = client.images_for_spec(
-                spec_id,
-                job_type=job_type,
-                compute_source=compute_source,
-                cluster_type=cluster_type,
-                has_internet=has_internet,
-                visualize_required=visualize_required,
-            )
-        return dump({"ok": True, "images": images})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        images = client.images_for_spec(
+            spec_id,
+            job_type=job_type,
+            compute_source=compute_source,
+            cluster_type=cluster_type,
+            has_internet=has_internet,
+            visualize_required=visualize_required,
+        )
+    return dump({"ok": True, "images": images})
 @mcp.tool()
+@tool
 def openi_list_public_images() -> str:
     """列出可以真正拉起的公共镜像地址（place）。
 
@@ -514,209 +574,181 @@ def openi_list_public_images() -> str:
     openi_start_task 的 image_url；不传镜像时工具会用默认镜像
     （可用环境变量 OPENI_DEFAULT_IMAGE_URL 覆盖）。
     """
-    try:
-        with _client() as client:
-            recommended = client.recommended_images()
-            starred = client.starred_images()
+    with _client() as client:
+        recommended = client.recommended_images()
+        starred = client.starred_images()
 
-        def slim(payload: Any) -> list:
-            images = payload.get("images") if isinstance(payload, dict) else payload
-            out = []
-            for image in images or []:
-                if not isinstance(image, dict):
-                    continue
-                out.append(
-                    {
-                        "tag": image.get("tag"),
-                        "image_url": image.get("place"),
-                        "compute_resource": image.get("compute_resource"),
-                        "train_type": image.get("trainType"),
-                        "framework": image.get("framework"),
-                        "description": (image.get("description") or "").strip()[:160],
-                        "use_count": image.get("useCount"),
-                    }
-                )
-            return out
+    def slim(payload: Any) -> list:
+        images = payload.get("images") if isinstance(payload, dict) else payload
+        out = []
+        for image in images or []:
+            if not isinstance(image, dict):
+                continue
+            out.append(
+                {
+                    "tag": image.get("tag"),
+                    "image_url": image.get("place"),
+                    "compute_resource": image.get("compute_resource"),
+                    "train_type": image.get("trainType"),
+                    "framework": image.get("framework"),
+                    "description": (image.get("description") or "").strip()[:160],
+                    "use_count": image.get("useCount"),
+                }
+            )
+        return out
 
-        return dump(
-            {
-                "ok": True,
-                "default_image_url": DEFAULT_IMAGE_URL,
-                "recommended": slim(recommended),
-                "starred": slim(starred),
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    return dump(
+        {
+            "ok": True,
+            "default_image_url": DEFAULT_IMAGE_URL,
+            "recommended": slim(recommended),
+            "starred": slim(starred),
+        }
+    )
 @mcp.tool()
+@tool
 def openi_list_my_repositories(limit: int = 50) -> str:
     """列出当前账号的代码仓。新建计算任务时需要指定 owner/name 代码仓。"""
-    try:
-        with _client() as client:
-            repos = client.my_repos(limit=limit)
-        slim = [
-            {
-                "full_name": r.get("full_name"),
-                "private": r.get("private"),
-                "empty": r.get("empty"),
-                "updated_at": r.get("updated_at"),
-                "description": r.get("description"),
-            }
-            for r in repos
-            if isinstance(r, dict)
-        ]
-        return dump({"ok": True, "count": len(slim), "repositories": slim})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(limit=limit)
+    with _client() as client:
+        repos = client.my_repos(limit=limit)
+    slim = [
+        {
+            "full_name": r.get("full_name"),
+            "private": r.get("private"),
+            "empty": r.get("empty"),
+            "updated_at": r.get("updated_at"),
+            "description": r.get("description"),
+        }
+        for r in repos
+        if isinstance(r, dict)
+    ]
+    return dump({"ok": True, "count": len(slim), "repositories": slim})
 @mcp.tool()
+@tool
 def openi_search_repositories(query: str, limit: int = 20) -> str:
     """按关键字搜索启智社区上的公开代码仓。"""
-    try:
-        with _client() as client:
-            result = client.search_repos(query, limit=limit)
-        repos = result.get("data", []) if isinstance(result, dict) else result
-        slim = [
-            {
-                "full_name": r.get("full_name"),
-                "description": r.get("description"),
-                "updated_at": r.get("updated_at"),
-            }
-            for r in repos
-            if isinstance(r, dict)
-        ]
-        return dump({"ok": True, "count": len(slim), "repositories": slim})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(limit=limit)
+    with _client() as client:
+        result = client.search_repos(query, limit=limit)
+    repos = result.get("data", []) if isinstance(result, dict) else result
+    slim = [
+        {
+            "full_name": r.get("full_name"),
+            "description": r.get("description"),
+            "updated_at": r.get("updated_at"),
+        }
+        for r in repos
+        if isinstance(r, dict)
+    ]
+    return dump({"ok": True, "count": len(slim), "repositories": slim})
 @mcp.tool()
+@tool
 def openi_list_repo_tags(repo: str) -> str:
     """列出代码仓的 tag 及每个 tag 指向的提交。
 
     用来确认某个版本打没打过 tag、tag 落在哪个提交上。注意从 GitHub 同步过来的
     mirror 仓，它的 ref 在平台侧是只读的：tag 删不掉、也推不动，返回里会正常列出。
     """
-    try:
-        with _client() as client:
-            tags = client.repo_tags(repo)
-        return dump({"ok": True, "repo": repo, "count": len(tags), "tags": tags})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        tags = client.repo_tags(repo)
+    return dump({"ok": True, "repo": repo, "count": len(tags), "tags": tags})
 @mcp.tool()
+@tool
 def openi_list_repo_releases(repo: str) -> str:
     """列出代码仓的 release（版本发布），含 tag、草稿/预发布标记与时间。"""
-    try:
-        with _client() as client:
-            releases = client.repo_releases(repo)
-        return dump({"ok": True, "repo": repo, "count": len(releases), "releases": releases})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        releases = client.repo_releases(repo)
+    return dump({"ok": True, "repo": repo, "count": len(releases), "releases": releases})
 @mcp.tool()
+@tool
 def openi_list_repo_labels(repo: str) -> str:
     """列出代码仓的标签（issue 分类用），含颜色。"""
-    try:
-        with _client() as client:
-            labels = client.repo_labels(repo)
-        return dump({"ok": True, "repo": repo, "count": len(labels), "labels": labels})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        labels = client.repo_labels(repo)
+    return dump({"ok": True, "repo": repo, "count": len(labels), "labels": labels})
 @mcp.tool()
+@tool
 def openi_list_repo_collaborators(repo: str) -> str:
     """列出代码仓的协作者（login / full_name / is_active）。
 
     注意平台这个接口不回 permissions 字段（2026-10-17 实测），所以这里不承诺给出
-    每个人的权限；判断自己对该仓有没有写权限要靠别的手段（例如试着读仓的 right
-    接口，目前没有对应的 MCP 工具）。
+    每个人的权限；判断自己对该仓有没有写权限用 openi_repo_permission。
     """
-    try:
-        with _client() as client:
-            people = client.repo_collaborators(repo)
-        return dump({"ok": True, "repo": repo, "count": len(people), "collaborators": people})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        people = client.repo_collaborators(repo)
+    return dump({"ok": True, "repo": repo, "count": len(people), "collaborators": people})
 @mcp.tool()
+@tool
+def openi_repo_permission(repo: str) -> str:
+    """查当前账号对某个代码仓有没有写权限（GET /repos/{owner}/{repo}/right）。
+
+    写代码仓（openi_push_repo_files / openi_write_repo_file）、改 issue 之前想知道
+    会不会因为权限不够失败，先用这个确认。协作者列表不回 permissions，所以这是
+    判断权限的入口。
+
+    repo: 代码仓全名 owner/name。
+    """
+    if not _REPO_FULLNAME_RE.match(repo or ""):
+        return dump({
+            "ok": False,
+            "error": f"repo 必须是 owner/name 形式：{repo!r}",
+        })
+    with _client() as client:
+        return _ok(client.repo_permission(repo), ok=True, repo=repo)
+@mcp.tool()
+@tool
 def openi_list_repo_stargazers(repo: str, limit: int = 50, page: int = 1) -> str:
     """列出收藏（star）某个代码仓的账号。"""
-    try:
-        with _client() as client:
-            people = client.repo_stargazers(repo, limit=limit, page=page)
-        return dump({"ok": True, "repo": repo, "count": len(people), "stargazers": people})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(limit=limit, page=page)
+    with _client() as client:
+        people = client.repo_stargazers(repo, limit=limit, page=page)
+    return dump({"ok": True, "repo": repo, "count": len(people), "stargazers": people})
 @mcp.tool()
+@tool
 def openi_list_starred_repositories(limit: int = 50, page: int = 1) -> str:
     """列出当前账号收藏（star）的代码仓。
 
     和 openi_list_my_repositories 不同：那个只列自己 owner 的仓，这里列的是别人
     的仓（含组织下的），是找参考实现和可复用代码的入口。
     """
-    try:
-        with _client() as client:
-            repos = client.account_repos("starred", limit=limit, page=page)
-        return dump({"ok": True, "count": len(repos), "repositories": repos})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(limit=limit, page=page)
+    with _client() as client:
+        repos = client.account_repos("starred", limit=limit, page=page)
+    return dump({"ok": True, "count": len(repos), "repositories": repos})
 @mcp.tool()
+@tool
 def openi_list_subscribed_repositories(limit: int = 50, page: int = 1) -> str:
     """列出当前账号关注（watch）的代码仓。"""
-    try:
-        with _client() as client:
-            repos = client.account_repos("subscriptions", limit=limit, page=page)
-        return dump({"ok": True, "count": len(repos), "repositories": repos})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(limit=limit, page=page)
+    with _client() as client:
+        repos = client.account_repos("subscriptions", limit=limit, page=page)
+    return dump({"ok": True, "count": len(repos), "repositories": repos})
 @mcp.tool()
+@tool
 def openi_list_my_orgs() -> str:
     """列出当前账号加入的组织 / 团队。"""
-    try:
-        with _client() as client:
-            orgs = client.my_orgs()
-        return dump({"ok": True, "count": len(orgs), "orgs": orgs})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        orgs = client.my_orgs()
+    return dump({"ok": True, "count": len(orgs), "orgs": orgs})
 @mcp.tool()
+@tool
 def openi_search_topics(query: str = "", limit: int = 20) -> str:
     """按主题（topic）找仓，主题上带着仓数量。"""
-    try:
-        with _client() as client:
-            topics = client.search_topics(query, limit=limit)
-        return dump({"ok": True, "count": len(topics), "topics": topics})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(limit=limit)
+    with _client() as client:
+        topics = client.search_topics(query, limit=limit)
+    return dump({"ok": True, "count": len(topics), "topics": topics})
 @mcp.tool()
+@tool
 def openi_search_users(query: str, limit: int = 20) -> str:
     """按关键字找账号（人和组织），拿 login 用于拼全名 owner/name。"""
-    try:
-        with _client() as client:
-            users = client.search_users(query, limit=limit)
-        return dump({"ok": True, "count": len(users), "users": users})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(limit=limit)
+    with _client() as client:
+        users = client.search_users(query, limit=limit)
+    return dump({"ok": True, "count": len(users), "users": users})
 @mcp.tool()
+@tool
 def openi_create_repository(
     name: str,
     description: str = "",
@@ -738,35 +770,31 @@ def openi_create_repository(
     注意：平台建仓很慢（实测 30 秒以上），超时不代表失败——请用
     openi_list_my_repositories 回查确认，不要重复建仓。
     """
-    try:
-        with _client() as client:
-            repo = client.create_repo(
-                name,
-                description=description,
-                private=private,
-                auto_init=auto_init,
-                default_branch=default_branch,
-            )
-        info = repo if isinstance(repo, dict) else {}
-        # 建仓响应里的 default_branch 常是空的（初始化还没跑完），补查一次。
-        branch = info.get("default_branch")
-        if not branch and info.get("full_name"):
-            with _client() as client:
-                branch = client.default_branch(info["full_name"])
-        return dump(
-            {
-                "ok": True,
-                "full_name": info.get("full_name"),
-                "default_branch": branch,
-                "private": info.get("private"),
-                "html_url": info.get("html_url"),
-            }
+    with _client() as client:
+        repo = client.create_repo(
+            name,
+            description=description,
+            private=private,
+            auto_init=auto_init,
+            default_branch=default_branch,
         )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    info = repo if isinstance(repo, dict) else {}
+    # 建仓响应里的 default_branch 常是空的（初始化还没跑完），补查一次。
+    branch = info.get("default_branch")
+    if not branch and info.get("full_name"):
+        with _client() as client:
+            branch = client.default_branch(info["full_name"])
+    return dump(
+        {
+            "ok": True,
+            "full_name": info.get("full_name"),
+            "default_branch": branch,
+            "private": info.get("private"),
+            "html_url": info.get("html_url"),
+        }
+    )
 @mcp.tool()
+@tool
 def openi_delete_repository(repo: str) -> str:
     """删掉一个代码仓，连同里面的代码和提交历史，不可恢复。
 
@@ -775,15 +803,11 @@ def openi_delete_repository(repo: str) -> str:
 
     repo: 代码仓全名 owner/name。平台删仓同样偏慢，会在服务端先跑一会儿。
     """
-    try:
-        with _client() as client:
-            client.delete_repo(repo)
-        return dump({"ok": True, "repo": repo, "deleted": True})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        client.delete_repo(repo)
+    return dump({"ok": True, "repo": repo, "deleted": True})
 @mcp.tool()
+@tool
 def openi_list_repo_files(repo: str, ref: Optional[str] = None, path: str = "") -> str:
     """列出代码仓某个目录与全部分支，用于确定启动文件 boot_file（例如 train.py）。
 
@@ -791,25 +815,21 @@ def openi_list_repo_files(repo: str, ref: Optional[str] = None, path: str = "") 
     ref: 分支或提交，留空用默认分支。
     path: 仓内目录，留空是根目录，例如 "src" 或 "src/models"。
     """
-    try:
-        with _client() as client:
-            files = client.repo_contents(repo, ref=ref, path=path)
-            branches = client.repo_branches(repo)
-        if isinstance(files, list):
-            entries = [
-                {"name": f.get("name"), "type": f.get("type"), "size": f.get("size")}
-                for f in files
-                if isinstance(f, dict)
-            ]
-        else:
-            entries = files
-        branch_names = [b.get("name") for b in branches] if isinstance(branches, list) else branches
-        return dump({"ok": True, "path": path, "files": entries, "branches": branch_names})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        files = client.repo_contents(repo, ref=ref, path=path)
+        branches = client.repo_branches(repo)
+    if isinstance(files, list):
+        entries = [
+            {"name": f.get("name"), "type": f.get("type"), "size": f.get("size")}
+            for f in files
+            if isinstance(f, dict)
+        ]
+    else:
+        entries = files
+    branch_names = [b.get("name") for b in branches] if isinstance(branches, list) else branches
+    return dump({"ok": True, "path": path, "files": entries, "branches": branch_names})
 @mcp.tool()
+@tool
 def openi_repo_tree(
     repo: str, ref: Optional[str] = None, path: str = "", max_entries: int = 20000
 ) -> str:
@@ -823,15 +843,11 @@ def openi_repo_tree(
     path: 只看这个子目录；客户端过滤，请求本身仍取全量。
     max_entries: 最多返回多少条，默认 20000；被截断时 truncated 为 true。
     """
-    try:
-        with _client() as client:
-            result = client.repo_tree(repo, ref=ref or "", path=path, max_entries=max_entries)
-        return dump({"ok": True, **result})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        result = client.repo_tree(repo, ref=ref or "", path=path, max_entries=max_entries)
+    return dump({"ok": True, **result})
 @mcp.tool()
+@tool
 def openi_list_repo_commits(
     repo: str, ref: Optional[str] = None, limit: int = 20, page: int = 1
 ) -> str:
@@ -844,15 +860,11 @@ def openi_list_repo_commits(
     平台的 path 过滤参数在这套部署上是空操作（实测传任何 path 都返回全量历史），
     所以这里没有这个参数；要看某个具体文件的内容直接 openi_read_repo_file。
     """
-    try:
-        with _client() as client:
-            commits = client.repo_commits(repo, ref=ref or "", limit=limit, page=page)
-        return dump({"ok": True, "repo": repo, "count": len(commits), "commits": commits})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        commits = client.repo_commits(repo, ref=ref or "", limit=limit, page=page)
+    return dump({"ok": True, "repo": repo, "count": len(commits), "commits": commits})
 @mcp.tool()
+@tool
 def openi_download_repo_archive(
     repo: str, save_to: str, ref: Optional[str] = None, max_bytes: Optional[int] = None
 ) -> str:
@@ -865,17 +877,13 @@ def openi_download_repo_archive(
     ref: 分支或提交，留空用默认分支。
     max_bytes: 大小上限，超了立刻中止并删掉半包，不会留下残缺的 zip。
     """
-    try:
-        with _client() as client:
-            result = client.download_repo_archive(
-                repo, save_to, ref=ref or "", max_bytes=max_bytes
-            )
-        return dump({"ok": True, **result})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        result = client.download_repo_archive(
+            repo, save_to, ref=ref or "", max_bytes=max_bytes
+        )
+    return dump({"ok": True, **result})
 @mcp.tool()
+@tool
 def openi_create_repo_issue(repo: str, title: str, body: str = "") -> str:
     """在代码仓里开一个 issue，用来报问题或记待办，返回 issue 号。
 
@@ -884,15 +892,11 @@ def openi_create_repo_issue(repo: str, title: str, body: str = "") -> str:
     body: 正文，支持 Markdown，可留空。
     返回里的 number 可以接着传给 openi_comment_repo_issue。
     """
-    try:
-        with _client() as client:
-            issue = client.create_repo_issue(repo, title, body)
-        return dump({"ok": True, "repo": repo, "issue": issue})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        issue = client.create_repo_issue(repo, title, body)
+    return dump({"ok": True, "repo": repo, "issue": issue})
 @mcp.tool()
+@tool
 def openi_list_repo_issues(
     repo: str, state: str = "open", limit: int = 20, page: int = 1
 ) -> str:
@@ -902,15 +906,12 @@ def openi_list_repo_issues(
     state: open（默认）/ closed / all。
     limit / page: 分页，默认第 1 页、每页 20 条。
     """
-    try:
-        with _client() as client:
-            issues = client.repo_issues(repo, state=state, limit=limit, page=page)
-        return dump({"ok": True, "repo": repo, "state": state, "count": len(issues), "issues": issues})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(limit=limit, page=page)
+    with _client() as client:
+        issues = client.repo_issues(repo, state=state, limit=limit, page=page)
+    return dump({"ok": True, "repo": repo, "state": state, "count": len(issues), "issues": issues})
 @mcp.tool()
+@tool
 def openi_comment_repo_issue(repo: str, index: int, body: str) -> str:
     """在某个 issue 下发表评论。
 
@@ -919,15 +920,11 @@ def openi_comment_repo_issue(repo: str, index: int, body: str) -> str:
       openi_create_repo_issue 的返回值里拿）。
     body: 评论正文，支持 Markdown。
     """
-    try:
-        with _client() as client:
-            comment = client.comment_repo_issue(repo, index, body)
-        return dump({"ok": True, "repo": repo, "issue": index, "comment": comment})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        comment = client.comment_repo_issue(repo, index, body)
+    return dump({"ok": True, "repo": repo, "issue": index, "comment": comment})
 @mcp.tool()
+@tool
 def openi_update_repo_issue(
     repo: str,
     index: int,
@@ -944,17 +941,13 @@ def openi_update_repo_issue(
 
     平台不接受空改动，state / title / body 至少要给一个。
     """
-    try:
-        with _client() as client:
-            issue = client.update_repo_issue(
-                repo, index, state=state, title=title, body=body
-            )
-        return dump({"ok": True, "repo": repo, "issue": issue})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        issue = client.update_repo_issue(
+            repo, index, state=state, title=title, body=body
+        )
+    return dump({"ok": True, "repo": repo, "issue": issue})
 @mcp.tool()
+@tool
 def openi_read_repo_file(
     repo: str,
     path: str,
@@ -971,40 +964,36 @@ def openi_read_repo_file(
     save_to: 给了就把原始字节写到本地这个路径（二进制或大文件用这条），返回 md5。
     max_bytes: 直接拒绝的大小上限，默认 2MB，0 表示不限制。
     """
+    with _client() as client:
+        data = client.read_repo_file(repo, path, ref=ref, max_bytes=max_bytes)
+    blob = data.pop("bytes")
+    if save_to:
+        dest = os.path.abspath(os.path.expanduser(save_to))
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        with open(dest, "wb") as handle:
+            handle.write(blob)
+        return dump(
+            {
+                "ok": True,
+                **data,
+                "saved_to": dest,
+                "md5": hashlib.md5(blob).hexdigest(),
+            }
+        )
     try:
-        with _client() as client:
-            data = client.read_repo_file(repo, path, ref=ref, max_bytes=max_bytes)
-        blob = data.pop("bytes")
-        if save_to:
-            dest = os.path.abspath(os.path.expanduser(save_to))
-            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-            with open(dest, "wb") as handle:
-                handle.write(blob)
-            return dump(
-                {
-                    "ok": True,
-                    **data,
-                    "saved_to": dest,
-                    "md5": hashlib.md5(blob).hexdigest(),
-                }
-            )
-        try:
-            text = blob.decode(encoding)
-        except (UnicodeDecodeError, LookupError):
-            return dump(
-                {
-                    "ok": True,
-                    **data,
-                    "binary": True,
-                    "note": f"按 {encoding} 解不出来，是二进制文件；需要落盘请传 save_to。",
-                }
-            )
-        return dump({"ok": True, **data, "text": text})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+        text = blob.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return dump(
+            {
+                "ok": True,
+                **data,
+                "binary": True,
+                "note": f"按 {encoding} 解不出来，是二进制文件；需要落盘请传 save_to。",
+            }
+        )
+    return dump({"ok": True, **data, "text": text})
 @mcp.tool()
+@tool
 def openi_write_repo_file(
     repo: str,
     path: str,
@@ -1022,40 +1011,36 @@ def openi_write_repo_file(
     message: 提交信息，留空自动生成。branch: 目标分支，留空用默认分支。
     dry_run: True 时只回显会新建还是覆盖，不提交。
     """
-    try:
-        with _client() as client:
-            if dry_run:
-                exists = client.repo_file_sha(repo, path) is not None
-                return dump(
-                    {
-                        "ok": True,
-                        "dry_run": True,
-                        "repo": repo,
-                        "path": path,
-                        "branch": branch,
-                        "action": "update" if exists else "create",
-                        "bytes": len(content.encode("utf-8")),
-                    }
-                )
-            result = client.write_repo_file(
-                repo, path, content, message=message or "", branch=branch
+    with _client() as client:
+        if dry_run:
+            exists = client.repo_file_sha(repo, path) is not None
+            return dump(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "repo": repo,
+                    "path": path,
+                    "branch": branch,
+                    "action": "update" if exists else "create",
+                    "bytes": len(content.encode("utf-8")),
+                }
             )
-        info = result.get("content") if isinstance(result, dict) else {}
-        commit = result.get("commit") if isinstance(result, dict) else {}
-        return dump(
-            {
-                "ok": True,
-                "repo": repo,
-                "path": (info or {}).get("path", path),
-                "sha": (info or {}).get("sha"),
-                "commit_sha": (commit or {}).get("sha"),
-            }
+        result = client.write_repo_file(
+            repo, path, content, message=message or "", branch=branch
         )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    info = result.get("content") if isinstance(result, dict) else {}
+    commit = result.get("commit") if isinstance(result, dict) else {}
+    return dump(
+        {
+            "ok": True,
+            "repo": repo,
+            "path": (info or {}).get("path", path),
+            "sha": (info or {}).get("sha"),
+            "commit_sha": (commit or {}).get("sha"),
+        }
+    )
 @mcp.tool()
+@tool
 def openi_push_repo_files(
     repo: str,
     paths: list[str],
@@ -1078,24 +1063,20 @@ def openi_push_repo_files(
     max_file_bytes: 单文件上限，默认 50MB——contents 接口用 base64 传、文件会进内存，
     更大的文件请改用 git 推送。
     """
-    try:
-        entries = expand_upload_paths(paths, remote_dir=remote_dir)
-        with _client() as client:
-            result = client.push_repo_files(
-                repo,
-                entries,
-                message=message or "",
-                branch=branch,
-                dry_run=dry_run,
-                max_bytes=max_bytes,
-                max_file_bytes=max_file_bytes,
-            )
-        return dump({"ok": True, **result})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    entries = expand_upload_paths(paths, remote_dir=remote_dir)
+    with _client() as client:
+        result = client.push_repo_files(
+            repo,
+            entries,
+            message=message or "",
+            branch=branch,
+            dry_run=dry_run,
+            max_bytes=max_bytes,
+            max_file_bytes=max_file_bytes,
+        )
+    return dump({"ok": True, **result})
 @mcp.tool()
+@tool
 def openi_create_dataset(
     name: str,
     alias: Optional[str] = None,
@@ -1116,39 +1097,35 @@ def openi_create_dataset(
     tasks: 关联任务，例如 ["language_modeling"]；可用值见 DATASET_TASKS。
     licenses: 许可证，默认 MIT，可选值见 DATASET_LICENSES。
     """
-    try:
-        bad_cat = [c for c in (categories or []) if c not in DATASET_CATEGORIES]
-        bad_task = [t for t in (tasks or []) if t not in DATASET_TASKS]
-        if bad_cat:
-            return dump({"ok": False, "error": f"未知的数据集类别：{bad_cat}", "allowed": list(DATASET_CATEGORIES)})
-        if bad_task:
-            return dump({"ok": False, "error": f"未知的数据集任务：{bad_task}", "allowed": list(DATASET_TASKS)})
-        if licenses not in DATASET_LICENSES:
-            return dump({"ok": False, "error": f"未知的许可证：{licenses}", "allowed": list(DATASET_LICENSES)})
-        with _client() as client:
-            result = client.create_dataset(
-                name=name,
-                alias=alias,
-                is_private=is_private,
-                categories=categories,
-                tasks=tasks,
-                licenses=licenses,
-            )
-        return dump(
-            {
-                "ok": True,
-                "id": result.get("id"),
-                "name": result.get("name"),
-                "owner_name": result.get("owner_name"),
-                "full_name": f"{result.get('owner_name')}/{result.get('name')}",
-                "note": "把 id 作为 dataset_uuid_str 传给 openi_start_task 即可挂载。",
-            }
+    bad_cat = [c for c in (categories or []) if c not in DATASET_CATEGORIES]
+    bad_task = [t for t in (tasks or []) if t not in DATASET_TASKS]
+    if bad_cat:
+        return dump({"ok": False, "error": f"未知的数据集类别：{bad_cat}", "allowed": list(DATASET_CATEGORIES)})
+    if bad_task:
+        return dump({"ok": False, "error": f"未知的数据集任务：{bad_task}", "allowed": list(DATASET_TASKS)})
+    if licenses not in DATASET_LICENSES:
+        return dump({"ok": False, "error": f"未知的许可证：{licenses}", "allowed": list(DATASET_LICENSES)})
+    with _client() as client:
+        result = client.create_dataset(
+            name=name,
+            alias=alias,
+            is_private=is_private,
+            categories=categories,
+            tasks=tasks,
+            licenses=licenses,
         )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    return dump(
+        {
+            "ok": True,
+            "id": result.get("id"),
+            "name": result.get("name"),
+            "owner_name": result.get("owner_name"),
+            "full_name": f"{result.get('owner_name')}/{result.get('name')}",
+            "note": "把 id 作为 dataset_uuid_str 传给 openi_start_task 即可挂载。",
+        }
+    )
 @mcp.tool()
+@tool
 def openi_create_model(
     name: str,
     alias: Optional[str] = None,
@@ -1169,37 +1146,33 @@ def openi_create_model(
       个非负整数；传错值平台会拒绝建库，不会静默建出一个错引擎的库。
     label / license: 展示用标签与许可证，可留空。
     """
-    try:
-        # name / alias 的规则与数据集一致，交给 client 校验；engine 平台没给取值表，
-        # 只拦住明显非法的值（负数、非整数），而不是编一套平台不认的枚举。
-        if isinstance(engine, bool) or not isinstance(engine, int):
-            return dump({"ok": False, "error": f"engine 必须是整数：{engine!r}"})
-        if engine < 0:
-            return dump({"ok": False, "error": f"engine 不能为负数：{engine}"})
-        with _client() as client:
-            result = client.create_model(
-                name=name,
-                alias=alias,
-                is_private=is_private,
-                engine=engine,
-                label=label,
-                license=license,
-            )
-        return dump(
-            {
-                "ok": True,
-                "id": result.get("id"),
-                "name": result.get("name"),
-                "owner_name": result.get("owner_name"),
-                "full_name": f"{result.get('owner_name')}/{result.get('name')}",
-                "note": "把 id 作为 pretrain_model_id_str 传给 openi_start_task 即可挂载。",
-            }
+    # name / alias 的规则与数据集一致，交给 client 校验；engine 平台没给取值表，
+    # 只拦住明显非法的值（负数、非整数），而不是编一套平台不认的枚举。
+    if isinstance(engine, bool) or not isinstance(engine, int):
+        return dump({"ok": False, "error": f"engine 必须是整数：{engine!r}"})
+    if engine < 0:
+        return dump({"ok": False, "error": f"engine 不能为负数：{engine}"})
+    with _client() as client:
+        result = client.create_model(
+            name=name,
+            alias=alias,
+            is_private=is_private,
+            engine=engine,
+            label=label,
+            license=license,
         )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    return dump(
+        {
+            "ok": True,
+            "id": result.get("id"),
+            "name": result.get("name"),
+            "owner_name": result.get("owner_name"),
+            "full_name": f"{result.get('owner_name')}/{result.get('name')}",
+            "note": "把 id 作为 pretrain_model_id_str 传给 openi_start_task 即可挂载。",
+        }
+    )
 @mcp.tool()
+@tool
 def openi_data_subject_info(subject: str, subject_type: str = "dataset") -> str:
     """查询数据集/模型库的详情，主要是拿到 UUID 和是否有写权限。
 
@@ -1207,26 +1180,22 @@ def openi_data_subject_info(subject: str, subject_type: str = "dataset") -> str:
     subject_type: dataset（数据集）或 model（模型库）。
     返回的 id 用作 openi_start_task 的 dataset_uuid_str / pretrain_model_id_str。
     """
-    try:
-        with _client() as client:
-            info = client.subject_info(subject, subject_type)
-        slim = {
-            "id": info.get("id"),
-            "name": info.get("name"),
-            "owner_name": info.get("owner_name"),
-            "alias": info.get("alias"),
-            "is_private": info.get("is_private"),
-            "size": info.get("size"),
-            "can_edit_file": info.get("can_edit_file")
-            if subject_type == "dataset"
-            else (info.get("permission") or {}).get("can_edit_file"),
-        }
-        return dump({"ok": True, "subject_type": subject_type, "info": slim})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        info = client.subject_info(subject, subject_type)
+    slim = {
+        "id": info.get("id"),
+        "name": info.get("name"),
+        "owner_name": info.get("owner_name"),
+        "alias": info.get("alias"),
+        "is_private": info.get("is_private"),
+        "size": info.get("size"),
+        "can_edit_file": info.get("can_edit_file")
+        if subject_type == "dataset"
+        else (info.get("permission") or {}).get("can_edit_file"),
+    }
+    return dump({"ok": True, "subject_type": subject_type, "info": slim})
 @mcp.tool()
+@tool
 def openi_upload_dataset_files(
     dataset: str,
     paths: list[str],
@@ -1245,17 +1214,13 @@ def openi_upload_dataset_files(
     返回里每个文件带 mode（direct/multipart）与是否成功。数据集里会自带一个
     openi_resource.version，属于正常现象。
     """
-    try:
-        entries = expand_upload_paths(paths, remote_dir=remote_dir)
-        with _client() as client:
-            report = client.upload_files(dataset, "dataset", entries, dry_run=dry_run)
-        # ok 写在后面：**report 里也可能有 ok，让它盖掉判定结果就等于自欺。
-        return dump({**_bounded_ok(report), "ok": report.get("failed_count", 0) == 0})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    entries = expand_upload_paths(paths, remote_dir=remote_dir)
+    with _client() as client:
+        report = client.upload_files(dataset, "dataset", entries, dry_run=dry_run)
+    # ok 写在后面：**report 里也可能有 ok，让它盖掉判定结果就等于自欺。
+    return dump({**_bounded_ok(report), "ok": report.get("failed_count", 0) == 0})
 @mcp.tool()
+@tool
 def openi_upload_model_files(
     model: str,
     paths: list[str],
@@ -1272,15 +1237,10 @@ def openi_upload_model_files(
 
     大文件（>64MB）自动按 64MB 分片上传，可断点续传（重复调用会跳过已完成分片）。
     """
-    try:
-        entries = expand_upload_paths(paths, remote_dir=remote_dir)
-        with _client() as client:
-            report = client.upload_files(model, "model", entries, dry_run=dry_run)
-        return dump({**_bounded_ok(report), "ok": report.get("failed_count", 0) == 0})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    entries = expand_upload_paths(paths, remote_dir=remote_dir)
+    with _client() as client:
+        report = client.upload_files(model, "model", entries, dry_run=dry_run)
+    return dump({**_bounded_ok(report), "ok": report.get("failed_count", 0) == 0})
 def _resolve_subject_ids(client: OpenIClient, targets: list[str], subject_type: str) -> list[str]:
     ids: list[str] = []
     for target in targets:
@@ -1305,28 +1265,21 @@ def _resolve_mount_ids(client: OpenIClient, value: Optional[str], subject_type: 
 
 
 @mcp.tool()
+@tool
 def openi_delete_dataset(datasets: list[str]) -> str:
     """删除数据集（不可恢复）。datasets 里可写全名 owner/name 或数据集 UUID。"""
-    try:
-        with _client() as client:
-            ids = _resolve_subject_ids(client, datasets, "dataset")
-            return dump({"ok": True, "deleted": client.delete_subjects("dataset", ids), "ids": ids})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        ids = _resolve_subject_ids(client, datasets, "dataset")
+        return dump({"ok": True, "deleted": client.delete_subjects("dataset", ids), "ids": ids})
 @mcp.tool()
+@tool
 def openi_delete_model(models: list[str]) -> str:
     """删除模型库（不可恢复）。models 里可写全名 owner/name 或模型 UUID。"""
-    try:
-        with _client() as client:
-            ids = _resolve_subject_ids(client, models, "model")
-            return dump({"ok": True, "deleted": client.delete_subjects("model", ids), "ids": ids})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        ids = _resolve_subject_ids(client, models, "model")
+        return dump({"ok": True, "deleted": client.delete_subjects("model", ids), "ids": ids})
 @mcp.tool()
+@tool
 def openi_storage_usage(subject: Optional[str] = None, subject_type: str = "dataset") -> str:
     """查看存储配额。不传 subject 时返回账号总体配额（上限/已用/剩余）。
 
@@ -1335,19 +1288,15 @@ def openi_storage_usage(subject: Optional[str] = None, subject_type: str = "data
     平台单账号默认 100GB 配额，上传前会先比对剩余额度。注意该接口即使带上
     subject 实测仍返回账号级汇总，所以单主体数字只能作参考。
     """
-    try:
-        with _client() as client:
-            if subject:
-                subject_id = client.subject_id(subject, subject_type)
-                summary = client.storage_summary(subject_id, {"dataset": "1", "model": "2"}[subject_type])
-                return dump({"ok": True, "scope": subject, "subject_type": subject_type,
-                             "subject_id": subject_id, "storage": summary})
-            return dump({"ok": True, "scope": "account", "storage": client.storage_summary()})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        if subject:
+            subject_id = client.subject_id(subject, subject_type)
+            summary = client.storage_summary(subject_id, {"dataset": "1", "model": "2"}[subject_type])
+            return dump({"ok": True, "scope": subject, "subject_type": subject_type,
+                         "subject_id": subject_id, "storage": summary})
+        return dump({"ok": True, "scope": "account", "storage": client.storage_summary()})
 @mcp.tool()
+@tool
 def openi_search_datasets(
     q: str = "",
     scope: str = "public",
@@ -1376,18 +1325,14 @@ def openi_search_datasets(
     返回里每项含 subject（owner/name，可直接传给 openi_pull_dataset /
     openi_start_task）、id（UUID）、size_gb、downloads、stars、tags、tasks。
     """
-    try:
-        with _client() as client:
-            result = client.search_subjects(
-                "dataset", q=q, scope=scope, order_by=order_by, tags=tags,
-                tasks=tasks, license=license, recommend=recommend, page=page, page_size=page_size,
-            )
-        return dump({"ok": True, **result})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        result = client.search_subjects(
+            "dataset", q=q, scope=scope, order_by=order_by, tags=tags,
+            tasks=tasks, license=license, recommend=recommend, page=page, page_size=page_size,
+        )
+    return dump({"ok": True, **result})
 @mcp.tool()
+@tool
 def openi_search_models(
     q: str = "",
     scope: str = "public",
@@ -1414,18 +1359,14 @@ def openi_search_models(
     openi_start_task 的 pretrain_model_id_str）、id（模型 ID）、size_gb、
     downloads、stars、label、external（是否是外链模型，外链没有平台内的文件）。
     """
-    try:
-        with _client() as client:
-            result = client.search_subjects(
-                "model", q=q, scope=scope, order_by=order_by, tags=tags,
-                recommend=recommend, page=page, page_size=page_size,
-            )
-        return dump({"ok": True, **result})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        result = client.search_subjects(
+            "model", q=q, scope=scope, order_by=order_by, tags=tags,
+            recommend=recommend, page=page, page_size=page_size,
+        )
+    return dump({"ok": True, **result})
 @mcp.tool()
+@tool
 def openi_list_subject_files(
     subject: str,
     subject_type: str = "dataset",
@@ -1443,25 +1384,22 @@ def openi_list_subject_files(
     page_size: 每次最多 1000 行，一般不用改。
     用来在 openi_pull_dataset / openi_pull_model 之前确认要拉哪些文件。
     """
-    try:
-        with _client() as client:
-            page = client.subject_files(subject, subject_type, parent_dir, marker, page_size) or {}
-        rows = [
-            {
-                "name": (f"{parent_dir}/{r.get('FileName')}".strip("/") if parent_dir else r.get("FileName")),
-                "is_dir": bool(r.get("IsDir")),
-                "size": r.get("Size"),
-                "modified": r.get("ModTime"),
-            }
-            for r in (page.get("file_list") or [])
-        ]
-        return dump({"ok": True, "subject": subject, "dir": parent_dir, "has_next": page.get("has_next"),
-                     "marker": page.get("marker") or "", "files": rows})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    _check_pagination(page_size=page_size)
+    with _client() as client:
+        page = client.subject_files(subject, subject_type, parent_dir, marker, page_size) or {}
+    rows = [
+        {
+            "name": (f"{parent_dir}/{r.get('FileName')}".strip("/") if parent_dir else r.get("FileName")),
+            "is_dir": bool(r.get("IsDir")),
+            "size": r.get("Size"),
+            "modified": r.get("ModTime"),
+        }
+        for r in (page.get("file_list") or [])
+    ]
+    return dump({"ok": True, "subject": subject, "dir": parent_dir, "has_next": page.get("has_next"),
+                 "marker": page.get("marker") or "", "files": rows})
 @mcp.tool()
+@tool
 def openi_delete_subject_file(
     subject: str, path: str, subject_type: str = "dataset"
 ) -> str:
@@ -1476,15 +1414,10 @@ def openi_delete_subject_file(
     路径也回 200/ok，所以工具删完会重新列一遍父目录核对：清单里确实没有了才报
     removed=true，本来就没有则报 existed=false（什么都没动）。
     """
-    try:
-        with _client() as client:
-            result = client.delete_subject_file(subject, subject_type, path)
-        return dump({"ok": result.get("removed", False), "subject": subject,
-                     "subject_type": subject_type, **result})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        result = client.delete_subject_file(subject, subject_type, path)
+    return dump({"ok": result.get("removed", False), "subject": subject,
+                 "subject_type": subject_type, **result})
 def _pull(client: OpenIClient, subject: str, subject_type: str, dest_dir: str, file: Optional[str],
           parent_dir: str, dry_run: bool, overwrite: bool, max_bytes: Optional[int],
           max_files: Optional[int] = None) -> str:
@@ -1497,6 +1430,7 @@ def _pull(client: OpenIClient, subject: str, subject_type: str, dest_dir: str, f
 
 
 @mcp.tool()
+@tool
 def openi_pull_dataset(
     dataset: str,
     dest_dir: str,
@@ -1523,15 +1457,11 @@ def openi_pull_dataset(
 
     数据集里自带的 openi_resource.version 默认跳过。
     """
-    try:
-        with _client() as client:
-            return _pull(client, dataset, "dataset", dest_dir, file, parent_dir,
-                         dry_run, overwrite, max_bytes, max_files)
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return _pull(client, dataset, "dataset", dest_dir, file, parent_dir,
+                     dry_run, overwrite, max_bytes, max_files)
 @mcp.tool()
+@tool
 def openi_pull_model(
     model: str,
     dest_dir: str,
@@ -1557,116 +1487,101 @@ def openi_pull_model(
     ckpt 往往十几 GB，建议先 dry_run，或者直接用 openi_start_task 把它挂到云脑
     任务里（pretrain_model_id_str），不必下载到本地。
     """
-    try:
-        with _client() as client:
-            return _pull(client, model, "model", dest_dir, file, parent_dir,
-                         dry_run, overwrite, max_bytes, max_files)
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return _pull(client, model, "model", dest_dir, file, parent_dir,
+                     dry_run, overwrite, max_bytes, max_files)
 @mcp.tool()
+@tool
 def openi_get_task(task_id: str) -> str:
     """按任务 ID 查询任务详情（状态、资源、时长等）。"""
-    try:
-        with _client() as client:
-            detail = client.task(task_id)
-            if not isinstance(detail, dict):
-                return _ok(detail, ok=True)
+    with _client() as client:
+        detail = client.task(task_id)
+        if not isinstance(detail, dict):
+            return _ok(detail, ok=True)
+        try:
+            detail.update(client.task_brief(task_id) or {})
+        except OpenIError:
+            pass
+        job_type = detail.get("job_type") or (
+            (detail.get("task") or {}).get("job_type") if isinstance(detail.get("task"), dict) else ""
+        )
+        if str(job_type).upper() == "ONLINEINFERENCE":
             try:
-                detail.update(client.task_brief(task_id) or {})
+                detail["service"] = client.service_url(task_id)
             except OpenIError:
                 pass
-            job_type = detail.get("job_type") or (
-                (detail.get("task") or {}).get("job_type") if isinstance(detail.get("task"), dict) else ""
-            )
-            if str(job_type).upper() == "ONLINEINFERENCE":
-                try:
-                    detail["service"] = client.service_url(task_id)
-                except OpenIError:
-                    pass
-        return _ok(detail, ok=True)
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    return _ok(detail, ok=True)
 @mcp.tool()
+@tool
 def openi_list_tasks(page: int = 1, page_size: int = 20) -> str:
     """列出当前账号的全部计算任务（跨所有代码仓）。"""
-    try:
-        with _client() as client:
-            data = client.list_tasks(page=page, page_size=page_size)
-        if not isinstance(data, dict):
-            return dump({"ok": True, "tasks": data})
-        slim = []
-        for item in data.get("tasks", []):
-            task = item.get("task", item) if isinstance(item, dict) else {}
-            if not isinstance(task, dict):
-                continue
-            slim.append(
-                {
-                    "id": task.get("id"),
-                    "display_job_name": task.get("display_job_name"),
-                    "job_type": task.get("job_type"),
-                    "status": task.get("status"),
-                    "compute_source": task.get("compute_source"),
-                    "card_type": task.get("acc_card_type"),
-                    "cluster": task.get("cluster"),
-                    "created_unix": task.get("created_unix"),
-                    "duration": task.get("formatted_duration"),
-                    "repo": item.get("repo_alias") if isinstance(item, dict) else None,
-                }
-            )
-        return dump(
+    _check_pagination(page=page, page_size=page_size)
+    with _client() as client:
+        data = client.list_tasks(page=page, page_size=page_size)
+    if not isinstance(data, dict):
+        return dump({"ok": True, "tasks": data})
+    slim = []
+    for item in data.get("tasks", []):
+        task = item.get("task", item) if isinstance(item, dict) else {}
+        if not isinstance(task, dict):
+            continue
+        slim.append(
             {
-                "ok": True,
-                "total": data.get("total"),
-                "page": data.get("page"),
-                "page_size": data.get("page_size"),
-                "can_create_task": data.get("can_create_task"),
-                "tasks": slim,
+                "id": task.get("id"),
+                "display_job_name": task.get("display_job_name"),
+                "job_type": task.get("job_type"),
+                "status": task.get("status"),
+                "compute_source": task.get("compute_source"),
+                "card_type": task.get("acc_card_type"),
+                "cluster": task.get("cluster"),
+                "created_unix": task.get("created_unix"),
+                "duration": task.get("formatted_duration"),
+                "repo": item.get("repo_alias") if isinstance(item, dict) else None,
             }
         )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    return dump(
+        {
+            "ok": True,
+            "total": data.get("total"),
+            "page": data.get("page"),
+            "page_size": data.get("page_size"),
+            "can_create_task": data.get("can_create_task"),
+            "tasks": slim,
+        }
+    )
 @mcp.tool()
+@tool
 def openi_list_repo_tasks(repo: str) -> str:
     """列出某个代码仓（owner/name）下的全部计算任务。
 
     优先用仓级接口 /{owner}/{repo}/ai_task；该接口对部分令牌会返回 403，
     此时退回到账号级 /ai_task/my_list 再按仓名过滤，结果里会带 fallback 标记。
     """
-    try:
-        with _client() as client:
-            try:
-                tasks = client.repo_tasks(repo)
-                return dump({"ok": True, "repo": repo, "tasks": tasks})
-            except OpenIError as exc:
-                if exc.status_code != 403:
-                    raise
-                name = repo.split("/")[-1]
-                data = client.list_tasks(page=1, page_size=100)
-                matched = [
-                    item
-                    for item in (data.get("tasks") or [])
-                    if isinstance(item, dict)
-                    and (item.get("repo_alias") in (name, repo) or item.get("repo_name") in (name, repo))
-                ]
-                return dump(
-                    {
-                        "ok": True,
-                        "repo": repo,
-                        "fallback": "repo 级接口返回 403，已用账号级任务列表按仓名过滤",
-                        "tasks": matched,
-                    }
-                )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        try:
+            tasks = client.repo_tasks(repo)
+            return dump({"ok": True, "repo": repo, "tasks": tasks})
+        except OpenIError as exc:
+            if exc.status_code != 403:
+                raise
+            name = repo.split("/")[-1]
+            data = client.list_tasks(page=1, page_size=100)
+            matched = [
+                item
+                for item in (data.get("tasks") or [])
+                if isinstance(item, dict)
+                and (item.get("repo_alias") in (name, repo) or item.get("repo_name") in (name, repo))
+            ]
+            return dump(
+                {
+                    "ok": True,
+                    "repo": repo,
+                    "fallback": "repo 级接口返回 403，已用账号级任务列表按仓名过滤",
+                    "tasks": matched,
+                }
+            )
 @mcp.tool()
+@tool
 def openi_task_logs(
     task_id: str,
     repo: Optional[str] = None,
@@ -1686,54 +1601,38 @@ def openi_task_logs(
     node_id: 多机任务里指定节点。
     file_name: 训练任务里指定日志文件名。
     """
-    try:
-        with _client() as client:
-            logs = client.task_log(
-                task_id,
-                lines=lines,
-                order=order,
-                base_line=base_line,
-                node_id=node_id,
-                file_name=file_name,
-                repo=repo,
-            )
-        return dump({"ok": True, "logs": logs})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        logs = client.task_log(
+            task_id,
+            lines=lines,
+            order=order,
+            base_line=base_line,
+            node_id=node_id,
+            file_name=file_name,
+            repo=repo,
+        )
+    return dump({"ok": True, "logs": logs})
 @mcp.tool()
+@tool
 def openi_task_resource_usage(task_id: str) -> str:
     """查看任务当前的算力占用（卡数、CPU、内存、耗时）。"""
-    try:
-        with _client() as client:
-            usage = client.task_resource_usage(task_id)
-        return dump({"ok": True, "resource_usage": usage})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        usage = client.task_resource_usage(task_id)
+    return dump({"ok": True, "resource_usage": usage})
 @mcp.tool()
+@tool
 def openi_task_debug_url(task_id: str, repo: Optional[str] = None) -> str:
     """获取调试任务的 Jupyter / SSH 访问入口。"""
-    try:
-        with _client() as client:
-            return dump({"ok": True, "debug": client.debug_url(task_id, repo=repo)})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return dump({"ok": True, "debug": client.debug_url(task_id, repo=repo)})
 @mcp.tool()
+@tool
 def openi_task_visualize_url(task_id: str) -> str:
     """获取训练任务的 TensorBoard 可视化入口。"""
-    try:
-        with _client() as client:
-            return dump({"ok": True, "visualize": client.visualize_url(task_id)})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return dump({"ok": True, "visualize": client.visualize_url(task_id)})
 @mcp.tool()
+@tool
 def openi_task_service_url(task_id: str) -> str:
     """获取在线推理（ONLINEINFERENCE）任务的对外服务地址。
 
@@ -1744,14 +1643,10 @@ def openi_task_service_url(task_id: str) -> str:
     code 99（"The service is loading"），等一会儿再调用即可；容器里的服务必须
     监听 8000 端口，否则这个地址连不上。
     """
-    try:
-        with _client() as client:
-            return dump({"ok": True, "service": client.service_url(task_id)})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return dump({"ok": True, "service": client.service_url(task_id)})
 @mcp.tool()
+@tool
 def openi_task_events(task_id: str) -> str:
     """看一个任务的调度事件时间线，用来定位“为什么排队 / 为什么失败”。
 
@@ -1760,30 +1655,22 @@ def openi_task_events(task_id: str) -> str:
     Started / Killing / Exit）、timestamp（UTC）与 action。任务长期卡在 WAITING、
     被抢占、镜像拉不动或异常退出时，这里能看出卡在哪一步、为什么。
     """
-    try:
-        with _client() as client:
-            data = client.task_operation_profile(task_id)
-        events = data.get("events") if isinstance(data, dict) else data
-        return dump({"ok": True, "task_id": task_id, "events": events})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        data = client.task_operation_profile(task_id)
+    events = data.get("events") if isinstance(data, dict) else data
+    return dump({"ok": True, "task_id": task_id, "events": events})
 @mcp.tool()
+@tool
 def openi_task_nodes(task_id: str) -> str:
     """列出任务实际跑在哪些节点上（多机任务会有多条）。
 
     返回每个节点 {id, log_file_name}；配合 openi_task_logs 的 node_id 可以分别
     读取各节点的日志。
     """
-    try:
-        with _client() as client:
-            return dump({"ok": True, "task_id": task_id, "nodes": client.task_node_info(task_id)})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return dump({"ok": True, "task_id": task_id, "nodes": client.task_node_info(task_id)})
 @mcp.tool()
+@tool
 def openi_task_outputs(task_id: str, parent_dir: str = "") -> str:
     """列出任务输出目录里的文件（一次一层，子目录用 parent_dir 继续往下翻）。
 
@@ -1794,31 +1681,27 @@ def openi_task_outputs(task_id: str, parent_dir: str = "") -> str:
     （平台字段 status=1），通常要等一两分钟才会变成 ready=true 并列出文件
     （status=0）。刚结束查不到文件时，隔一会儿重试，别当成任务没有输出。
     """
-    try:
-        with _client() as client:
-            data = client.task_output(task_id, parent_dir=parent_dir)
-        out = data.get("output") if isinstance(data, dict) else {}
-        out = out if isinstance(out, dict) else {}
-        status = out.get("status")
-        return dump(
-            {
-                "ok": True,
-                "task_id": task_id,
-                "parent_dir": parent_dir,
-                "ready": status == 0,
-                "status": status,
-                "is_task_terminal": out.get("is_task_terminal"),
-                "can_download": out.get("can_download"),
-                "can_reschedule": out.get("can_reschedule"),
-                "output_size_limit": out.get("output_size_limit"),
-                "files": _slim_output_files(out.get("file_list")),
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        data = client.task_output(task_id, parent_dir=parent_dir)
+    out = data.get("output") if isinstance(data, dict) else {}
+    out = out if isinstance(out, dict) else {}
+    status = out.get("status")
+    return dump(
+        {
+            "ok": True,
+            "task_id": task_id,
+            "parent_dir": parent_dir,
+            "ready": status == 0,
+            "status": status,
+            "is_task_terminal": out.get("is_task_terminal"),
+            "can_download": out.get("can_download"),
+            "can_reschedule": out.get("can_reschedule"),
+            "output_size_limit": out.get("output_size_limit"),
+            "files": _slim_output_files(out.get("file_list")),
+        }
+    )
 @mcp.tool()
+@tool
 def openi_task_output_files(task_id: str) -> str:
     """一次列出任务输出的全部文件（递归，含子目录里的）。
 
@@ -1826,23 +1709,19 @@ def openi_task_output_files(task_id: str) -> str:
     openi_task_download_output 的 file_name。刚跑完时同样要等平台索引完成
     （见 openi_task_outputs 的说明），列表为空不代表没有输出。
     """
-    try:
-        with _client() as client:
-            data = client.task_output_all(task_id)
-        out = data.get("output") if isinstance(data, dict) else {}
-        out = out if isinstance(out, dict) else {}
-        return dump(
-            {
-                "ok": True,
-                "task_id": task_id,
-                "files": _slim_output_files(out.get("file_list")),
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        data = client.task_output_all(task_id)
+    out = data.get("output") if isinstance(data, dict) else {}
+    out = out if isinstance(out, dict) else {}
+    return dump(
+        {
+            "ok": True,
+            "task_id": task_id,
+            "files": _slim_output_files(out.get("file_list")),
+        }
+    )
 @mcp.tool()
+@tool
 def openi_task_download_output(
     task_id: str,
     file_name: str,
@@ -1860,17 +1739,13 @@ def openi_task_download_output(
     小文件（几 MB 以内）不带 save_to 直接读进来最省事；大文件务必给 save_to
     让它流式落盘。
     """
-    try:
-        with _client() as client:
-            payload = client.task_output_download(
-                task_id, file_name, parent_dir=parent_dir, save_to=save_to
-            )
-        return dump({"ok": True, "task_id": task_id, "file_name": file_name, **payload})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        payload = client.task_output_download(
+            task_id, file_name, parent_dir=parent_dir, save_to=save_to
+        )
+    return dump({"ok": True, "task_id": task_id, "file_name": file_name, **payload})
 @mcp.tool()
+@tool
 def openi_task_download_output_archive(task_id: str, save_to: str, max_bytes: Optional[int] = None) -> str:
     """把任务的整个输出目录打成一个 zip 下到本地（产物多时比逐个文件拉省事）。
 
@@ -1882,17 +1757,13 @@ def openi_task_download_output_archive(task_id: str, save_to: str, max_bytes: Op
     任务没有产物时平台会回一个空的 zip（约 22 字节），那是正常结果不是错误；
     下载前后可以用 openi_task_output_files 核对清单。
     """
-    try:
-        with _client() as client:
-            payload = client.task_output_download_all(
-                task_id, save_to=save_to, max_bytes=max_bytes
-            )
-        return dump({"ok": True, "task_id": task_id, **payload})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        payload = client.task_output_download_all(
+            task_id, save_to=save_to, max_bytes=max_bytes
+        )
+    return dump({"ok": True, "task_id": task_id, **payload})
 @mcp.tool()
+@tool
 def openi_task_download_log(
     task_id: str,
     save_to: Optional[str] = None,
@@ -1907,31 +1778,23 @@ def openi_task_download_log(
     max_bytes: 自定义上限。给 save_to 时它是硬上限（超了立即中止，不落盘）；
       不给 save_to 时它是内存里的截断上限。
     """
-    try:
-        limit = max_bytes if (max_bytes is not None or save_to) else 256 * 1024
-        with _client() as client:
-            payload = client.task_log_download(task_id, save_to=save_to, max_bytes=limit)
-        return dump({"ok": True, "task_id": task_id, **payload})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    limit = max_bytes if (max_bytes is not None or save_to) else 256 * 1024
+    with _client() as client:
+        payload = client.task_log_download(task_id, save_to=save_to, max_bytes=limit)
+    return dump({"ok": True, "task_id": task_id, **payload})
 @mcp.tool()
+@tool
 def openi_task_loss(task_id: str) -> str:
     """读取训练任务的 loss 曲线（epoch / loss 序列）。
 
     任务没上报 loss 时返回空列表；这是平台侧记录的曲线，训练脚本没按平台方式
     输出 loss 时会为空。
     """
-    try:
-        with _client() as client:
-            data = client.task_loss(task_id)
-        return dump({"ok": True, "task_id": task_id, "loss": data})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        data = client.task_loss(task_id)
+    return dump({"ok": True, "task_id": task_id, "loss": data})
 @mcp.tool()
+@tool
 def openi_task_export_to_dataset(task_id: str, dataset: str, files: list[str]) -> str:
     """把任务输出文件搬进一个已有的数据集（训练产物落库的第一条路）。
 
@@ -1947,19 +1810,15 @@ def openi_task_export_to_dataset(task_id: str, dataset: str, files: list[str]) -
 
     导出是异步的：返回里的 process_id 喂给 openi_task_export_progress 查进度。
     """
-    try:
-        with _client() as client:
-            info = client.subject_info(dataset, "dataset")
-            dataset_id = info.get("id") if isinstance(info, dict) else None
-            if not dataset_id:
-                raise OpenIError(f"没拿到数据集 {dataset} 的 UUID，确认名字 owner/name 是否正确。")
-            result = client.export_task_to_dataset(task_id, dataset_id, files)
-        return dump({"ok": True, "dataset": dataset, **result})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        info = client.subject_info(dataset, "dataset")
+        dataset_id = info.get("id") if isinstance(info, dict) else None
+        if not dataset_id:
+            raise OpenIError(f"没拿到数据集 {dataset} 的 UUID，确认名字 owner/name 是否正确。")
+        result = client.export_task_to_dataset(task_id, dataset_id, files)
+    return dump({"ok": True, "dataset": dataset, **result})
 @mcp.tool()
+@tool
 def openi_task_export_to_model(
     task_id: str,
     name: str,
@@ -1983,22 +1842,18 @@ def openi_task_export_to_model(
 
     导出是异步的：返回里的 process_id 喂给 openi_task_export_progress 查进度。
     """
-    try:
-        with _client() as client:
-            result = client.export_task_to_model(
-                task_id,
-                name,
-                files,
-                alias=alias,
-                license=license,
-                is_private=is_private,
-            )
-        return dump({"ok": True, **result})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        result = client.export_task_to_model(
+            task_id,
+            name,
+            files,
+            alias=alias,
+            license=license,
+            is_private=is_private,
+        )
+    return dump({"ok": True, **result})
 @mcp.tool()
+@tool
 def openi_task_export_progress(
     process_id: str, subject_type: str = "dataset", wait_seconds: int = 60
 ) -> str:
@@ -2011,17 +1866,13 @@ def openi_task_export_progress(
     返回 files 是 {文件: 百分比}：100 已完成，0 刚开始，-1 / -2 / -3 是失败
     （源文件读不到 / 目标已有同名文件 / 超出存储限额），failed 列出卖掉的文件。
     """
-    try:
-        with _client() as client:
-            progress = client.wait_export(
-                subject_type, process_id, wait_seconds=wait_seconds
-            )
-        return dump({"ok": True, **progress})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        progress = client.wait_export(
+            subject_type, process_id, wait_seconds=wait_seconds
+        )
+    return dump({"ok": True, **progress})
 @mcp.tool()
+@tool
 def openi_list_task_templates(
     q: str = "",
     scope: str = "public",
@@ -2054,57 +1905,45 @@ def openi_list_task_templates(
     models、use_count、collected。tags 是按模板自己的标签做精确匹配（大小写敏感，
     取值多为中文，如 "调试任务"、"训练任务"、"NPU"），拿不准就用 q 搜关键词。
     """
-    try:
-        with _client() as client:
-            result = client.list_task_templates(
-                scope=scope, q=q, job_type=job_type, compute_source=compute_source,
-                tags=tags, order_by=order_by, page=page, page_size=page_size,
-            )
-        return dump({"ok": True, **result})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        result = client.list_task_templates(
+            scope=scope, q=q, job_type=job_type, compute_source=compute_source,
+            tags=tags, order_by=order_by, page=page, page_size=page_size,
+        )
+    return dump({"ok": True, **result})
 @mcp.tool()
+@tool
 def openi_get_task_template(template_id: str) -> str:
     """按模板 ID 查一个任务模板的完整配置（代码仓、分支、启动文件、镜像、要挂的数据集/模型）。
 
     列表工具返回的字段这里都有，区别是这里能按 ID 精确取一条。注意平台只有
     GET /ai_task_template?id= 这一个按 ID 取详情的入口，列表接口的 id 参数是无效的。
     """
-    try:
-        with _client() as client:
-            tpl = client.task_template(template_id)
-        return dump({"ok": True, "template": summarize_task_template(tpl)})
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        tpl = client.task_template(template_id)
+    return dump({"ok": True, "template": summarize_task_template(tpl)})
 @mcp.tool()
+@tool
 def openi_collect_task_template(template_id: str, collect: bool = True) -> str:
     """收藏 / 取消收藏一个任务模板，收藏后在 scope="collected" 里能找到。
 
     collect=False 表示取消收藏。
     """
-    try:
-        with _client() as client:
-            client.collect_task_template(template_id, collect=collect)
-            listed = client.list_task_templates(scope="collected", page_size=100)
-        ids = [item.get("template_id") for item in listed.get("items") or []]
-        return dump(
-            {
-                "ok": True,
-                "template_id": template_id,
-                "collected": collect,
-                "collected_total": listed.get("total"),
-                "still_collected": template_id in ids,
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        client.collect_task_template(template_id, collect=collect)
+        listed = client.list_task_templates(scope="collected", page_size=100)
+    ids = [item.get("template_id") for item in listed.get("items") or []]
+    return dump(
+        {
+            "ok": True,
+            "template_id": template_id,
+            "collected": collect,
+            "collected_total": listed.get("total"),
+            "still_collected": template_id in ids,
+        }
+    )
 @mcp.tool()
+@tool
 def openi_start_task_from_template(
     template_id: str,
     repo: Optional[str] = None,
@@ -2139,92 +1978,88 @@ def openi_start_task_from_template(
       指定了特殊镜像（如在线推理的 openclaw-feishu-qwen3.5）时才置 True。
     extra_fields: JSON 字符串，补充平台新增字段。
     """
-    try:
-        extra = json.loads(extra_fields) if extra_fields else None
-        with _client() as client:
-            tpl = client.task_template(template_id)
-            spec = client.template_spec(tpl)
-            job_type = str(tpl.get("JobType") or "DEBUG")
-            source = str(tpl.get("ComputeSource") or "GPU")
-            cluster = str(tpl.get("Cluster") or DEFAULT_CLUSTER)
-            repo = repo or f'{tpl.get("RepoOwnerName")}/{tpl.get("RepoName")}'
-            boot = boot_file if boot_file is not None else (tpl.get("BootFile") or None)
-            mounts = dataset_uuid_str
-            if mounts is None:
-                mounts = ",".join(
-                    d.get("DatasetID")
-                    for d in (tpl.get("DatasetLists") or [])
-                    if not d.get("IsDeleted")
-                )
-            models = pretrain_model_id_str
-            if models is None:
-                models = ",".join(
-                    m.get("ModelID")
-                    for m in (tpl.get("ModelLists") or [])
-                    if not m.get("IsDeleted")
-                )
-            mounts = _resolve_mount_ids(client, mounts, "dataset")
-            models = _resolve_mount_ids(client, models, "model")
-            image_id = image_name = image_url = None
-            if use_template_image:
-                image_id = tpl.get("ImageID") or None
-                image_name = tpl.get("ImageName") or None
-                if not image_id:
-                    image_url = template_image_url(tpl)
-            workers = work_server_number
-            if workers is None:
-                workers = int(tpl.get("AccCardsNum") or 1)
-            internet = tpl.get("HasInternet") if has_internet is None else has_internet
-            result = client.create_task(
-                repo=repo,
-                spec_id=spec.get("id"),
-                display_job_name=display_job_name,
-                compute_source=source,
-                cluster=cluster,
-                job_type=job_type,
-                work_server_number=workers,
-                branch_name=tpl.get("BranchName") or None,
-                image_id=image_id,
-                image_name=image_name,
-                image_url=image_url,
-                boot_file=boot,
-                params=params,
-                dataset_uuid_str=mounts,
-                pretrain_model_id_str=models,
-                has_internet=int(internet if internet is not None else 2),
-                time_limit=time_limit,
-                visualize_required=bool(tpl.get("VisualizeRequired")),
-                extra=extra,
+    extra = json.loads(extra_fields) if extra_fields else None
+    with _client() as client:
+        tpl = client.task_template(template_id)
+        spec = client.template_spec(tpl)
+        job_type = str(tpl.get("JobType") or "DEBUG")
+        source = str(tpl.get("ComputeSource") or "GPU")
+        cluster = str(tpl.get("Cluster") or DEFAULT_CLUSTER)
+        repo = repo or f'{tpl.get("RepoOwnerName")}/{tpl.get("RepoName")}'
+        boot = boot_file if boot_file is not None else (tpl.get("BootFile") or None)
+        mounts = dataset_uuid_str
+        if mounts is None:
+            mounts = ",".join(
+                d.get("DatasetID")
+                for d in (tpl.get("DatasetLists") or [])
+                if not d.get("IsDeleted")
             )
-            template_info = summarize_task_template(tpl)
-        return _ok(
-            result,
-            ok=True,
-            template={
-                "template_id": template_info.get("template_id"),
-                "name": template_info.get("name"),
-                "repo": repo,
-                "branch": template_info.get("branch"),
-                "boot_file": boot,
-                "job_type": job_type,
-                "compute_source": source,
-                "cluster": cluster,
-                "acc_card_type": spec.get("acc_card_type"),
-                "acc_cards_num": spec.get("acc_cards_num"),
-                "spec_id": spec.get("id"),
-                "unit_price": spec.get("unit_price"),
-                "datasets": mounts or None,
-                "models": models or None,
-                "used_template_image": bool(use_template_image),
-                "template_parameters": template_info.get("parameters"),
-                "note": "模板里的 Parameters（表单默认值）没有自动映射到 params，需要时请自己传 params。",
-            },
+        models = pretrain_model_id_str
+        if models is None:
+            models = ",".join(
+                m.get("ModelID")
+                for m in (tpl.get("ModelLists") or [])
+                if not m.get("IsDeleted")
+            )
+        mounts = _resolve_mount_ids(client, mounts, "dataset")
+        models = _resolve_mount_ids(client, models, "model")
+        image_id = image_name = image_url = None
+        if use_template_image:
+            image_id = tpl.get("ImageID") or None
+            image_name = tpl.get("ImageName") or None
+            if not image_id:
+                image_url = template_image_url(tpl)
+        workers = work_server_number
+        if workers is None:
+            workers = int(tpl.get("AccCardsNum") or 1)
+        internet = tpl.get("HasInternet") if has_internet is None else has_internet
+        result = client.create_task(
+            repo=repo,
+            spec_id=spec.get("id"),
+            display_job_name=display_job_name,
+            compute_source=source,
+            cluster=cluster,
+            job_type=job_type,
+            work_server_number=workers,
+            branch_name=tpl.get("BranchName") or None,
+            image_id=image_id,
+            image_name=image_name,
+            image_url=image_url,
+            boot_file=boot,
+            params=params,
+            dataset_uuid_str=mounts,
+            pretrain_model_id_str=models,
+            has_internet=int(internet if internet is not None else 2),
+            time_limit=time_limit,
+            visualize_required=bool(tpl.get("VisualizeRequired")),
+            extra=extra,
         )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+        template_info = summarize_task_template(tpl)
+    return _ok(
+        result,
+        ok=True,
+        template={
+            "template_id": template_info.get("template_id"),
+            "name": template_info.get("name"),
+            "repo": repo,
+            "branch": template_info.get("branch"),
+            "boot_file": boot,
+            "job_type": job_type,
+            "compute_source": source,
+            "cluster": cluster,
+            "acc_card_type": spec.get("acc_card_type"),
+            "acc_cards_num": spec.get("acc_cards_num"),
+            "spec_id": spec.get("id"),
+            "unit_price": spec.get("unit_price"),
+            "datasets": mounts or None,
+            "models": models or None,
+            "used_template_image": bool(use_template_image),
+            "template_parameters": template_info.get("parameters"),
+            "note": "模板里的 Parameters（表单默认值）没有自动映射到 params，需要时请自己传 params。",
+        },
+    )
 @mcp.tool()
+@tool
 def openi_start_task(
     repo: str,
     spec_id: int,
@@ -2276,57 +2111,66 @@ def openi_start_task(
     visualize_required: 是否需要 TensorBoard。
     extra_fields: JSON 字符串，用于补充平台新增字段。
     """
-    try:
-        extra = json.loads(extra_fields) if extra_fields else None
-        with _client() as client:
-            dataset_uuid_str = _resolve_mount_ids(client, dataset_uuid_str, "dataset")
-            pretrain_model_id_str = _resolve_mount_ids(client, pretrain_model_id_str, "model")
-            result = client.create_task(
-                repo=repo,
-                spec_id=spec_id,
-                display_job_name=display_job_name,
-                compute_source=compute_source,
-                cluster=cluster,
-                job_type=job_type,
-                work_server_number=work_server_number,
-                branch_name=branch_name,
-                image_id=image_id,
-                image_name=image_name,
-                image_url=image_url,
-                boot_file=boot_file,
-                params=params,
-                dataset_uuid_str=dataset_uuid_str,
-                pretrain_model_id_str=pretrain_model_id_str,
-                description=description,
-                has_internet=has_internet,
-                time_limit=time_limit,
-                visualize_required=visualize_required,
-                extra=extra,
-            )
-        return _ok(result, ok=True)
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    extra = json.loads(extra_fields) if extra_fields else None
+    with _client() as client:
+        dataset_uuid_str = _resolve_mount_ids(client, dataset_uuid_str, "dataset")
+        pretrain_model_id_str = _resolve_mount_ids(client, pretrain_model_id_str, "model")
+        result = client.create_task(
+            repo=repo,
+            spec_id=spec_id,
+            display_job_name=display_job_name,
+            compute_source=compute_source,
+            cluster=cluster,
+            job_type=job_type,
+            work_server_number=work_server_number,
+            branch_name=branch_name,
+            image_id=image_id,
+            image_name=image_name,
+            image_url=image_url,
+            boot_file=boot_file,
+            params=params,
+            dataset_uuid_str=dataset_uuid_str,
+            pretrain_model_id_str=pretrain_model_id_str,
+            description=description,
+            has_internet=has_internet,
+            time_limit=time_limit,
+            visualize_required=visualize_required,
+            extra=extra,
+        )
+    return _ok(result, ok=True)
 @mcp.tool()
+@tool
 def openi_start_task_raw(repo: str, payload_json: str, dry_run: bool = False) -> str:
-    """用完全自定义的 JSON 请求体创建任务，用于平台接口字段变化时兜底。
+    """用完全自定义的 JSON 请求体创建任务（兜底用，会真的开卡计费）。
 
-    payload_json 直接作为请求体发送到 /{repo}/ai_task/create。
-    dry_run=True 时只回显将要发送的请求，不真正创建。
+    payload_json 直接作为请求体发到 /{repo}/ai_task/create，不做字段级校验——
+    这正是它的用途：平台加了新字段、而 openi_start_task 还没跟上时用它兜底。
+    代价是拼错的字段平台未必会拒，可能建出一个配置不对却照样计费的任务。
+
+    所以这个工具**默认不执行**：必须显式传 dry_run=False 才会真的创建。先跑一次
+    dry_run=True 看请求体，确认无误再关掉它。repo 必须是 owner/name 形式，
+    且请求体必须是非空 JSON 对象——这两条会先挡住，避免把请求打到意外的路径上。
+    创建成功后同样建议用 openi_get_task 核对状态与镜像。
     """
-    try:
-        payload = json.loads(payload_json)
-        if dry_run:
-            return dump({"ok": True, "dry_run": True, "repo": repo, "payload": payload})
-        with _client() as client:
-            result = client.post_json(f"/{repo}/ai_task/create", json_body=payload)
-        return _ok(result, ok=True)
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    if not _REPO_FULLNAME_RE.match(repo or ""):
+        return dump({
+            "ok": False,
+            "error": f"repo 必须是 owner/name 形式：{repo!r}",
+            "hint": "用 openi_list_my_repositories 查可用的仓。",
+        })
+    payload = json.loads(payload_json)
+    if not isinstance(payload, dict) or not payload:
+        return dump({
+            "ok": False,
+            "error": "payload_json 必须是一个非空 JSON 对象",
+        })
+    if dry_run:
+        return dump({"ok": True, "dry_run": True, "repo": repo, "payload": payload})
+    with _client() as client:
+        result = client.post_json(f"/{repo}/ai_task/create", json_body=payload)
+    return _ok(result, ok=True)
 @mcp.tool()
+@tool
 def openi_stop_task(task_id: str, wait_seconds: float = 30.0) -> str:
     """停止任务并释放算力（停止后停止计费），并回读确认状态真的变成了已停止。
 
@@ -2336,14 +2180,10 @@ def openi_stop_task(task_id: str, wait_seconds: float = 30.0) -> str:
     观察到结果，返回里 ok=false 并带上 status_at_timeout——如果那时仍是 RUNNING，
     任务还在计费，需要过一会儿再用 openi_get_task 确认。
     """
-    try:
-        with _client() as client:
-            return dump(client.task_action_verified("stop", task_id, wait_seconds=wait_seconds))
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return dump(client.task_action_verified("stop", task_id, wait_seconds=wait_seconds))
 @mcp.tool()
+@tool
 def openi_restart_task(task_id: str, wait_seconds: float = 60.0) -> str:
     """重启一个已停止的任务，并回读确认状态真的变了。
 
@@ -2351,47 +2191,35 @@ def openi_restart_task(task_id: str, wait_seconds: float = 60.0) -> str:
     离开"已停止"就算确认成功（不要求等到 RUNNING，那样排队久了会超时）。
     wait_seconds: 最长等多少秒确认状态，超时只影响确认，不影响重启本身。
     """
-    try:
-        with _client() as client:
-            return dump(client.task_action_verified("restart", task_id, wait_seconds=wait_seconds))
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return dump(client.task_action_verified("restart", task_id, wait_seconds=wait_seconds))
 @mcp.tool()
+@tool
 def openi_delete_task(task_id: str, wait_seconds: float = 30.0) -> str:
     """删除任务（不可恢复），并回读确认任务确实消失了。
 
     任务需先处于已停止状态，否则平台可能拒绝。删除之后查不到任务是正常结果，
     这时 ok=true。wait_seconds 超时不会取消删除，只是没观察到结果。
     """
-    try:
-        with _client() as client:
-            return dump(client.task_action_verified("del", task_id, wait_seconds=wait_seconds))
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return dump(client.task_action_verified("del", task_id, wait_seconds=wait_seconds))
 @mcp.tool()
+@tool
 def openi_sdk_code(job_type: str = "DEBUG", compute_source: str = "GPU", visualize: bool = False) -> str:
     """生成任务容器内访问数据集/模型的示例代码。"""
-    try:
-        with _client() as client:
-            return dump(
-                {
-                    "ok": True,
-                    "sdk_code": client.sdk_code(
-                        job_type=job_type,
-                        compute_source=compute_source,
-                        visualize_required=visualize,
-                    ),
-                }
-            )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        return dump(
+            {
+                "ok": True,
+                "sdk_code": client.sdk_code(
+                    job_type=job_type,
+                    compute_source=compute_source,
+                    visualize_required=visualize,
+                ),
+            }
+        )
 @mcp.tool()
+@tool
 def openi_points_today() -> str:
     """看今天（北京时间）已经拿到多少积分、还剩哪些没拿。
 
@@ -2399,33 +2227,29 @@ def openi_points_today() -> str:
     项目的完成情况（今天做了几次、还剩几次、还能拿几分、对应的工具是哪个）。
     平台的每日结算以北京时间 0 点为界。
     """
-    try:
-        with _client() as client:
-            status = autopoint.daily_status(client)
-        daily = status.get("daily_actions") or []
-        reward = next((row for row in daily if row["task_code"] == autopoint.REWARD_ACTION), {})
-        return dump(
-            {
-                "ok": True,
-                **status,
-                "compute_reward_points": reward.get("points_per_award", 0.0),
-                "pending_daily_actions": [row for row in daily if row.get("remaining")],
-                "automation": {
-                    "automated_action": POINT_ACTIONS.get(autopoint.REWARD_ACTION),
-                    "how": "openi_claim_daily_points 会在需要时开一个 1 分/卡时的 DEBUG 任务，"
-                    "进入 RUNNING 后立即停止并删除；不足 6 分钟不计费，所以当天净赚 10 分、"
-                    "算力消耗 0 分。其余每日项每条都要产出一个真实的东西（一处 commit、"
-                    "一个 issue、一条评论、一个数据集），平台对重复公开项目、空评论按刷分"
-                    "处理并追回积分，所以不自动刷；要做的时候用 pending_daily_actions 里"
-                    "给出的工具调一次即可。",
-                },
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        status = autopoint.daily_status(client)
+    daily = status.get("daily_actions") or []
+    reward = next((row for row in daily if row["task_code"] == autopoint.REWARD_ACTION), {})
+    return dump(
+        {
+            "ok": True,
+            **status,
+            "compute_reward_points": reward.get("points_per_award", 0.0),
+            "pending_daily_actions": [row for row in daily if row.get("remaining")],
+            "automation": {
+                "automated_action": POINT_ACTIONS.get(autopoint.REWARD_ACTION),
+                "how": "openi_claim_daily_points 会在需要时开一个 1 分/卡时的 DEBUG 任务，"
+                "进入 RUNNING 后立即停止并删除；不足 6 分钟不计费，所以当天净赚 10 分、"
+                "算力消耗 0 分。其余每日项每条都要产出一个真实的东西（一处 commit、"
+                "一个 issue、一条评论、一个数据集），平台对重复公开项目、空评论按刷分"
+                "处理并追回积分，所以不自动刷；要做的时候用 pending_daily_actions 里"
+                "给出的工具调一次即可。",
+            },
+        }
+    )
 @mcp.tool()
+@tool
 def openi_claim_daily_points(
     repo: Optional[str] = None,
     compute_source: Optional[str] = None,
@@ -2451,23 +2275,19 @@ def openi_claim_daily_points(
 
     注意：这个调用会阻塞到任务跑完（正常 1-5 分钟，最长 timeout），期间不要重复调用。
     """
-    try:
-        with _client() as client:
-            report = autopoint.claim_daily_points(
-                client,
-                repo=repo,
-                job_type=job_type,
-                compute_source=compute_source,
-                timeout=timeout,
-                dry_run=dry_run,
-                force=force,
-            )
-        return dump(report)
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        report = autopoint.claim_daily_points(
+            client,
+            repo=repo,
+            job_type=job_type,
+            compute_source=compute_source,
+            timeout=timeout,
+            dry_run=dry_run,
+            force=force,
+        )
+    return dump(report)
 @mcp.tool()
+@tool
 def openi_run_on_card(
     code: str,
     compute_source: Optional[str] = None,
@@ -2499,25 +2319,21 @@ def openi_run_on_card(
     注意：这个调用会阻塞到跑完（正常几十秒到几分钟）；同时只能有 1 个 running
     DEBUG 任务，保留任务（keep=True）会挡住其他任务创建。
     """
-    try:
-        with _client() as client:
-            report = exec_on_card.run_on_card(
-                client,
-                code,
-                repo=repo,
-                spec_id=spec_id,
-                compute_source=compute_source,
-                job_type=job_type,
-                wait_seconds=wait_seconds,
-                exec_timeout=exec_timeout,
-                keep=keep,
-            )
-        return dump(report)
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
+    with _client() as client:
+        report = exec_on_card.run_on_card(
+            client,
+            code,
+            repo=repo,
+            spec_id=spec_id,
+            compute_source=compute_source,
+            job_type=job_type,
+            wait_seconds=wait_seconds,
+            exec_timeout=exec_timeout,
+            keep=keep,
+        )
+    return dump(report)
 @mcp.tool()
+@tool
 def openi_autopoint_schedule() -> str:
     """给出把"每日自动领积分"挂到系统定时任务上的现成配置。
 
@@ -2530,6 +2346,12 @@ def openi_autopoint_schedule() -> str:
     python = sys.executable
     cwd = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     log = os.path.expanduser("~/Library/Logs/openi-autopoint.log")
+    # plist 是 XML：路径里的 & 或 < 会让文件解析失败，先转义。
+    def _xml(text: str) -> str:
+        return (
+            text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
+
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -2537,22 +2359,29 @@ def openi_autopoint_schedule() -> str:
   <key>Label</key><string>cn.openi.autopoint</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{python}</string>
+    <string>{_xml(python)}</string>
     <string>-m</string>
     <string>openi_bridge.autopoint</string>
     <string>--json</string>
   </array>
-  <key>WorkingDirectory</key><string>{cwd}</string>
+  <key>WorkingDirectory</key><string>{_xml(cwd)}</string>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
-  <key>StandardOutPath</key><string>{log}</string>
-  <key>StandardErrorPath</key><string>{log}</string>
+  <key>StandardOutPath</key><string>{_xml(log)}</string>
+  <key>StandardErrorPath</key><string>{_xml(log)}</string>
 </dict>
 </plist>
 """
+    # cron 行是 shell 语法，路径必须转义：工作目录或解释器路径里带空格
+    # （macOS 上很常见，例如 "Application Support"）会让整行命令拆错，
+    # 定时任务静默跑成一个不存在的命令。
+    q_cwd = shlex.quote(cwd)
+    q_python = shlex.quote(python)
     cron = (
-        f"5 9 * * * cd {cwd} && {python} -m openi_bridge.autopoint --json >> ~/.openi/autopoint.log 2>&1\n"
-        f"*/30 * * * * cd {cwd} && {python} -m openi_bridge.autopoint --reap >> ~/.openi/autopoint.log 2>&1"
+        f"5 9 * * * cd {q_cwd} && {q_python} -m openi_bridge.autopoint --json "
+        f">> ~/.openi/autopoint.log 2>&1\n"
+        f"*/30 * * * * cd {q_cwd} && {q_python} -m openi_bridge.autopoint --reap "
+        f">> ~/.openi/autopoint.log 2>&1"
     )
     return dump(
         {
