@@ -91,6 +91,51 @@ class TestVerifiedImageTrust:
         assert row["image_id"] == "8c8d460801974a98945d26d8a06cf2d2"
 
 
+class TestToolNameReferences:
+    """Every openi_* name in prose must be a tool that actually exists.
+
+    Error messages and docstrings are read by the model, so a stale or invented
+    name sends it looking for a tool that is not there. Two were found this way:
+    openi_get_creation_options (really openi_list_creation_options) and
+    openi_mark_notifications_read (really openi_mark_all_notifications_read).
+    """
+
+    # Non-tool identifiers that legitimately appear in prose.
+    ALLOWED = {"openi_bridge", "openi_resource"}
+
+    def _defined_tools(self):
+        import re
+        from pathlib import Path
+
+        source = Path(__file__).resolve().parents[1] / "src/openi_bridge/server.py"
+        text = source.read_text(encoding="utf-8")
+        return set(re.findall(r"def (openi_[a-z_]+)\(", text))
+
+    def _referenced_names(self):
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        names = set()
+        for path in list((root / "src/openi_bridge").glob("*.py")) + [root / "README.md"]:
+            names |= set(re.findall(r"openi_[a-z_]+", path.read_text(encoding="utf-8")))
+        return names
+
+    def test_no_dangling_tool_references(self):
+        defined = self._defined_tools()
+        assert defined, "failed to parse any tool definitions"
+        dangling = sorted(self._referenced_names() - defined - self.ALLOWED)
+        assert not dangling, (
+            f"prose references tools that do not exist: {dangling}. "
+            f"Either the tool was renamed or the reference is stale."
+        )
+
+    def test_known_renames_are_gone(self):
+        referenced = self._referenced_names()
+        for stale in ("openi_get_creation_options", "openi_mark_notifications_read"):
+            assert stale not in referenced, f"stale tool name {stale} reappeared"
+
+
 class TestCatalogIntegrity:
     """Cross-table consistency: the catalog is read by the model as fact."""
 

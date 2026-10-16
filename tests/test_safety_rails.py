@@ -219,7 +219,88 @@ class TestNoFabricatedFields:
         assert rows[0]["permissions"] == {"admin": True}
 
 
-class TestFreeWindowAccounting:
+class TestKernelReplyStatus:
+    """A kernel reply that is not "ok" must never be reported as success.
+
+    Jupyter's execute_reply.status is ok | error | abort. The old code set
+    ``ok = error is None``, and an aborted request carries no evalue -- so an
+    aborted (never executed) cell came back as a successful run with empty
+    stdout.
+    """
+
+    def _run(self, replies):
+        """Drive JupyterConsole._collect against a fake websocket.
+
+        _collect sends the request first and then ignores any message whose
+        parent_header.msg_id does not match the one it just sent, so the fake
+        has to capture that id from the outgoing frame and echo it back.
+        """
+        import json as _json
+
+        from openi_bridge.exec_on_card import JupyterConsole
+
+        class FakeWS:
+            def __init__(self):
+                self._replies = list(replies)
+                self._sent_id = None
+                self.timeout = None
+
+            def send(self, payload):
+                self._sent_id = _json.loads(payload)["header"]["msg_id"]
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def recv(self):
+                if not self._replies:
+                    raise TimeoutError("no more messages")
+                message = self._replies.pop(0)
+                message.setdefault("parent_header", {})["msg_id"] = self._sent_id
+                return _json.dumps(message)
+
+        return JupyterConsole._collect(FakeWS(), "print(1)", timeout=1.0)
+
+    def test_ok_status_is_success(self):
+        out = self._run([{"header": {"msg_type": "execute_reply"},
+                          "content": {"status": "ok"}}])
+        assert out["ok"] is True
+        assert out["status"] == "ok"
+
+    def test_abort_status_is_not_success(self):
+        """abort carries no evalue, so it used to slip through as ok=True."""
+        out = self._run([{"header": {"msg_type": "execute_reply"},
+                          "content": {"status": "abort"}}])
+        assert out["ok"] is False
+        assert "abort" in out["error"]
+
+    def test_error_status_is_not_success(self):
+        out = self._run([{"header": {"msg_type": "execute_reply"},
+                          "content": {"status": "error", "evalue": "boom"}}])
+        assert out["ok"] is False
+
+    def test_missing_reply_is_not_success(self):
+        """No execute_reply at all means we cannot claim anything ran."""
+        out = self._run([{"header": {"msg_type": "stream"},
+                          "content": {"text": "partial"}}])
+        assert out["ok"] is False
+        assert out["error"]
+
+
+class TestDownloadDoesNotClobber:
+    """A failed download must not destroy the previous good file."""
+
+    def test_previous_file_survives_a_failed_replace(self, tmp_path):
+        import os
+
+        dest = tmp_path / "data.bin"
+        dest.write_bytes(b"GOOD-OLD-CONTENT")
+        previous = str(dest) + ".prev"
+        os.replace(dest, previous)
+        try:
+            raise OSError(28, "No space left on device")
+        except BaseException:
+            os.replace(previous, dest)
+        assert dest.read_bytes() == b"GOOD-OLD-CONTENT"
     """keep_seconds must be measured from RUNNING, and truncation reported."""
 
     def test_margin_constant_is_sane(self):

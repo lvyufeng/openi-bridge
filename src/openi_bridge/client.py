@@ -675,7 +675,7 @@ class OpenIClient:
         if thread_id is not None:
             raise OpenIError(
                 "平台不提供“标记单条通知已读”的接口（PATCH 被反向代理拦截、"
-                "PUT/POST 路由未注册），只能用 openi_mark_notifications_read() 全部标已读。"
+                "PUT/POST 路由未注册），只能用 openi_mark_all_notifications_read 全部标已读。"
             )
         return self.put_json("/notifications", params={"all": "true"})
 
@@ -2372,7 +2372,21 @@ class OpenIClient:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
                 raise
-            os.replace(tmp_path, dest)
+            # os.replace 会无条件覆盖 dest。这不是"可恢复"的操作：目标文件如果
+            # 是上一次成功下载的产物，这次失败就把它换成了一个可能不完整的文件。
+            # 落盘前先把已有文件挪到 .prev，成功后再删，失败时能找回来。
+            previous = None
+            if os.path.exists(dest):
+                previous = f"{dest}.prev"
+                os.replace(dest, previous)
+            try:
+                os.replace(tmp_path, dest)
+            except BaseException:
+                if previous and os.path.exists(previous):
+                    os.replace(previous, dest)  # 回滚，别把老文件也弄丢
+                raise
+            if previous and os.path.exists(previous):
+                os.remove(previous)
             return {
                 "path": dest,
                 "bytes": size,
@@ -2743,7 +2757,7 @@ class OpenIClient:
     ) -> Dict[str, Any]:
         """POST /api/v1/{owner}/{repo}/ai_task/create.
 
-        spec_id must come from openi_get_creation_options for the same
+        spec_id must come from openi_list_creation_options for the same
         job_type/compute_source/cluster.
 
         When the caller supplies no image, the platform's own default image is

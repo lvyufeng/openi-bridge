@@ -26,8 +26,15 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+# 备份文件名用的时区；与 autopoint 一致。
+BEIJING = timezone(timedelta(hours=8))
+
+# 调 claude CLI 的超时。它可能等交互输入，不设上限会把安装卡死。
+CLI_TIMEOUT_SECONDS = 60.0
 
 from .client import dump
 
@@ -110,10 +117,19 @@ def apply_codex(command: Sequence[str], path: Path) -> Dict[str, Any]:
     body = [f"command = {json.dumps(command[0])}", f"args = [{args}]"]
     updated, action = _upsert_toml_section(original, f"[mcp_servers.{SERVER_NAME}]", body)
     if updated != original:
+        backup = None
         if path.exists():
-            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
-        path.write_text(updated)
-    return {"path": str(path), "action": action}
+            # 备份带时间戳，而不是每次覆盖同一个 .bak：连跑两次写坏了的配置时，
+            # 唯一的 .bak 已经被上一次覆盖，原始内容就找不回来了。
+            stamp = datetime.now(BEIJING).strftime("%Y%m%d%H%M%S")
+            backup = path.with_suffix(path.suffix + f".{stamp}.bak")
+            shutil.copy2(path, backup)
+        # 先写临时文件再 os.replace：write_text 是就地截断，写到一半失败（磁盘满、
+        # 进程被杀）会留下一个被截断的 config.toml，客户端下次启动就崩。
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(updated)
+        os.replace(tmp, path)
+    return {"path": str(path), "action": action, "backup": str(backup) if backup else None}
 
 
 def apply_all_codex(command: Sequence[str]) -> List[Dict[str, Any]]:
@@ -124,15 +140,27 @@ def apply_claude(command: Sequence[str]) -> Dict[str, Any]:
     cli = shutil.which("claude")
     if not cli:
         return {"action": "skipped", "reason": "没找到 claude 命令，请手动加配置文件"}
-    # 先删掉同名旧条目，避免重复；删不到就忽略。
-    subprocess.run(
+    # 先删掉同名旧条目，避免重复；删不到就忽略。两条命令都设超时：claude CLI 在
+    # 某些状态下会等交互输入，不设超时会把整个安装卡死在这里。
+    removed = subprocess.run(
         [cli, "mcp", "remove", "--scope", "user", SERVER_NAME],
         capture_output=True,
         text=True,
+        timeout=CLI_TIMEOUT_SECONDS,
     )
-    result = subprocess.run(
-        [cli, *claude_command(command)[1:]], capture_output=True, text=True
-    )
+    try:
+        result = subprocess.run(
+            [cli, *claude_command(command)[1:]],
+            capture_output=True,
+            text=True,
+            timeout=CLI_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "action": "failed",
+            "reason": f"claude mcp add 超过 {CLI_TIMEOUT_SECONDS}s 没有返回，已放弃",
+            "remove_returncode": removed.returncode,
+        }
     return {
         "action": "installed" if result.returncode == 0 else "failed",
         "returncode": result.returncode,

@@ -635,7 +635,8 @@ def openi_list_repo_collaborators(repo: str) -> str:
     """列出代码仓的协作者（login / full_name / is_active）。
 
     注意平台这个接口不回 permissions 字段（2026-10-17 实测），所以这里不承诺给出
-    每个人的权限。
+    每个人的权限；判断自己对该仓有没有写权限要靠别的手段（例如试着读仓的 right
+    接口，目前没有对应的 MCP 工具）。
     """
     try:
         with _client() as client:

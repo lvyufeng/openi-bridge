@@ -309,10 +309,22 @@ class JupyterConsole:
         error: Optional[str] = None
         reply_status: Optional[str] = None
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # 每次 recv 都设一个不超过剩余预算的超时：连接级 timeout 只约束握手和
+            # 单次 socket 读，内核静默挂住时 recv 会一直阻塞，deadline 根本轮不到
+            # 检查，调用方只能干等。
+            try:
+                ws.settimeout(max(0.5, remaining))
+            except Exception:  # noqa: BLE001 - 不影响主流程
+                pass
             try:
                 message = json.loads(ws.recv())
             except Exception as exc:  # noqa: BLE001
+                if time.monotonic() >= deadline:
+                    break  # 到点了，交给下面的超时分支给结论
                 chunks.append(f"[ws error] {type(exc).__name__}: {exc}\n")
                 break
             if message.get("parent_header", {}).get("msg_id") != message_id:
@@ -333,8 +345,19 @@ class JupyterConsole:
                 if content.get("status") == "error" and not error:
                     error = content.get("evalue") or "execution failed"
                 break
+        # 只有 status == "ok" 才算跑成功。Jupyter 的 execute_reply.status 除了
+        # ok/error 还有 "abort"（请求被丢弃、代码根本没执行），而 abort 不带
+        # evalue，所以早期版本用 `ok = error is None` 会把它报成成功，返回一个
+        # 空 stdout 的成功结果——调用方以为代码跑了，其实一行都没执行。
+        if reply_status is None:
+            error = error or (
+                f"内核在 {timeout:.0f} 秒内没有回 execute_reply"
+                "（超时或连接中断），无法确认代码是否执行完。"
+            )
+        elif reply_status != "ok" and not error:
+            error = f"内核回的执行状态是 {reply_status!r}，代码没有正常跑完"
         return {
-            "ok": error is None,
+            "ok": reply_status == "ok" and error is None,
             "status": reply_status,
             "stdout": "".join(chunks),
             "error": error,
