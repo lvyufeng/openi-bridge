@@ -58,18 +58,39 @@ python3 -m venv ~/.local/share/openi-bridge/venv
 ~/.local/share/openi-bridge/venv/bin/python -m openi_bridge.install_mcp --apply
 ~~~
 
-它会往 Codex 的 `config.toml` 写一段 `[mcp_servers.openi-bridge]`（改前自动备份成
-`config.toml.bak`），并执行 `claude mcp add --scope user openi-bridge <绝对路径>`。
-Codex 读的是 `$CODEX_HOME/config.toml`（没设就是 `~/.codex/config.toml`），这台机器上
-`CODEX_HOME` 指向 `~/.codex-tui`，同时又有一份 `~/.codex/config.toml`，所以两份都会写到，
-换个客户端也找得到。两处都只放**启动命令**，不放令牌——运行时从 `~/.openi/token.json`
-读，所以配置里没有明文密钥，换令牌也不用改配置。
+它一次把四个客户端都配好，每个的写法和配置形状都不一样：
+
+| 客户端 | 写到哪里 | 形状 |
+| --- | --- | --- |
+| **Claude Code** | `~/.claude.json` 的 `mcpServers` | 执行 `claude mcp add --scope user --transport stdio` |
+| **Codex** | `$CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`）的 `[mcp_servers.openi-bridge]` | TOML，`command` + `args` |
+| **dsh** | `$DSH_HOME/profiles/<profile>/cordis.patch.yml`（每个 profile 一份） | YAML 顶层数组里的 `@deepseek-ai/dsh-mcp-client` 条目 |
+| **Cursor** | 用户 profile（`cursor --add-mcp`） | 扁平 JSON 对象，**带 `name`** |
+
+几个容易踩的点：
+
+- **dsh 每个 profile 各一份配置**（`dsh-tui` / `headless` / `web` …），只写一个的话
+  换个 profile 就没这个工具。安装器会把所有 profile 都写上。它的补丁文件是人手维护的
+  YAML，所以写入是**行级插入、不重新序列化**——round-trip 一次会把里面的注释全洗掉。
+  默认模板是一行 `[]`，安装器会把它替换掉而不是往后追加（追加会变成两个 YAML 文档，
+  dsh 直接解析失败）。
+- **Cursor 的形状和别家不同**：`cursor --add-mcp` 收的是**一条扁平服务器定义**且必须带
+  `name`，传 Claude 那种 `{"mcpServers": {...}}` 嵌套形式会被拒（`Missing name property`）。
+- **Codex 可能有多份 home**（`$CODEX_HOME` 与 `~/.codex`），安装器两份都写。
+- 每个文件改前都会**带时间戳备份**（`config.toml.20261017…bak`），写入走临时文件 +
+  `os.replace`，写到一半失败不会留下被截断的配置。
+
+**四处都只放启动命令，不放令牌**——运行时从 `~/.openi/token.json`（或 `OPENI_TOKEN`）
+读，所以配置里没有明文密钥，换令牌也不用改配置。安装器有测试断言这一点。
 
 **第 3 步，重启客户端并验证。** 用 `claude mcp list` / `codex mcp list` 看是否
-Connected / enabled（Claude Code 里也可以 `/mcp` 查看），然后随便找个目录问一句
-“OpenI 上现在有哪些卡能开、我还剩多少积分”。想确认令牌没问题，就调 `openi_whoami`。
+Connected / enabled（Claude Code 里也可以 `/mcp` 查看）；dsh 用
+`dsh --profile dsh-tui --dump-config | grep mcp-openi-bridge` 确认条目进了合成树。
+然后随便找个目录问一句"OpenI 上现在有哪些卡能开、我还剩多少积分"。想确认令牌没问题，
+就调 `openi_whoami`。
 
-Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即可：
+只想手工配一个客户端的话，各家的片段 `install_mcp` 不带 `--apply` 时会直接打印出来。
+Claude Desktop 等只认 JSON 的客户端，写绝对路径即可：
 
 ~~~json
 {

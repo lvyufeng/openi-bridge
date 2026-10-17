@@ -737,6 +737,166 @@ class TestPaginationTerminates:
         assert client._subject_entry("o/r", "dataset", "x.txt") is None
 
 
+class TestInstallMcpTargets:
+    """The installer writes to four clients' config files; each has its own shape.
+
+    dsh's config is a hand-maintained YAML patch full of comments and custom
+    plugins, so the writer must do a surgical line insert rather than a YAML
+    round-trip -- reparsing would strip every comment in the file.
+    """
+
+    def _mod(self):
+        from openi_bridge import install_mcp
+
+        return install_mcp
+
+    def test_dsh_entry_has_the_fields_dsh_expects(self):
+        m = self._mod()
+        lines = m.dsh_entry(["/venv/bin/openi-bridge"])
+        text = "\n".join(lines)
+        assert "- id: mcp-openi-bridge" in text
+        assert "'@deepseek-ai/dsh-mcp-client'" in text
+        assert "transport: stdio" in text
+        assert "serverName: openi-bridge" in text
+        assert "command: /venv/bin/openi-bridge" in text
+        assert "args: []" in text
+
+    def test_dsh_entry_carries_no_token(self):
+        m = self._mod()
+        text = "\n".join(m.dsh_entry(["/venv/bin/openi-bridge"]))
+        assert "TOKEN" not in text and "token" not in text
+
+    def test_dsh_insert_is_idempotent(self, tmp_path):
+        m = self._mod()
+        f = tmp_path / "cordis.patch.yml"
+        f.write_text("# a comment\n- insert:\n    - id: mcp-other\n      name: x\n", encoding="utf-8")
+        first = m.apply_dsh(["/venv/bin/openi-bridge"], f)
+        body = f.read_text(encoding="utf-8")
+        second = m.apply_dsh(["/venv/bin/openi-bridge"], f)
+        assert first["action"] == "added"
+        assert second["action"] == "unchanged"
+        assert f.read_text(encoding="utf-8") == body
+        assert body.count("- id: mcp-openi-bridge") == 1
+
+    def test_dsh_insert_preserves_comments(self, tmp_path):
+        m = self._mod()
+        f = tmp_path / "cordis.patch.yml"
+        before = "# keep me\n# and me\n- insert:\n    - id: mcp-other\n      name: x\n"
+        f.write_text(before, encoding="utf-8")
+        m.apply_dsh(["/venv/bin/openi-bridge"], f)
+        after = f.read_text(encoding="utf-8")
+        assert "# keep me" in after and "# and me" in after
+        assert "- id: mcp-other" in after
+
+    def test_dsh_update_replaces_rather_than_duplicates(self, tmp_path):
+        m = self._mod()
+        f = tmp_path / "cordis.patch.yml"
+        f.write_text("", encoding="utf-8")
+        m.apply_dsh(["/old/bin/openi-bridge"], f)
+        m.apply_dsh(["/new/bin/openi-bridge"], f)
+        text = f.read_text(encoding="utf-8")
+        assert text.count("- id: mcp-openi-bridge") == 1
+        assert "/new/bin/openi-bridge" in text
+        assert "/old/bin/openi-bridge" not in text
+
+    def test_codex_reapply_is_idempotent_and_reports_no_backup(self, tmp_path):
+        """Re-running apply must be a no-op, not a crash.
+
+        apply_codex built its return value from a `backup` variable that only
+        existed inside the "something changed" branch, so a second apply (where
+        nothing changes) raised UnboundLocalError instead of reporting success.
+        """
+        m = self._mod()
+        f = tmp_path / "config.toml"
+        first = m.apply_codex(["/venv/bin/openi-bridge"], f)
+        second = m.apply_codex(["/venv/bin/openi-bridge"], f)
+        assert first["action"] == "added"
+        assert first["backup"] in (None, "None") or first["backup"]
+        # the no-op path must return cleanly
+        assert second["action"] in ("added", "updated")
+        assert second.get("backup") is None
+        assert f.read_text(encoding="utf-8").count("[mcp_servers.openi-bridge]") == 1
+
+    def test_dsh_handles_the_empty_array_template(self, tmp_path):
+        """dsh's default per-profile template is a bare `[]`.
+
+        Appending a second YAML document after it breaks the file outright
+        (dsh: "document separator is expected"), which is how the headless
+        profile got corrupted on the first apply. The `[]` must be replaced,
+        and the header comments kept.
+        """
+        m = self._mod()
+        f = tmp_path / "cordis.patch.yml"
+        f.write_text(
+            "# Your patch layer for this dsh profile:\n"
+            "# a top-level YAML array of loader patch entries.\n"
+            "[]\n",
+            encoding="utf-8",
+        )
+        m.apply_dsh(["/venv/bin/openi-bridge"], f)
+        text = f.read_text(encoding="utf-8")
+
+        assert "# Your patch layer" in text, "header comments must survive"
+        assert "- id: mcp-openi-bridge" in text
+        # the top-level `[]` must be gone; the only [] left is the args value
+        top_level = [l for l in text.splitlines() if l.strip() == "[]"]
+        assert not top_level, "a leftover top-level [] would be a second document"
+
+    def test_dsh_empty_array_output_is_one_yaml_document(self, tmp_path):
+        """The result must parse as a single YAML array."""
+        yaml = pytest.importorskip("yaml")
+
+        m = self._mod()
+        f = tmp_path / "cordis.patch.yml"
+        f.write_text("# header\n[]\n", encoding="utf-8")
+        m.apply_dsh(["/venv/bin/openi-bridge"], f)
+        doc = yaml.safe_load(f.read_text(encoding="utf-8"))
+        assert isinstance(doc, list)
+        assert any(
+            isinstance(e, dict) and e.get("insert") for e in doc
+        ), "expected one insert entry"
+
+    def test_codex_block_is_valid_toml_shape(self):
+        m = self._mod()
+        block = m.codex_block(["/venv/bin/openi-bridge"])
+        assert block.startswith("[mcp_servers.openi-bridge]")
+        assert 'command = "/venv/bin/openi-bridge"' in block
+
+    def test_cursor_payload_is_json_with_no_secret(self):
+        import json as _json
+
+        m = self._mod()
+        entry = _json.loads(m.cursor_payload(["/venv/bin/openi-bridge"]))
+        # Cursor takes a flat single-server object with a name; the nested
+        # {"mcpServers": {...}} shape is rejected with "Missing name property".
+        assert entry["name"] == "openi-bridge"
+        assert entry["command"] == "/venv/bin/openi-bridge"
+        assert entry["args"] == []
+        assert "token" not in _json.dumps(entry).lower()
+
+    def test_cursor_payload_is_flat_not_nested(self):
+        import json as _json
+
+        m = self._mod()
+        entry = _json.loads(m.cursor_payload(["/venv/bin/openi-bridge"]))
+        assert "mcpServers" not in entry, (
+            "Cursor rejects the nested form; it wants one flat server object"
+        )
+
+    def test_console_script_is_absolute(self):
+        m = self._mod()
+        cmd = m.console_script()
+        assert cmd and cmd[0].startswith("/"), f"must be an absolute path: {cmd}"
+
+    def test_no_client_config_embeds_a_token(self, tmp_path):
+        """Whatever shape a client wants, the token stays out of it."""
+        m = self._mod()
+        cmd = ["/venv/bin/openi-bridge"]
+        assert "token" not in m.codex_block(cmd).lower()
+        assert "token" not in m.cursor_payload(cmd).lower()
+        assert "token" not in "\n".join(m.dsh_entry(cmd)).lower()
+
+
 class TestTaskActionVerified:
     """The verified wrapper must distinguish acceptance from effect."""
 
