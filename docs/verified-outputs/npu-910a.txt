@@ -1,6 +1,6 @@
-create: {"code": 0, "msg": "ok", "data": {"id": 000000, "status": ""}}
-TASK 000000
-DEBUG_URL https://<notebook-host>/47943dea-3d0f-4b1d-92de-306b53776b10/lab?token=<redacted>
+create: {"code": 0, "msg": "ok", "data": {"id": TASK-08, "status": ""}}
+TASK TASK-08
+DEBUG_URL https://<notebook-host>/<uuid>/lab?token=<redacted>
 kernelspec: python-3.10.6
 ### /usr/local/sbin/npu-smi
   $ npu-smi  (rc 215)

@@ -10,10 +10,10 @@ openi_stop_task / openi_delete_task。
 探针脚本（仓内 train.py）：用 c2net.context.prepare() 拿到 output_path，
 写 hello.txt、sub/mid.txt、sub/deep/leaf.bin，再 upload_output()。
 
-任务号 000000（000000 是同一套流程的扁平版本），状态流转 PREPARING → WAITING →
+任务号 TASK-13（TASK-14 是同一套流程的扁平版本），状态流转 PREPARING → WAITING →
 RUNNING → SUCCEEDED，全程约 30 秒。
 
-一、调度事件时间线（openi_task_events → GET /ai_task/operation_profile?id=000000）
+一、调度事件时间线（openi_task_events → GET /ai_task/operation_profile?id=TASK-13）
 
     {"events": [
       {"timestamp": "2026-10-16T02:51:33Z", "reason": "Scheduled",
@@ -27,30 +27,30 @@ RUNNING → SUCCEEDED，全程约 30 秒。
 每条含 message / name / reason / timestamp / action，时间戳是 UTC。这是任务排队、被抢占
 或异常退出时定位“卡在哪一步”的依据。
 
-二、节点清单（openi_task_nodes → GET /ai_task/node_info?id=000000）
+二、节点清单（openi_task_nodes → GET /ai_task/node_info?id=TASK-13）
 
     {"nodes": [{"id": 0, "log_file_name": ""}]}
 
 三、输出目录（openi_task_outputs / openi_task_output_files）
 
-根目录一层（GET /ai_task/output?id=000000，status 为 1 时还没索引完）：
+根目录一层（GET /ai_task/output?id=TASK-13，status 为 1 时还没索引完）：
 
     {"output": {"status": 0, "file_list": [
       {"FileName": "sub", "IsDir": true, ...},
       {"FileName": "hello.txt", "IsDir": false, "Size": 17,
-       "RelativePath": "56122205-3c7c-44ac-b971-0aa36fc2afd4/hello.txt"}]}}
+       "RelativePath": "<uuid>/hello.txt"}]}}
 
-递归全量（GET /ai_task/output/all?id=000000，FileName 就是相对输出根的完整路径）：
+递归全量（GET /ai_task/output/all?id=TASK-13，FileName 就是相对输出根的完整路径）：
 
     hello.txt            17
     sub/deep/leaf.bin    25
     sub/mid.txt          19
 
-每个子目录用 parent_dir 下翻：GET /ai_task/output?id=000000&parent_dir=sub 会列出
+每个子目录用 parent_dir 下翻：GET /ai_task/output?id=TASK-13&parent_dir=sub 会列出
 sub 里的 deep（目录）与 mid.txt；父目录参数名是 parent_dir（传 dir 无效）。
 
 关键平台行为：输出是异步索引的。任务刚进 SUCCEEDED 时 output.status=1、file_list 为空，
-约两分钟后才变成 status=0 并列出文件（000000、000000 都如此）。所以工具带 ready 标记，
+约两分钟后才变成 status=0 并列出文件（TASK-14、TASK-13 都如此）。所以工具带 ready 标记，
 刚跑完查不到文件当成“还没索引”，不是“没有输出”。
 
 四、下载单个输出文件（openi_task_download_output）
@@ -58,16 +58,16 @@ sub 里的 deep（目录）与 mid.txt；父目录参数名是 parent_dir（传 
 平台先答 307，再跳到 OBS 的签名直链（obs.cn-south-222.ai.pcl.cn/...）。file_name 给纯
 文件名（配 parent_dir）或相对路径都能命中：
 
-    GET /ai_task/output/download?id=000000&file_name=sub/mid.txt          -> 200 "nested:sub/mid.txt\n"
-    GET /ai_task/output/download?id=000000&file_name=sub/deep/leaf.bin    -> 200 "nested:sub/deep/leaf.bin\n"
-    GET /ai_task/output/download?id=000000&file_name=hello.txt            -> 200 "probe output from openi-bridge\n"
+    GET /ai_task/output/download?id=TASK-13&file_name=sub/mid.txt          -> 200 "nested:sub/mid.txt\n"
+    GET /ai_task/output/download?id=TASK-13&file_name=sub/deep/leaf.bin    -> 200 "nested:sub/deep/leaf.bin\n"
+    GET /ai_task/output/download?id=TASK-13&file_name=hello.txt            -> 200 "probe output from openi-bridge\n"
 
 带 save_to 时流式落盘（先写 .part 再改名，同时给 md5）：
 
     {"path": "/tmp/scratch-repo/dl_out/hello.txt", "bytes": 17, "mb": 0.0,
      "md5": "0ef83aafe57c71174580adf539b3ea88"}
 
-五、整份日志（openi_task_download_log → GET /ai_task/log/download?id=000000）
+五、整份日志（openi_task_download_log → GET /ai_task/log/download?id=TASK-13）
 
 返回的是纯文本（不是 JSON），一次给完整日志。带 save_to 落盘：
 
@@ -76,9 +76,9 @@ sub 里的 deep（目录）与 mid.txt；父目录参数名是 parent_dir（传 
 
 日志内容含 c2net 准备、写入三个文件、`upload_output ok`、`nested probe done`、`success`。
 
-六、loss 曲线（openi_task_loss → GET /ai_task/loss?id=000000）
+六、loss 曲线（openi_task_loss → GET /ai_task/loss?id=TASK-13）
 
     {"loss": []}   <- 探针脚本没有按平台方式上报 loss，所以是空列表；路由本身 200 可用。
 
-收尾：任务 000000 / 000000 已停止并删除；探针用的临时私有仓 scratch-repo
+收尾：任务 TASK-14 / TASK-13 已停止并删除；探针用的临时私有仓 scratch-repo
 用完已删除。任务存活都在几十秒内，不足 6 分钟不扣费。

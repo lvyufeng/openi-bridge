@@ -5,17 +5,17 @@
 
 在 scratch-repo 仓里放一个 train.py：用 c2net.context.prepare() 拿 output_path，
 写 metrics.txt 与 ckpt/model.bin，再 upload_output()。用 openi_start_task 开 TRAIN 任务
-000000（GCU / ENFLAME-T20，spec 229），约 30 秒到 SUCCEEDED；输出文件约两分钟后才被平台
+TASK-12（GCU / ENFLAME-T20，spec 229），约 30 秒到 SUCCEEDED；输出文件约两分钟后才被平台
 索引出来（openi_task_output_files 的 file_list 从空变成两条，FileName 即
 "ckpt/model.bin" 与 "metrics.txt"）。
 
 导出到数据集（先 openi_create_dataset 建 scratch-repo）：
 
-    POST /ai_task/export2dataset?dataset_id=<uuid>&id=000000
-    body: task_id=000000&file_list_str=metrics.txt,ckpt/model.bin
-    -> 200 {"code":0,"msg":"ok","data":{"id":"dataset:<uuid>:export_task:000000:process_id"}}
+    POST /ai_task/export2dataset?dataset_id=<uuid>&id=TASK-12
+    body: task_id=TASK-12&file_list_str=metrics.txt,ckpt/model.bin
+    -> 200 {"code":0,"msg":"ok","data":{"id":"dataset:<uuid>:export_task:TASK-12:process_id"}}
 
-    GET /dataset/get_export_process?id=dataset:<uuid>:export_task:000000:process_id
+    GET /dataset/get_export_process?id=dataset:<uuid>:export_task:TASK-12:process_id
     -> {"ckpt/model.bin":100,"metrics.txt":100}   （100 完成；0 刚开始；-1/-2/-3 失败）
 
 导出后 /dataset/files?dataset_name=scratch-repo 里能看到 ckpt/ 目录与
@@ -24,11 +24,11 @@ metrics.txt，说明产物已经脱离任务、落进数据集。关键点：这
 
 导出成模型库（scratch-repo）：
 
-    POST /ai_task/export2aimodel?id=000000
+    POST /ai_task/export2aimodel?id=TASK-12
     body: name=...&alias=...&owner_id=248&aimodel_type=0&is_private=false&engine=0&
-          label=&license=MIT&task_id=000000&file_list_str=ckpt/model.bin
+          label=&license=MIT&task_id=TASK-12&file_list_str=ckpt/model.bin
     -> 200 {"code":0,"msg":"ok","data":{"id":"a512271f-...","name":"scratch-repo",
-            "owner_name":"<account>","process_id":"ai_model:a512271f-...:export_task:000000:process_id"}}
+            "owner_name":"<account>","process_id":"ai_model:a512271f-...:export_task:TASK-12:process_id"}}
 
     GET /aimodel/get_export_process?id=ai_model:a512271f-...:... -> {"ckpt/model.bin":100}
 
@@ -56,5 +56,5 @@ PUT 与带 _method=PATCH 的 POST 都 404，所以编辑只能走 issue 路径�
 threads/999999999 返回 404，两条都证明 GET 路由是活的。单条标已读没有可用接口：
 PATCH 被反代拦截、PUT 与 POST(_method=PATCH) 均 404（见 README 的已知限制）。
 
-清理：删掉探针任务 000000、探针仓 scratch-repo、探针数据集
-scratch-repo / scratch-repo、探针模型 scratch-repo。
+清理：删掉探针任务 TASK-12、探针仓 scratch-repo、探针数据集
+scratch-repo、探针模型 scratch-repo。

@@ -391,7 +391,7 @@ class TestStartTaskRawGuards:
         from openi_bridge.server import _REPO_FULLNAME_RE
 
         assert _REPO_FULLNAME_RE.match("owner/name")
-        assert _REPO_FULLNAME_RE.match("scratch-repo")
+        assert _REPO_FULLNAME_RE.match("owner/mindnlp")
         # these would otherwise be spliced into f"/{repo}/ai_task/create"
         assert not _REPO_FULLNAME_RE.match("no-slash")
         assert not _REPO_FULLNAME_RE.match("../etc/passwd")

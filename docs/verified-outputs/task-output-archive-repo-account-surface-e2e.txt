@@ -9,7 +9,7 @@
 
 一、任务整包输出（openi_task_download_output_archive → GET /ai_task/output/download/all）
 
-接口行为（已验证 2026-10-17）：GET /ai_task/output/download/all?id=000000
+接口行为（已验证 2026-10-17）：GET /ai_task/output/download/all?id=TASK-15
 -> 200，Content-Type: application/octet-stream，回的是 zip 字节流本身，不走
 单文件下载那条 307 跳 OBS 签名直链的路（同一个任务上调
 /ai_task/output/download 是 404，两条路由形态不同）。
@@ -18,11 +18,11 @@
 记录，不是错误。这个 22 字节的数字已验证。
 
 原稿此处的实测（待复核）：在 scratch-repo 仓推 zip_train.py（写
-metrics.txt 与 ckpt/model.bin 后 upload_output()），开 TRAIN 任务 000000
+metrics.txt 与 ckpt/model.bin 后 upload_output()），开 TRAIN 任务 TASK-16
 （GCU / ENFLAME-T20，spec 229）走 WAITING → RUNNING → FAILED（脚本跑完并上传了
 产物，任务态是 FAILED 但输出已落），整包下载为 287 字节 zip，成员
 ckpt/model.bin（28 字节）与 metrics.txt（10 字节，内容 b'loss=0.01\n'）。
-上面那个 22 字节的空包就是拿 000000 对照测的。
+上面那个 22 字节的空包就是拿 TASK-15 对照测的。
 
 顺带把 /ai_task/output 里原本没透出的元数据补进 openi_task_outputs：
 is_task_terminal、can_reschedule、can_download。
@@ -69,6 +69,6 @@ labels 9 条（平台默认 bug/enhancement 等）、collaborators 1 条、starg
 
 四、收尾
 
-原稿称任务 000000 / 000000 均已停止并删除、测试仓已删除、无残留。仓的部分可以
+原稿称任务 TASK-16 / TASK-15 均已停止并删除、测试仓已删除、无残留。仓的部分可以
 佐证：scratch-repo 现在是 404，确实不在了。任务号删除后平台一律回 403，
 无法再区分「已删除」与「不存在」，所以这部分只能依据原稿与仓的 404 结果。

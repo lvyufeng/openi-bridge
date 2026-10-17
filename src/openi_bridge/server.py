@@ -1089,7 +1089,7 @@ def openi_create_dataset(
 ) -> str:
     """新建一个空数据集，随后用 openi_upload_dataset_files 往里面传文件。
 
-    数据集全名是 当前账号登录名/name，例如 scratch-repo。返回里的 id
+    数据集全名是 当前账号登录名/name，例如 alice/my-dataset。返回里的 id
     就是这个数据集的 UUID，可直接作为 openi_start_task 的 dataset_uuid_str。
 
     name: 数据集短名（URL 标识），只能字母/数字/连字符/下划线/点，字母数字开头结尾。
@@ -1178,7 +1178,7 @@ def openi_create_model(
 def openi_data_subject_info(subject: str, subject_type: str = "dataset") -> str:
     """查询数据集/模型库的详情，主要是拿到 UUID 和是否有写权限。
 
-    subject: 全名 owner/name，例如 scratch-repo。
+    subject: 全名 owner/name，例如 alice/my-dataset。
     subject_type: dataset（数据集）或 model（模型库）。
     返回的 id 用作 openi_start_task 的 dataset_uuid_str / pretrain_model_id_str。
     """

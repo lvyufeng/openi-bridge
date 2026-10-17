@@ -5,29 +5,29 @@
 acc_cards_num) 到 /ai_task/creation/required 的实时清单配对 spec →
 openi_start_task_from_template 创建 → 轮询状态 → 停止 → 删除。
 
-模板：ed82f65c-14a6-4542-a8c1-506a210659e0
+模板：<uuid>
       "NPU调试任务-MNIST手写数字识别样例"
       job_type=DEBUG  compute_source=NPU  cluster=C2Net
       acc_card_type=ASCEND910  acc_cards_num=1
       repo=OpenIOSSG/OpenI_Cloudbrain_Example  branch=master  boot_file=(空)
       image_id=0b79fed7504c4etrainms22cann7caaicb1
       image_name=mindspore_2_2_cann7_cb2_caai_26
-      image_url=318c8cac-2011-44c8-acee-21d6a1c138ff   <- 实际是内部记录 UUID，不是镜像地址
-      数据集=MnistDataset_mindspore (aced78db-6703-41b6-be46-140ccd411107)
+      image_url=<uuid>   <- 实际是内部记录 UUID，不是镜像地址
+      数据集=MnistDataset_mindspore (<uuid>)
 
 本账号实时配到的 spec：id=328  acc_card_type=ASCEND910  acc_cards_num=1
       unit_price=2  ai_center_code=cloudbrain2
 
 create 返回（_request_payload 即真正发出去的请求体）：
 
-{"id": 000000, "status": "",
+{"id": TASK-17, "status": "",
  "_request_payload": {"job_type": "DEBUG", "display_job_name": "lvyuf202610152066915",
    "spec_id": 328, "compute_source": "NPU", "cluster": "C2Net",
    "work_server_number": 1, "has_internet": 2, "visualize_required": false,
    "auto_save": false, "branch_name": "master",
    "image_id": "5b9d7a3c8e2f1d4e0a6b7c8d9e0f1a2b",
    "image_name": "cann8_3_rc1_mindspore2_7",
-   "dataset_uuid_str": "aced78db-6703-41b6-be46-140ccd411107"},
+   "dataset_uuid_str": "<uuid>"},
  "_image_source": "verified_image", "_branch_name": "master",
  "_branch_source": "explicit"}
 
@@ -40,5 +40,5 @@ create 返回（_request_payload 即真正发出去的请求体）：
 2. 镜像用的是 spec 328 上实测跑通的 image_id（_image_source=verified_image），模板里
    那个 UUID 形态的 image_url 被忽略了——它当镜像地址发下去拉不起来。
 
-同一轮里另一个用同样路径创建的任务 000000（先把模板字段手工映射了一遍）也已经停止并
+同一轮里另一个用同样路径创建的任务 TASK-18（先把模板字段手工映射了一遍）也已经停止并
 删除，账号下没有留下本次实测的任务。

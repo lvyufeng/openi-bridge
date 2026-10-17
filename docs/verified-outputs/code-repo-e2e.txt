@@ -1,7 +1,7 @@
 代码仓读写实测（推代码 → 覆盖写 → 用该仓跑任务）
 
 创建时间 2026-10-15，账号 <account>，真实令牌。全程走新加的工具，探针仓库
-scratch-repo 与任务 000000 事后都已删除，仓库列表回查已无该仓。
+scratch-repo 与任务 TASK-02 事后都已删除，仓库列表回查已无该仓。
 
 建仓 POST /user/repos → 201（耗时约 32 秒）
 {"ok": true, "full_name": "scratch-repo", "default_branch": "master",
@@ -25,13 +25,13 @@ scratch-repo 与任务 000000 事后都已删除，仓库列表回查已无该�
   print("rewritten by openi_write_repo_file", flush=True)
 
 用这个仓建 TRAIN 任务（spec_id 210 / NVIDIA V100 / C2Net / branch master / boot_file train.py）
-{"id": 000000, "_branch_name": "master", "_branch_source": "explicit",
+{"id": TASK-02, "_branch_name": "master", "_branch_source": "explicit",
  "_image_source": "fallback_image_url",
  "_request_payload": {"job_type": "TRAIN", "spec_id": 210, "compute_source": "GPU",
    "cluster": "C2Net", "branch_name": "master", "boot_file": "train.py",
    "image_url": "swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1"}}
 状态 WAITING → SUCCEEDED。
-openi_task_logs(id=000000) 的 content：
+openi_task_logs(id=TASK-02) 的 content：
   Processing /tmp/sdk/c2net-0.4.0-py3-none-any.whl
   Installing collected packages: c2net
   Successfully installed c2net-0.4.0

@@ -16,7 +16,7 @@ openi_stop_task → openi_delete_task。
 
 创建（openi_start_task，spec 237 / A100 / C2Net / boot_file=serve.py）：
 
-    {"id": 000000, "status": ""}
+    {"id": TASK-11, "status": ""}
 
 状态流转：WAITING（约 40 秒）→ RUNNING；任务详情里 port=8000、
 end_point=y4c98dbaecfb4602、app_name=""。
@@ -28,7 +28,7 @@ end_point=y4c98dbaecfb4602、app_name=""。
 
 RUNNING 后用 openi_task_service_url 取到的完整结果：
 
-    {"task_id": "000000", "status": "RUNNING", "port": 8000,
+    {"task_id": "TASK-11", "status": "RUNNING", "port": 8000,
      "end_point": "y4c98dbaecfb4602", "app_name": "",
      "url": "https://<notebook-host>"}
 

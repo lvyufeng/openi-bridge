@@ -1,5 +1,5 @@
-create: {"code": 0, "msg": "ok", "data": {"id": 000000, "status": ""}}
-TASK 000000
+create: {"code": 0, "msg": "ok", "data": {"id": TASK-10, "status": ""}}
+TASK TASK-10
 DEBUG_URL https://cloudbrain3-oct.openi.org.cn/notebook_<id>_task0?token=
 kernelspec: python3
 ### /usr/local/bin/npu-smi

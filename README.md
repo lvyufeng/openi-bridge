@@ -95,7 +95,7 @@ Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即�
 `openi_points` / `openi_points_today` / `openi_estimate_runtime`，最后这个用实时单价和
 余额算出每个规格还能开多少机时。
 
-**开卡。** “用一张 910B 开个调试任务，代码仓选 `scratch-repo`，跑完给我 Jupyter 地址。”
+**开卡。** “用一张 910B 开个调试任务，代码仓选 `scratch-repo-8`，跑完给我 Jupyter 地址。”
 助手先 `openi_list_creation_options(job_type="DEBUG", compute_source="NPU")` 拿实时
 `spec_id` 和镜像，再 `openi_start_task` 建任务，`openi_get_task` 跟状态，
 `openi_task_debug_url` 取入口。
@@ -237,19 +237,19 @@ swr.cn-south-1.myhuaweicloud.com/openi/cuda111_python37_pytorch191:v1
 
 | 算力类型 | 实测卡型 | 验证命令 | 实测任务号 |
 | --- | --- | --- | --- |
-| GPU | NVIDIA Tesla V100S-PCIE-32GB（32768 MiB，驱动 570.124.06，CUDA 12.8） | `nvidia-smi` | 000000 |
-| NPU | 华为昇腾 910B2（HBM 65536 MB，npu-smi 25.2.1，aarch64） | `npu-smi info` | 000000 |
-| NPU | 华为昇腾 910ProA / 910A（HBM 32768 MB，npu-smi 24.1.0，aarch64） | `npu-smi info` | 000000 |
-| NPU | 华为昇腾 910C（双芯，每芯 HBM 65536 MB，npu-smi 26.0.rc3） | `npu-smi info` | 000000 |
-| GCU | 燧原 Enflame T20（32 G 显存，EFSMI V1.21.0，驱动 2.5.20231219） | `efsmi` | 000000 |
-| MLU | 寒武纪 MLU290-M5（32768 MiB，CNMON v4.20.16） | `cnmon` | 000000 |
-| DCU | 海光 DCU / K100_AI（HCU，PwrCap 400W） | `hy-smi`、`rocm-smi` | 000000 |
-| ILUVATAR-GPGPU | 天数智芯 Iluvatar MR-V100（32768 MiB，IX-ML 驱动 4.4.0） | `ixsmi` | 000000 |
-| BIREN-GPU | 壁仞 Biren106M（32512 MiB，400W，BR-SMI 1.10.1 / SUPA 1.10） | `brsmi` | 000000 |
+| GPU | NVIDIA Tesla V100S-PCIE-32GB（32768 MiB，驱动 570.124.06，CUDA 12.8） | `nvidia-smi` | TASK-05 |
+| NPU | 华为昇腾 910B2（HBM 65536 MB，npu-smi 25.2.1，aarch64） | `npu-smi info` | TASK-09 |
+| NPU | 华为昇腾 910ProA / 910A（HBM 32768 MB，npu-smi 24.1.0，aarch64） | `npu-smi info` | TASK-08 |
+| NPU | 华为昇腾 910C（双芯，每芯 HBM 65536 MB，npu-smi 26.0.rc3） | `npu-smi info` | TASK-10 |
+| GCU | 燧原 Enflame T20（32 G 显存，EFSMI V1.21.0，驱动 2.5.20231219） | `efsmi` | TASK-04 |
+| MLU | 寒武纪 MLU290-M5（32768 MiB，CNMON v4.20.16） | `cnmon` | TASK-07 |
+| DCU | 海光 DCU / K100_AI（HCU，PwrCap 400W） | `hy-smi`、`rocm-smi` | TASK-03 |
+| ILUVATAR-GPGPU | 天数智芯 Iluvatar MR-V100（32768 MiB，IX-ML 驱动 4.4.0） | `ixsmi` | TASK-06 |
+| BIREN-GPU | 壁仞 Biren106M（32512 MiB，400W，BR-SMI 1.10.1 / SUPA 1.10） | `brsmi` | TASK-01 |
 
 除了纯 CPU，这些算力都能真正开到卡。`METAX-GPGPU`（沐曦 C500）平台上有可用规格
 （`spec_id=333`），但 2026-10-13 23:00 到 2026-10-14 09:12 之间反复创建了 9 次 DEBUG
-任务，7 次卡在 `centerPending`（示例任务 000000、000000）、2 次 `CREATED_FAILED`，一次都
+任务，7 次卡在 `centerPending`（示例任务 TASK-19、TASK-20）、2 次 `CREATED_FAILED`，一次都
 没有调度到卡，任务详情里的 `ai_center_code` 还是 `openi-mlu`，看起来没有真正的沐曦资源
 池，所以上表里没有它。`CPU` 是唯一在 `openi_list_creation_options` 里拿不到规格的
 `compute_source`。
@@ -663,7 +663,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   半截 zip。
 - 任务输出（`/ai_task/output*`）在平台侧是**异步索引**的：任务刚进 `SUCCEEDED` 时
   `output.status` 是 1、`file_list` 是空的，通常要等一两分钟才变成 `status=0` 并列出
-  文件（实测 000000 / 000000 都在约两分钟后才刷出来）。所以 `openi_task_outputs` /
+  文件（实测 TASK-14 / TASK-13 都在约两分钟后才刷出来）。所以 `openi_task_outputs` /
   `openi_task_output_files` 带 `ready` 标记：刚跑完看不到文件不代表任务没有输出，隔一会儿
   重试即可。输出目录里的子目录以 `IsDir=true` 标出，下载子目录里的文件用相对路径
   （如 `sub/mid.txt`）或者“文件名 + `parent_dir`”两种写法都行。
