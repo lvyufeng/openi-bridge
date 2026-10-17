@@ -64,7 +64,7 @@ mcp = _Server(
         "建，容器里的服务监听 8000 端口，RUNNING 之后用 openi_task_service_url 取对外地址。"
         "使用前必须设置 "
         "OPENI_TOKEN 环境变量，令牌在 https://openi.pcl.ac.cn/user/settings/applications 生成。"
-        "任务跑完后用 openi_task_outputs / openi_task_output_files 看产出文件、"
+        "任务跑完后用 openi_task_output_dir / openi_task_output_files 看产出文件、"
         "openi_task_download_output 取单个文件、openi_task_download_output_archive 整包"
         "打 zip 下载、openi_task_download_log 取整份日志；"
         "任务排队或失败时用 openi_task_events 看调度时间线，openi_task_nodes 看节点，"
@@ -1673,11 +1673,13 @@ def openi_task_nodes(task_id: str) -> str:
         return dump({"ok": True, "task_id": task_id, "nodes": client.task_node_info(task_id)})
 @mcp.tool()
 @tool
-def openi_task_outputs(task_id: str, parent_dir: str = "") -> str:
-    """列出任务输出目录里的文件（一次一层，子目录用 parent_dir 继续往下翻）。
+def openi_task_output_dir(task_id: str, parent_dir: str = "") -> str:
+    """**一次一层**地列任务输出目录（不递归；要全量用 openi_task_output_files）。
 
-    parent_dir: 相对输出根的子目录，留空看根目录。想一次拿全量递归清单就用
-    openi_task_output_files。
+    适合逐个目录地看结构：根目录有哪些子目录和文件，再进某个子目录继续看。
+    子目录里的文件不会出现在这一层的结果里。
+
+    parent_dir: 相对输出根的子目录，留空看根目录。
 
     重要：平台对输出是异步索引的。任务刚跑完时 ready=false、file_list 为空
     （平台字段 status=1），通常要等一两分钟才会变成 ready=true 并列出文件
@@ -1705,11 +1707,15 @@ def openi_task_outputs(task_id: str, parent_dir: str = "") -> str:
 @mcp.tool()
 @tool
 def openi_task_output_files(task_id: str) -> str:
-    """一次列出任务输出的全部文件（递归，含子目录里的）。
+    """**一次拿全**任务输出的所有文件（递归，含子目录里的）。
+
+    和 openi_task_output_dir 的区别：那个一次只列一层，这个一次列完。产物多、
+    或者只想直接拿文件路径去下载/导出时用这个。
 
     返回每项的 name 就是相对输出根的完整路径，可以直接作为
-    openi_task_download_output 的 file_name。刚跑完时同样要等平台索引完成
-    （见 openi_task_outputs 的说明），列表为空不代表没有输出。
+    openi_task_download_output 的 file_name，也是 openi_task_export_to_dataset /
+    openi_task_export_to_model 的 files 取值。刚跑完时同样要等平台索引完成
+    （见 openi_task_output_dir 的说明），列表为空不代表没有输出。
     """
     with _client() as client:
         data = client.task_output_all(task_id)
@@ -2142,17 +2148,17 @@ def openi_start_task(
     return _ok(result, ok=True)
 @mcp.tool()
 @tool
-def openi_start_task_raw(repo: str, payload_json: str, dry_run: bool = False) -> str:
-    """用完全自定义的 JSON 请求体创建任务（兜底用，会真的开卡计费）。
+def openi_start_task_raw(repo: str, payload_json: str, dry_run: bool = True) -> str:
+    """用完全自定义的 JSON 请求体创建任务（兜底用，**默认只预览不执行**）。
 
     payload_json 直接作为请求体发到 /{repo}/ai_task/create，不做字段级校验——
     这正是它的用途：平台加了新字段、而 openi_start_task 还没跟上时用它兜底。
     代价是拼错的字段平台未必会拒，可能建出一个配置不对却照样计费的任务。
 
-    所以这个工具**默认不执行**：必须显式传 dry_run=False 才会真的创建。先跑一次
-    dry_run=True 看请求体，确认无误再关掉它。repo 必须是 owner/name 形式，
-    且请求体必须是非空 JSON 对象——这两条会先挡住，避免把请求打到意外的路径上。
-    创建成功后同样建议用 openi_get_task 核对状态与镜像。
+    所以它默认 dry_run=True，只回显将要发送的请求体、不建任务；确认无误后传
+    dry_run=False 才会真的创建（会开卡计费）。repo 必须是 owner/name 形式、请求体
+    必须是非空 JSON 对象，这两条先挡住，避免把请求打到意外的路径上。
+    创建后用 openi_get_task 核对状态与镜像。
     """
     if not _REPO_FULLNAME_RE.match(repo or ""):
         return dump({

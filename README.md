@@ -150,7 +150,7 @@ Claude Desktop / Cursor 等只认 JSON 的客户端，直接写绝对路径即�
 `openi_stop_task` / `openi_delete_task`。
 
 **收产出、查为什么排队。** “任务跑完了，把 output 里的结果拿下来”“这个任务怎么一直排队？”
-助手用 `openi_task_outputs` / `openi_task_output_files` 列任务产出的文件，
+助手用 `openi_task_output_dir` / `openi_task_output_files` 列任务产出的文件，
 `openi_task_download_output` 把文件取下来（小文件直接读进返回，大文件给 `save_to` 流式
 落盘），`openi_task_download_log` 取整份日志；任务排队、被抢占或失败时用
 `openi_task_events` 看调度时间线（分配节点→拉镜像→建容器→启动→结束），
@@ -427,7 +427,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | 工具 | 作用 |
 | --- | --- |
 | openi_start_task | 新建并启动计算任务（调试/训练/推理） |
-| openi_start_task_raw | 用自定义 JSON 请求体创建任务（兜底/调试用） |
+| openi_start_task_raw | 用自定义 JSON 请求体创建任务（兜底用；**默认只预览**，需显式 dry_run=False 才真建） |
 | openi_run_on_card | 在云脑的一张卡上直接跑一段代码：建 DEBUG 任务 → 连它的 Jupyter 内核执行 → 收 stdout → 清理 |
 | openi_stop_task | 停止任务、释放算力、停止计费（会回读确认状态真的变成已停止） |
 | openi_restart_task | 重启已停止的任务（会回读确认任务确实离开了已停止状态） |
@@ -451,8 +451,8 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_task_debug_url | 获取调试任务的 Jupyter / SSH 入口 |
 | openi_task_visualize_url | 获取训练任务的 TensorBoard 入口 |
 | openi_task_service_url | 获取在线推理（ONLINEINFERENCE）任务的对外服务地址 |
-| openi_task_outputs | 列出任务输出目录的文件（一次一层，子目录用 parent_dir 下翻） |
-| openi_task_output_files | 一次列出任务输出的全部文件（递归，name 即相对路径，可直接下载） |
+| openi_task_output_dir | 列任务输出目录（**一次一层**，子目录用 parent_dir 下翻；不递归） |
+| openi_task_output_files | **一次拿全**任务输出的所有文件（递归，name 即相对路径，可直接下载/导出） |
 | openi_task_download_output | 下载任务输出的某个文件（流式落盘，或直接读进返回） |
 | openi_task_download_output_archive | 把整个输出目录打包成一个 zip 下载（产物多时省事，流式落盘） |
 | openi_task_download_log | 下载任务的完整日志（整段纯文本，非分页；读进返回时默认截到 256KB） |
@@ -539,9 +539,10 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 "一直说还有下一页、但标记不前进"时生效——那时会报一条明确的错误，而不是挂住。
 两个值都可以用环境变量覆盖（`OPENI_MAX_TREE_PAGES` / `OPENI_MAX_LIST_PAGES`）。
 
-`openi_start_task_raw` 是自定义 JSON 创建任务的兜底入口，因为它不做字段校验，
-`repo` 必须是 `owner/name`、`payload_json` 必须是非空 JSON 对象，且执行前
-建议先 `dry_run=True` 看一遍请求体。
+`openi_start_task_raw` 是自定义 JSON 创建任务的兜底入口。因为它不做字段校验、
+拼错的字段平台未必会拒（可能建出一个配置不对却照样计费的任务），它**默认
+`dry_run=True` 只回显请求体**，要真的创建必须显式传 `dry_run=False`。
+`repo` 必须是 `owner/name`、`payload_json` 必须是非空 JSON 对象。
 
 ## 测试
 
@@ -670,7 +671,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   半截 zip。
 - 任务输出（`/ai_task/output*`）在平台侧是**异步索引**的：任务刚进 `SUCCEEDED` 时
   `output.status` 是 1、`file_list` 是空的，通常要等一两分钟才变成 `status=0` 并列出
-  文件（实测 TASK-14 / TASK-13 都在约两分钟后才刷出来）。所以 `openi_task_outputs` /
+  文件（实测 TASK-14 / TASK-13 都在约两分钟后才刷出来）。所以 `openi_task_output_dir` /
   `openi_task_output_files` 带 `ready` 标记：刚跑完看不到文件不代表任务没有输出，隔一会儿
   重试即可。输出目录里的子目录以 `IsDir=true` 标出，下载子目录里的文件用相对路径
   （如 `sub/mid.txt`）或者“文件名 + `parent_dir`”两种写法都行。

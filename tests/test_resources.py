@@ -196,6 +196,79 @@ class TestReadmeConsistency:
         assert not broken, f"README links point at missing headings: {broken}"
 
 
+class TestOutputToolNames:
+    """The two output tools must read the way they behave.
+
+    They used to be openi_task_outputs (one level) and openi_task_output_files
+    (recursive) -- the plural, more expansive name was the shallow one, so a
+    caller reasonably picked the wrong tool. The shallow one is now _dir, which
+    says what it does.
+    """
+
+    def _texts(self):
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        server = (root / "src/openi_bridge/server.py").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        allsrc = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in (root / "src/openi_bridge").glob("*.py")
+        )
+        return server, readme, allsrc
+
+    def test_old_misleading_name_is_gone(self):
+        server, readme, allsrc = self._texts()
+        assert "openi_task_outputs" not in server
+        assert "openi_task_outputs" not in readme
+
+    def test_both_names_exist(self):
+        server, _, _ = self._texts()
+        assert "def openi_task_output_dir(" in server
+        assert "def openi_task_output_files(" in server
+
+    def test_dir_tool_says_it_is_not_recursive(self):
+        import re
+
+        server, _, _ = self._texts()
+        m = re.search(r'def openi_task_output_dir\(.*?"""(.*?)"""', server, re.S)
+        assert m, "could not find the openi_task_output_dir docstring"
+        doc = m.group(1)
+        assert "一次一层" in doc, "the shallow tool must say it lists one level"
+        assert "openi_task_output_files" in doc, "and point at the recursive one"
+
+    def test_files_tool_says_it_is_recursive(self):
+        import re
+
+        server, _, _ = self._texts()
+        m = re.search(r'def openi_task_output_files\(.*?"""(.*?)"""', server, re.S)
+        assert m
+        doc = m.group(1)
+        assert "递归" in doc and "一次拿全" in doc
+
+
+class TestRawTaskToolIsSafeByDefault:
+    """openi_start_task_raw posts an unchecked body and bills for a card."""
+
+    def test_dry_run_defaults_to_true(self):
+        import inspect
+
+        from openi_bridge.server import openi_start_task_raw
+
+        sig = inspect.signature(openi_start_task_raw)
+        assert sig.parameters["dry_run"].default is True, (
+            "the raw path must not create a billed task unless asked to"
+        )
+
+    def test_docstring_says_it_previews_by_default(self):
+        from openi_bridge.server import openi_start_task_raw
+
+        doc = openi_start_task_raw.__doc__ or ""
+        assert "默认只预览" in doc or "默认 dry_run=True" in doc
+        assert "dry_run=False" in doc, "must tell the caller how to actually run it"
+
+
 class TestCatalogIntegrity:
     """Cross-table consistency: the catalog is read by the model as fact."""
 
