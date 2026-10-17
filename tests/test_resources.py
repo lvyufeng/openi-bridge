@@ -269,6 +269,85 @@ class TestRawTaskToolIsSafeByDefault:
         assert "dry_run=False" in doc, "must tell the caller how to actually run it"
 
 
+class TestReadmeClientSnippets:
+    """The README documents four client config shapes; they must stay correct.
+
+    These blocks are the easiest thing in the repo to get wrong by hand, because
+    every client wants a different shape and two of them reject the obvious one:
+    dsh needs its entry inside a top-level YAML array (and its default template
+    is a bare `[]` that must be replaced, not appended to), and Cursor rejects
+    the nested {"mcpServers": {...}} form that Claude Desktop wants.
+    """
+
+    def _readme(self):
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "README.md").read_text(
+            encoding="utf-8"
+        )
+
+    def _block(self, lang):
+        import re
+
+        m = re.search(rf"~~~{lang}\n(.*?)~~~", self._readme(), re.S)
+        assert m, f"README has no {lang} block"
+        return m.group(1)
+
+    def test_dsh_block_is_valid_yaml_with_the_right_entry(self):
+        yaml = pytest.importorskip("yaml")
+
+        doc = yaml.safe_load(self._block("yaml"))
+        assert isinstance(doc, list), "dsh patch layer is a top-level array"
+        entry = doc[0]["insert"][0]
+        assert entry["id"] == "mcp-openi-bridge"
+        assert entry["name"] == "@deepseek-ai/dsh-mcp-client"
+        assert entry["config"]["transport"] == "stdio"
+        assert entry["config"]["serverName"] == "openi-bridge"
+
+    def test_cursor_snippet_is_flat_and_named(self):
+        import json
+        import re
+
+        m = re.search(r"cursor --add-mcp '(\{.*?\})'", self._readme(), re.S)
+        assert m, "README has no cursor --add-mcp snippet"
+        entry = json.loads(m.group(1))
+        assert entry["name"] == "openi-bridge"
+        assert "mcpServers" not in entry, (
+            "Cursor rejects the nested form; the snippet must be flat"
+        )
+
+    def test_codex_block_matches_what_the_installer_writes(self):
+        from openi_bridge.install_mcp import codex_block
+
+        generated = codex_block(["/Users/you/.openi/venv/bin/openi-bridge"])
+        assert "[mcp_servers.openi-bridge]" in generated
+        readme = self._block("toml")
+        assert "[mcp_servers.openi-bridge]" in readme
+        assert "command = " in readme and "args = " in readme
+
+    def test_claude_desktop_block_uses_nested_form(self):
+        import json
+        import re
+
+        for m in re.finditer(r"~~~json\n(.*?)~~~", self._readme(), re.S):
+            text = m.group(1)
+            if "mcpServers" in text:
+                doc = json.loads(text)
+                assert "openi-bridge" in doc["mcpServers"]
+                return
+        pytest.fail("README no longer documents the Claude Desktop JSON form")
+
+    def test_no_snippet_contains_a_token(self):
+        text = self._readme()
+        import re
+
+        for m in re.finditer(r"~~~(json|toml|yaml)\n(.*?)~~~", text, re.S):
+            body = m.group(2).lower()
+            assert "token" not in body or "你的令牌" in m.group(2), (
+                f"a {m.group(1)} snippet appears to embed a credential"
+            )
+
+
 class TestCatalogIntegrity:
     """Cross-table consistency: the catalog is read by the model as fact."""
 

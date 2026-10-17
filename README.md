@@ -28,8 +28,8 @@
 
 ## 快速开始
 
-目标：在**任意目录**下打开 Claude Code 或 Codex，直接说人话就能开卡，不用先
-`cd` 到某个仓库、也不用设环境变量。
+目标：在**任意目录**下打开 Claude Code / Codex / dsh / Cursor，直接说人话就能开卡，
+不用先 `cd` 到某个仓库、也不用设环境变量。
 
 **第 0 步，拿一个令牌。** 打开 https://openi.pcl.ac.cn/user/settings/applications
 新建访问令牌（勾选需要的作用域），然后写进 `~/.openi/token.json`：
@@ -48,8 +48,8 @@ python3 -m venv ~/.local/share/openi-bridge/venv
 
 把 `/path/to/openi-bridge` 换成这个仓库的绝对路径。
 
-**第 2 步，注册到 Claude Code 和 Codex。** 仓库自带的 `openi-mcp-install` 会把启动
-命令算成绝对路径，同时写进两个客户端：
+**第 2 步，注册到你的客户端。** 仓库自带的 `openi-mcp-install` 会把启动命令算成
+绝对路径，一次写进下面四个客户端（装了几个就配几个）：
 
 ~~~bash
 # 先干跑一遍，看看会写什么、会执行什么命令
@@ -89,8 +89,45 @@ Connected / enabled（Claude Code 里也可以 `/mcp` 查看）；dsh 用
 然后随便找个目录问一句"OpenI 上现在有哪些卡能开、我还剩多少积分"。想确认令牌没问题，
 就调 `openi_whoami`。
 
-只想手工配一个客户端的话，各家的片段 `install_mcp` 不带 `--apply` 时会直接打印出来。
-Claude Desktop 等只认 JSON 的客户端，写绝对路径即可：
+只想手工配某一个客户端的话，`install_mcp` 不带 `--apply` 会直接把各家片段打印出来，
+复制即可。下面是四个客户端的**完整片段**，注意形状各不相同（这也是最容易配错的地方）：
+
+**Claude Code**（命令行一条，写到 `~/.claude.json`）：
+
+~~~bash
+claude mcp add --scope user --transport stdio openi-bridge \
+  /Users/you/.local/share/openi-bridge/venv/bin/openi-bridge
+~~~
+
+**Codex**（追加到 `$CODEX_HOME/config.toml`，默认 `~/.codex/config.toml`；多份 home 就每份都加）：
+
+~~~toml
+[mcp_servers.openi-bridge]
+command = "/Users/you/.local/share/openi-bridge/venv/bin/openi-bridge"
+args = []
+~~~
+
+**dsh**（追加到 `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 的**顶层数组**里，每个 profile 一份）。
+如果文件内容还是默认的一行 `[]`，要**替换**它，不要往后接：
+
+~~~yaml
+- insert:
+    - id: mcp-openi-bridge
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: openi-bridge
+        command: /Users/you/.local/share/openi-bridge/venv/bin/openi-bridge
+        args: []
+~~~
+
+**Cursor**（一条命令；JSON 必须是**扁平**的，带 `name`，**不能**套 `{"mcpServers": {...}}`）：
+
+~~~bash
+cursor --add-mcp '{"name":"openi-bridge","command":"/Users/you/.local/share/openi-bridge/venv/bin/openi-bridge","args":[]}'
+~~~
+
+**Claude Desktop 等其他只认 JSON 的客户端**，用嵌套形式（这类客户端吃这一种）：
 
 ~~~json
 {

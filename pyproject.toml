@@ -13,6 +13,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0.0",
+  # The README's dsh snippet is YAML, and a test parses it to prove it is a
+  # single valid document (the installer once produced two).
+  "pyyaml>=6.0",
 ]
 
 [project.scripts]
