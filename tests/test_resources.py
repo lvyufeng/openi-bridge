@@ -151,6 +151,14 @@ class TestReadmeConsistency:
             encoding="utf-8"
         )
 
+    def _tool_docs(self):
+        """The full tool table lives in docs/tools.md since the README was trimmed."""
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "docs/tools.md").read_text(
+            encoding="utf-8"
+        )
+
     def _defined_tools(self):
         import re
         from pathlib import Path
@@ -163,7 +171,7 @@ class TestReadmeConsistency:
     def test_every_tool_is_documented_exactly_once(self):
         import re
 
-        rows = re.findall(r"^\| (openi_[a-z_]+) \|", self._readme(), re.M)
+        rows = re.findall(r"^\| (openi_[a-z_]+) \|", self._tool_docs(), re.M)
         defined = self._defined_tools()
         undocumented = sorted(defined - set(rows))
         duplicated = sorted({r for r in rows if rows.count(r) > 1})
@@ -173,10 +181,12 @@ class TestReadmeConsistency:
     def test_stated_tool_count_matches_reality(self):
         import re
 
-        text = self._readme()
-        m = re.search(r"共 (\d+) 个工具", text)
-        assert m, "README no longer states a tool count"
-        assert int(m.group(1)) == len(self._defined_tools())
+        # the count is stated in both places; both must agree with reality
+        expected = len(self._defined_tools())
+        for name, text in (("README.md", self._readme()), ("docs/tools.md", self._tool_docs())):
+            m = re.search(r"共 \*{0,2}(\d+)\*{0,2} 个工具", text)
+            assert m, f"{name} no longer states a tool count"
+            assert int(m.group(1)) == expected, f"{name} says {m.group(1)}, actual {expected}"
 
     def test_internal_links_resolve(self):
         import re
@@ -269,6 +279,73 @@ class TestRawTaskToolIsSafeByDefault:
         assert "dry_run=False" in doc, "must tell the caller how to actually run it"
 
 
+class TestDocsLinks:
+    """Links must resolve across every markdown file, not just the README.
+
+    Content moved from the README into docs/ during the trim, and moving text
+    breaks relative paths and in-page anchors silently -- two such links were
+    found only by checking. This pins the whole set.
+    """
+
+    def _files(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        return [root / "README.md"] + sorted((root / "docs").glob("*.md"))
+
+    @staticmethod
+    def _slug(heading):
+        import re
+
+        s = heading.strip().lower()
+        s = re.sub(r"[^\w\u4e00-\u9fff\- ]", "", s)
+        return s.replace(" ", "-")
+
+    def test_every_relative_link_resolves(self):
+        import re
+
+        broken = []
+        for f in self._files():
+            text = f.read_text(encoding="utf-8")
+            for m in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", text):
+                target = m.group(1)
+                if target.startswith(("http://", "https://", "mailto:")):
+                    continue
+                path_part = target.split("#")[0]
+                if not path_part:
+                    continue
+                if not (f.parent / path_part).resolve().exists():
+                    broken.append(f"{f.name} -> {target}")
+        assert not broken, f"broken relative links: {broken}"
+
+    def test_every_in_page_anchor_exists(self):
+        import re
+
+        broken = []
+        for f in self._files():
+            text = f.read_text(encoding="utf-8")
+            heads = {
+                self._slug(m.group(2))
+                for m in re.finditer(r"^(#{1,6})\s+(.+?)\s*$", text, re.M)
+            }
+            for m in re.finditer(r"\[[^\]]+\]\(#([^)]+)\)", text):
+                if m.group(1) not in heads:
+                    broken.append(f"{f.name} -> #{m.group(1)}")
+        assert not broken, f"dead anchors: {broken}"
+
+    def test_docs_directory_is_linked_from_the_readme(self):
+        from pathlib import Path
+
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+            encoding="utf-8"
+        )
+        docs = Path(__file__).resolve().parents[1] / "docs"
+        for f in sorted(docs.glob("*.md")):
+            assert f.name in readme, (
+                f"docs/{f.name} is not linked from the README, so nobody will find it"
+            )
+
+
 class TestReadmeClientSnippets:
     """The README documents four client config shapes; they must stay correct.
 
@@ -279,18 +356,20 @@ class TestReadmeClientSnippets:
     the nested {"mcpServers": {...}} form that Claude Desktop wants.
     """
 
-    def _readme(self):
+    def _install_doc(self):
+        """The per-client snippets live in docs/install.md since the README
+        was trimmed to a project front page."""
         from pathlib import Path
 
-        return (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        return (Path(__file__).resolve().parents[1] / "docs/install.md").read_text(
             encoding="utf-8"
         )
 
     def _block(self, lang):
         import re
 
-        m = re.search(rf"~~~{lang}\n(.*?)~~~", self._readme(), re.S)
-        assert m, f"README has no {lang} block"
+        m = re.search(rf"```{lang}\n(.*?)```", self._install_doc(), re.S)
+        assert m, f"docs/install.md has no {lang} block"
         return m.group(1)
 
     def test_dsh_block_is_valid_yaml_with_the_right_entry(self):
@@ -308,8 +387,8 @@ class TestReadmeClientSnippets:
         import json
         import re
 
-        m = re.search(r"cursor --add-mcp '(\{.*?\})'", self._readme(), re.S)
-        assert m, "README has no cursor --add-mcp snippet"
+        m = re.search(r"cursor --add-mcp '(\{.*?\})'", self._install_doc(), re.S)
+        assert m, "docs/install.md has no cursor --add-mcp snippet"
         entry = json.loads(m.group(1))
         assert entry["name"] == "openi-bridge"
         assert "mcpServers" not in entry, (
@@ -329,19 +408,19 @@ class TestReadmeClientSnippets:
         import json
         import re
 
-        for m in re.finditer(r"~~~json\n(.*?)~~~", self._readme(), re.S):
+        for m in re.finditer(r"```json\n(.*?)```", self._install_doc(), re.S):
             text = m.group(1)
             if "mcpServers" in text:
                 doc = json.loads(text)
                 assert "openi-bridge" in doc["mcpServers"]
                 return
-        pytest.fail("README no longer documents the Claude Desktop JSON form")
+        pytest.fail("docs/install.md no longer documents the Claude Desktop JSON form")
 
     def test_no_snippet_contains_a_token(self):
-        text = self._readme()
+        text = self._install_doc()
         import re
 
-        for m in re.finditer(r"~~~(json|toml|yaml)\n(.*?)~~~", text, re.S):
+        for m in re.finditer(r"```(json|toml|yaml)\n(.*?)```", text, re.S):
             body = m.group(2).lower()
             assert "token" not in body or "你的令牌" in m.group(2), (
                 f"a {m.group(1)} snippet appears to embed a credential"
