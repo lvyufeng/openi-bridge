@@ -253,7 +253,7 @@ SOURCES_NEEDING_IMAGE_URL = frozenset({"GPU"})
 
 # 任务输出（/ai_task/output）在平台侧是异步索引的：任务刚进 SUCCEEDED 时
 # output.status 是 1、file_list 是空的，等一两分钟再查才变成 status 0 并列出文件
-# （2026-10 实测，a task / a task 都在约两分钟后才刷出来）。所以输出工具要把
+# （2026-10 实测，两次任务都在约两分钟后才刷出来）。所以输出工具要把
 # “刚跑完查不到文件”当成还没索引，而不是任务没有输出。
 
 # Platform validation (services/ai_task_service/task/opt_handler.go).
