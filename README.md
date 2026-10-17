@@ -407,7 +407,7 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 | openi_read_repo_file | 读取仓内单个文件（可落盘），用于确认启动入口或超参 |
 | openi_write_repo_file | 新建或覆盖仓内一个文本文件，产生一个提交 |
 | openi_list_repo_files | 列出代码仓某个目录的文件（含类型/大小）与全部分支，用于确定启动文件 |
-| openi_repo_tree | 一次拿到整仓文件树（路径/类型/大小），比逐层翻目录快 |
+| openi_repo_tree | 拿到整仓文件树（路径/类型/大小），自动翻页取全，比逐层翻目录快 |
 | openi_list_repo_commits | 列出提交历史（时间倒序），核对代码是不是真的推上去了 |
 | openi_download_repo_archive | 把整仓打包成 zip 下载到本地；max_bytes 超限即中止，不留残包 |
 | openi_create_repo_issue | 在代码仓里开 issue，返回 issue 号 |
@@ -595,8 +595,11 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   blob 的 sha（工具会先查一次 sha 再决定用哪个动词），因此**每个文件一个提交**。平台的
   多文件提交入口（`POST /repos/{owner}/{repo}/contents` 批量、`POST /git/blobs`）在这套
   部署上都是 404，所以没有批量提交这条路径。
-- `openi_repo_tree` 走 `/git/trees/{ref}?recursive=1`，一条请求拿全，大仓能返回几万条，
-  所以默认截到 20000 条并用 `truncated` 标出来。`openi_list_repo_commits` 走 `/commits`，
+- `openi_repo_tree` 走 `/git/trees/{ref}?recursive=1`。这个接口有隐藏分页：一次最多回
+  1000 条，同时在返回里给 `truncated` / `page` / `total_count`（mindnlp 实测 2627 条，
+  第一页只有 1000）。所以工具会翻完所有页再返回，`total_count` 是平台声明的总数；
+  `max_entries`（默认 20000）是之后的硬截断，被它截时 `count < total_count` 且
+  `truncated` 为 true。`openi_list_repo_commits` 走 `/commits`，
   它的 `path` 过滤参数在这套部署上是空操作（实测传任何 path 都返回全量历史），所以工具
   没有暴露这个参数；要看某个文件的内容直接 `openi_read_repo_file`。
 - `openi_download_repo_archive` 走 `/archive/{ref}.zip`，边下边写盘，先落在

@@ -596,6 +596,75 @@ class TestDownloadConstants:
         )
 
 
+class TestRepoTreePagination:
+    """repo_tree must fetch the whole tree, not just the platform's first page.
+
+    /git/trees caps a response at 1000 entries and sets truncated=true, with
+    page and total_count alongside. The client ignored both, so a repo with
+    2627 files reported 1000 and called it the tree -- truncated was true, but
+    nothing said the rest was simply missing rather than capped on purpose.
+    """
+
+    def _client(self, pages, total=None):
+        """pages: list of entry-counts to return, one per requested page."""
+        from openi_bridge.client import OpenIClient
+
+        client = OpenIClient.__new__(OpenIClient)
+        state = {"i": 0, "requested": []}
+
+        def get_json(path, params=None):
+            state["requested"].append((params or {}).get("page"))
+            n = pages[min(state["i"], len(pages) - 1)]
+            state["i"] += 1
+            return {
+                "sha": "deadbeef",
+                "tree": [{"path": f"f{k}", "type": "blob", "size": 1, "sha": "s"}
+                         for k in range(n)],
+                "truncated": n >= 1000,
+                "page": (params or {}).get("page", 1),
+                "total_count": total if total is not None else sum(pages),
+            }
+
+        client.get_json = get_json
+        client._state = state
+        return client
+
+    def test_single_page_tree_is_not_paginated(self):
+        client = self._client([10], total=10)
+        out = client.repo_tree("o/r")
+        assert out["count"] == 10
+        assert out["truncated"] is False
+        assert client._state["requested"] == [1]
+
+    def test_multi_page_tree_is_fully_fetched(self):
+        client = self._client([1000, 1000, 627], total=2627)
+        out = client.repo_tree("o/r")
+        assert out["count"] == 2627
+        assert out["truncated"] is False
+        assert client._state["requested"] == [1, 2, 3]
+
+    def test_max_entries_still_caps_and_flags(self):
+        client = self._client([1000, 1000, 627], total=2627)
+        out = client.repo_tree("o/r", max_entries=50)
+        assert out["count"] == 50
+        assert out["truncated"] is True
+
+    def test_page_cap_reports_truncation(self):
+        from openi_bridge.client import MAX_TREE_PAGES
+
+        # more pages than the cap allows, each full
+        client = self._client([1000] * (MAX_TREE_PAGES + 5), total=10**9)
+        out = client.repo_tree("o/r")
+        assert out["truncated"] is True
+        assert out["pages_fetched"] <= MAX_TREE_PAGES + 1
+
+    def test_empty_repo_is_not_truncated(self):
+        client = self._client([0], total=0)
+        out = client.repo_tree("o/r")
+        assert out["count"] == 0
+        assert out["truncated"] is False
+
+
 class TestTaskActionVerified:
     """The verified wrapper must distinguish acceptance from effect."""
 

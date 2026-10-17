@@ -833,15 +833,17 @@ def openi_list_repo_files(repo: str, ref: Optional[str] = None, path: str = "") 
 def openi_repo_tree(
     repo: str, ref: Optional[str] = None, path: str = "", max_entries: int = 20000
 ) -> str:
-    """一次拿到代码仓的完整文件树，用来确认目录结构和启动入口在哪。
+    """拿到代码仓的完整文件树，用来确认目录结构和启动入口在哪。
 
-    比逐层调 openi_list_repo_files 快得多：平台一条请求就返回整棵树，适合先看清
-    仓里有什么再决定读哪个文件。
+    比逐层调 openi_list_repo_files 快得多，适合先看清仓里有什么再决定读哪个文件。
+    平台这个接口一次最多回 1000 条并支持翻页，工具会自动翻完所有页，所以大仓
+    也是完整的（返回里的 total_count 是平台声明的总数）。
 
     repo: 代码仓全名 owner/name。
     ref: 分支或提交，留空用 HEAD（默认分支的最新提交）。
     path: 只看这个子目录；客户端过滤，请求本身仍取全量。
-    max_entries: 最多返回多少条，默认 20000；被截断时 truncated 为 true。
+    max_entries: 最多返回多少条，默认 20000。被它截断时 truncated 为 true，
+      且 count < total_count——这两个一起看就知道是"截了"还是"仓里就这么多"。
     """
     with _client() as client:
         result = client.repo_tree(repo, ref=ref or "", path=path, max_entries=max_entries)

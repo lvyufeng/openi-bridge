@@ -135,6 +135,10 @@ _MD5_SAMPLE_BYTES = 1024 * 1024
 # 默认请求超时（建仓、删仓这类慢接口会单独放宽）。
 DEFAULT_REQUEST_TIMEOUT = 30.0
 
+# /git/trees 的隐藏页大小与翻页上限（防止超大仓把一次工具调用拖到天荒地老）。
+_TREE_PAGE_SIZE = 1000
+MAX_TREE_PAGES = 50
+
 # 数据集 / 模型广场的列表范围（对应平台前端 getCardList 的 tab url）。
 SUBJECT_LIST_SCOPES = ("public", "owned", "collected", "collaborated")
 # 列表排序取值（取自平台前端 datasets.sort 下拉）。
@@ -1139,17 +1143,41 @@ class OpenIClient:
     def repo_tree(
         self, subject_name: str, ref: str = "", path: str = "", max_entries: int = WALK_FILE_LIMIT
     ) -> Dict[str, Any]:
-        """整仓文件树，一条请求拿全（/git/trees/{ref}?recursive=1）。
+        """整仓文件树（/git/trees/{ref}?recursive=1）。
 
-        比逐层翻 contents 快得多，适合先看清仓里有什么再决定读哪个文件；大仓的
-        返回体可能很大，用 max_entries 截断并在结果里标 truncated。
+        比逐层翻 contents 快得多，适合先看清仓里有什么再决定读哪个文件。
         ref 留空用 HEAD（即默认分支的最新提交）。
+
+        平台对这个接口有隐藏分页：一次最多回 1000 条，同时在返回里给
+        ``truncated``、``page`` 与 ``total_count``（mindnlp 实测 2627 条，第一页
+        只有 1000）。所以这里会翻页取全，而不是把第一页当成整棵树——早先的实现
+        就是后者，一个 2627 文件的仓只能看到前 1000 个。
+        max_entries 仍是硬上限（在取全之后再截断），避免超大仓把返回撑爆。
         """
         tree_ref = (ref or "").strip() or "HEAD"
-        data = self.get_json(
-            f"/repos/{subject_name}/git/trees/{tree_ref}", params={"recursive": 1}
-        ) or {}
-        rows = data.get("tree") or []
+        rows: List[Mapping[str, Any]] = []
+        data: Mapping[str, Any] = {}
+        page = 1
+        page_limit_hit = False
+        while True:
+            data = self.get_json(
+                f"/repos/{subject_name}/git/trees/{tree_ref}",
+                params={"recursive": 1, "page": page},
+            ) or {}
+            batch = data.get("tree") or []
+            rows.extend(r for r in batch if isinstance(r, Mapping))
+            total = data.get("total_count")
+            # 停止条件：这一页没满（没有更多）、拿满了 total、或该接口不再分页。
+            if not batch or not data.get("truncated"):
+                break
+            if isinstance(total, int) and total and len(rows) >= total:
+                break
+            if len(batch) < _TREE_PAGE_SIZE:
+                break
+            page += 1
+            if page > MAX_TREE_PAGES:
+                page_limit_hit = True
+                break
         prefix = (path or "").strip().strip("/")
         if prefix:
             rows = [
@@ -1158,9 +1186,17 @@ class OpenIClient:
                 if (row.get("path") or "") == prefix
                 or (row.get("path") or "").startswith(prefix + "/")
             ]
-        truncated = bool(data.get("truncated")) or (
-            max_entries > 0 and len(rows) > max_entries
+        # truncated 只表示"返回的比仓里实际有的少"。平台每页都带 truncated=true
+        # （它表示"这一页不是全部"），翻完页之后那个标志就不再说明问题了，所以
+        # 这里只认两件事：是不是被 max_entries 截了，以及有没有因为页数上限没取完。
+        total = data.get("total_count")
+        complete_tree = not page_limit_hit and (
+            len(rows) >= total
+            if isinstance(total, int) and total
+            else True
         )
+        truncated_by_cap = max_entries > 0 and len(rows) > max_entries
+        truncated = truncated_by_cap or not complete_tree
         if max_entries > 0:
             rows = rows[:max_entries]
         entries = [
@@ -1178,6 +1214,10 @@ class OpenIClient:
             "sha": data.get("sha"),
             "count": len(entries),
             "truncated": truncated,
+            # 平台声明的总数：count < total_count 说明是被 max_entries 截的，
+            # 而不是仓里就这么多文件。
+            "total_count": total,
+            "pages_fetched": page,
             "entries": entries,
         }
 
