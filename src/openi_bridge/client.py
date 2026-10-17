@@ -137,7 +137,7 @@ DEFAULT_REQUEST_TIMEOUT = 30.0
 
 # /git/trees 的隐藏页大小与翻页上限（防止超大仓把一次工具调用拖到天荒地老）。
 _TREE_PAGE_SIZE = 1000
-MAX_TREE_PAGES = 50
+MAX_TREE_PAGES = int(os.getenv("OPENI_MAX_TREE_PAGES", "50"))
 
 # 数据集 / 模型广场的列表范围（对应平台前端 getCardList 的 tab url）。
 SUBJECT_LIST_SCOPES = ("public", "owned", "collected", "collaborated")
@@ -160,6 +160,11 @@ TEMPLATE_LIST_SCOPES = ("public", "all", "created", "collected")
 TEMPLATE_LIST_ORDER = ("newest", "usecount", "collections")
 # 递归列目录时的文件数上限，避免误对超大主体做全量 crawl。
 WALK_FILE_LIMIT = int(os.getenv("OPENI_WALK_FILE_LIMIT", "20000"))
+# marker 翻页的次数上限。正常分页靠 has_next / marker 前进收敛，但那是平台的
+# 承诺；万一它一直回 has_next=true 且每次给一个新 marker，循环就永远不会结束。
+# 加一个硬上限，让它变成一条明确的错误而不是一次挂死。
+# 与 MAX_TREE_PAGES 分开：目录页比整树页小得多，合理上限本来就不同。
+MAX_LIST_PAGES = int(os.getenv("OPENI_MAX_LIST_PAGES", "500"))
 
 # 任务状态的终态与非终态。计费只在任务处于非终态（还在排队/准备/跑）时发生，
 # 所以"任务是否还在烧积分"这个问题永远可以退回这一组取值来回答。
@@ -1387,7 +1392,7 @@ class OpenIClient:
         if not base:
             return None
         marker = ""
-        while True:
+        for _ in range(MAX_LIST_PAGES):
             page = self.subject_files(subject_name, subject_type, parent, marker) or {}
             for row in page.get("file_list") or []:
                 if (row.get("FileName") or "") == base:
@@ -1396,6 +1401,10 @@ class OpenIClient:
             if not page.get("has_next") or not next_marker or next_marker == marker:
                 return None
             marker = next_marker
+        raise OpenIError(
+            f"列目录翻了 {MAX_LIST_PAGES} 页还没结束（目录：{parent or '/'}），"
+            "平台的分页标记可能没有前进。请用 parent_dir 缩小范围后重试。"
+        )
 
     def delete_subject_file(
         self,
@@ -1871,7 +1880,7 @@ class OpenIClient:
 
         def walk(directory: str) -> None:
             marker = ""
-            while True:
+            for _ in range(MAX_LIST_PAGES):
                 page = self.subject_files(subject_name, subject_type, directory, marker) or {}
                 for row in page.get("file_list") or []:
                     name = row.get("FileName") or ""
@@ -1895,6 +1904,13 @@ class OpenIClient:
                 if not page.get("has_next") or not next_marker or next_marker == marker:
                     break
                 marker = next_marker
+            else:
+                # for-else: 走满 MAX_LIST_PAGES 还没 break，说明分页没收敛。
+                # 静默返回半份清单比报错更糟——调用方会以为"就这些文件"。
+                raise OpenIError(
+                    f"列目录翻了 {MAX_LIST_PAGES} 页还没结束（目录：{directory or '/'}）。"
+                    "平台的分页标记可能没有前进；请用 parent_dir 缩小范围后重试。"
+                )
 
         walk(parent_dir)
         return collected

@@ -665,6 +665,78 @@ class TestRepoTreePagination:
         assert out["truncated"] is False
 
 
+class TestPaginationTerminates:
+    """Marker pagination must end, even against a server that never converges.
+
+    Normal paging stops when has_next goes false or the marker stops advancing.
+    A server that keeps reporting has_next with a fresh marker made these loops
+    run forever -- the call would hang instead of failing.
+    """
+
+    def _client(self):
+        from openi_bridge.client import OpenIClient
+
+        client = OpenIClient.__new__(OpenIClient)
+        state = {"calls": 0}
+
+        def never_ends(subject_name, subject_type, parent_dir="", marker="", page_size=1000):
+            state["calls"] += 1
+            return {
+                "file_list": [{"FileName": f"f{state['calls']}"}],
+                "has_next": True,
+                "marker": f"m{state['calls']}",
+            }
+
+        client.subject_files = never_ends
+        client._state = state
+        return client
+
+    def test_subject_entry_gives_up_with_an_error(self):
+        from openi_bridge.client import MAX_LIST_PAGES, OpenIError
+
+        client = self._client()
+        with pytest.raises(OpenIError, match="还没结束"):
+            client._subject_entry("o/r", "dataset", "target.txt")
+        assert client._state["calls"] == MAX_LIST_PAGES
+
+    def test_walk_subject_files_gives_up_with_an_error(self):
+        from openi_bridge.client import OpenIError
+
+        client = self._client()
+        with pytest.raises(OpenIError):
+            client.walk_subject_files("o/r", "dataset")
+
+    def test_normal_pagination_still_terminates_early(self):
+        from openi_bridge.client import OpenIClient
+
+        client = OpenIClient.__new__(OpenIClient)
+        pages = [
+            {"file_list": [{"FileName": "a"}], "has_next": True, "marker": "m1"},
+            {"file_list": [{"FileName": "target.txt"}], "has_next": True, "marker": "m2"},
+        ]
+        calls = {"n": 0}
+
+        def paged(*a, **k):
+            p = pages[min(calls["n"], len(pages) - 1)]
+            calls["n"] += 1
+            return p
+
+        client.subject_files = paged
+        row = client._subject_entry("o/r", "dataset", "target.txt")
+        assert row is not None and row["FileName"] == "target.txt"
+        assert calls["n"] == 2
+
+    def test_repeating_marker_terminates(self):
+        """A marker that never advances ends the search instead of looping."""
+        from openi_bridge.client import OpenIClient
+
+        client = OpenIClient.__new__(OpenIClient)
+        client.subject_files = lambda *a, **k: {
+            "file_list": [], "has_next": True, "marker": "same",
+        }
+        assert client._subject_entry("o/r", "dataset", "x.txt") is None
+
+
 class TestTaskActionVerified:
     """The verified wrapper must distinguish acceptance from effect."""
 

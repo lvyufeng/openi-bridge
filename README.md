@@ -533,6 +533,12 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
 原样交给模型——不设上限时一个 `limit=100000` 就能把几万条记录塞进一次返回。
 要更多数据请翻页，不要一次要完。
 
+工具自己翻页时也有内部上限，防止平台的异常响应把一次调用拖死：`openi_repo_tree`
+最多翻 50 页（`MAX_TREE_PAGES`），主体目录的 marker 翻页最多 500 页
+（`MAX_LIST_PAGES`）。正常分页靠 `has_next`/`marker` 收敛，这两个上限只在平台
+"一直说还有下一页、但标记不前进"时生效——那时会报一条明确的错误，而不是挂住。
+两个值都可以用环境变量覆盖（`OPENI_MAX_TREE_PAGES` / `OPENI_MAX_LIST_PAGES`）。
+
 `openi_start_task_raw` 是自定义 JSON 创建任务的兜底入口，因为它不做字段校验，
 `repo` 必须是 `owner/name`、`payload_json` 必须是非空 JSON 对象，且执行前
 建议先 `dry_run=True` 看一遍请求体。
@@ -565,9 +571,10 @@ python -m openi_bridge.exec_on_card --code "import torch; print(torch.cuda.is_av
   删仓、`/repos/{owner}/{repo}`、`/branches`、`/right`（写权限）、`/contents` 目录列表，
   以及文件读写 `GET/POST/PUT /repos/{owner}/{repo}/contents/{path}`（POST 新建、PUT 覆盖
   需带旧 blob sha）。
-- 代码仓的 git 面：`/git/trees/{ref}?recursive=1` 一条请求返回整棵树（响应里的
-  `truncated` 表示被平台截断）、`/commits` 提交历史、`/archive/{ref}.zip` 整仓打包、
-  `/issues`（GET 列表 / POST 新建）、`/issues/{n}/comments`（POST 评论）。
+- 代码仓的 git 面：`/git/trees/{ref}?recursive=1` 返回文件树，但**有隐藏分页**——
+  一次最多回 1000 条并带 `truncated` / `page` / `total_count`，取整棵树要按 `page` 翻完
+  （详见下面 `openi_repo_tree` 那条）。另有 `/commits` 提交历史、`/archive/{ref}.zip`
+  整仓打包、`/issues`（GET 列表 / POST 新建）、`/issues/{n}/comments`（POST 评论）。
 - 资源发现：`/ai_task/creation/required` 返回当前账号在指定 `job_type` + `compute_source`
   + `cluster_type` 下真实可用的规格列表（含数字 `spec_id`、卡型、卡数、CPU/内存、单价）、
   可用镜像、默认任务名、积分余额，以及 `can_create_more` / `not_stop_task_count` 等配额信息。

@@ -374,10 +374,14 @@ def _resolve_spec(
     if spec_id is None:
         return autopoint._cheapest_spec(client, job_type, compute_source)
     sources = [compute_source] if compute_source else list(ALL_SOURCES)
+    errors: List[str] = []
     for source in sources:
         try:
             info = client.creation_info(job_type, source)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # 单个算力类型查不到不代表 spec 不存在，所以继续试下一个；但要把原因
+            # 记下来。全失败时"没找到 spec"会把令牌过期这类真因说成参数问题。
+            errors.append(f"{source}: {exc}")
             continue
         specs = (info.get("specs") or {}).get("all") or []
         for spec in specs:
@@ -397,7 +401,23 @@ def _resolve_spec(
                 "cluster": DEFAULT_CLUSTER,
                 "job_type": job_type,
             }
-    return {"blocked": True, "reason": f"没找到 spec_id={spec_id}（{job_type}）"}
+    if errors and len(errors) == len(sources):
+        # 每一种算力类型都查不通：这不是"spec 不存在"，而是查询本身失败（常见于
+        # 令牌无效/过期）。把原始错误带出去，别让调用方去改一个没错的参数。
+        return {
+            "blocked": True,
+            "reason": (
+                f"规格查询全部失败（{len(sources)} 种算力类型都查不通），"
+                "不是 spec 不存在；请先确认令牌有效。"
+            ),
+            "errors": errors[:5],
+        }
+    return {
+        "blocked": True,
+        "reason": f"没找到 spec_id={spec_id}（{job_type}）",
+        "queried": len(sources),
+        "errors": errors[:5] if errors else None,
+    }
 
 
 def _wait_debug_url(
