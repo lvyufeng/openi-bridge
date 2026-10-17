@@ -2986,7 +2986,7 @@ def template_image_url(row: Mapping[str, Any]) -> Optional[str]:
 
     NPU 的 MNIST 模板给的是 318c8cac-2011-44c8-acee-21d6a1c138ff 这种 UUID，
     拿它当镜像地址发给平台必然拉不起来；OpenClaw 模板给的则是
-    <host>:<port>/default-workspace/... 这种真地址。这里只认后者。
+    <host>:<port>/default-workspace/... 这种真地址（内网 registry）。这里只认后者。
     """
     value = str(row.get("ImageUrl") or "").strip()
     if not value or TEMPLATE_IMAGE_UUID_RE.match(value):
