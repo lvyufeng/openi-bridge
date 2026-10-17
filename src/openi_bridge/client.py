@@ -100,6 +100,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -124,6 +125,15 @@ MAX_REPO_FILE_BYTES = 50 * 1024 * 1024
 IN_MEMORY_DOWNLOAD_MAX_BYTES = int(
     os.getenv("OPENI_IN_MEMORY_MAX_BYTES", str(8 * 1024 * 1024))
 )
+
+# 落盘下载的超时与读写粒度。总时长不限（单个 ckpt 可能十几 GB），但每次读要有
+# 超时，否则连接被静默挂住时调用方看不到任何反馈。
+DOWNLOAD_TIMEOUT = httpx.Timeout(30.0, read=120.0)
+DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+# 平台算分片 md5 时每片只取前 1MB（见 _file_chunk_md5）。
+_MD5_SAMPLE_BYTES = 1024 * 1024
+# 默认请求超时（建仓、删仓这类慢接口会单独放宽）。
+DEFAULT_REQUEST_TIMEOUT = 30.0
 
 # 数据集 / 模型广场的列表范围（对应平台前端 getCardList 的 tab url）。
 SUBJECT_LIST_SCOPES = ("public", "owned", "collected", "collaborated")
@@ -349,7 +359,7 @@ def _file_chunk_md5(path: str, chunk_size: int = CHUNK_SIZE) -> str:
             block = handle.read(chunk_size)
             if not block:
                 break
-            digest.update(block[: 1024 * 1024])
+            digest.update(block[: _MD5_SAMPLE_BYTES])
     return digest.hexdigest()
 
 
@@ -413,6 +423,77 @@ def _iter_chunks(path: str, chunk_size: int = CHUNK_SIZE, start_from: int = 1):
                 break
             yield number, data
             number += 1
+
+
+def _stream_to_file(
+    response_chunks: Any,
+    dest: str,
+    label: str,
+    max_bytes: Optional[int] = None,
+) -> Dict[str, Any]:
+    """把一串字节块写进 dest，走"临时文件 + 改名"，失败不留半截也不毁旧文件。
+
+    三个下载入口（仓打包、主体单文件、任务的输出/日志）原本各写了一遍这段逻辑，
+    结果只有一处做了覆盖保护：另外两处的 os.replace 会无条件盖掉同名文件，中途
+    失败还会留下一个 .part。这里收成一处，三条路径行为一致。
+
+    覆盖语义是"要么换成新文件，要么保持旧文件不动"：先把已有文件挪到 .prev，
+    新文件就位后再删 .prev；中途任何失败都把 .prev 换回去。刻意不删 ENOSPC 情况下
+    的 .part——那时它是唯一完整的副本。
+    """
+    tmp_path = f"{dest}.part"
+    digest = hashlib.md5()
+    size = 0
+    try:
+        with open(tmp_path, "wb") as handle:
+            for chunk in response_chunks:
+                handle.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+                if max_bytes is not None and size > max_bytes:
+                    raise OpenIError(
+                        f"{label} 超过 max_bytes={max_bytes} 字节，已中止下载。"
+                    )
+    except BaseException:
+        # 只有在确实写坏了（或超限）时才删临时文件；errno 28（磁盘满）时它是
+        # 唯一完整的副本，删掉等于把已经下到的内容也扔掉。
+        if os.path.exists(tmp_path) and not _is_out_of_space():
+            os.remove(tmp_path)
+        raise
+
+    previous = None
+    if os.path.exists(dest):
+        previous = f"{dest}.prev"
+        os.replace(dest, previous)
+    try:
+        os.replace(tmp_path, dest)
+    except BaseException:
+        if previous and os.path.exists(previous):
+            os.replace(previous, dest)  # 回滚，别把老文件也弄丢
+        # 换名失败时 .part 还在：内容完整但位置不对，留着只会让下次下载多一个
+        # 莫名其妙的分片。ENOSPC 除外——那时它是唯一的副本。
+        if os.path.exists(tmp_path) and not _is_out_of_space():
+            os.remove(tmp_path)
+        raise
+    if previous and os.path.exists(previous):
+        os.remove(previous)
+    return {
+        "path": dest,
+        "bytes": size,
+        "md5": digest.hexdigest(),
+    }
+
+
+def _is_out_of_space() -> bool:
+    """当前异常链里是不是磁盘写满（ENOSPC）。"""
+    import errno
+
+    exc = sys.exc_info()[1]
+    while exc is not None:
+        if getattr(exc, "errno", None) == errno.ENOSPC:
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def expand_upload_paths(paths: List[str], remote_dir: str = "") -> List[Dict[str, Any]]:
@@ -1149,43 +1230,31 @@ class OpenIClient:
         if os.path.isdir(dest):
             dest = os.path.join(dest, f"{subject_name.split('/')[-1]}-{ref}.zip")
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-        tmp_path = f"{dest}.part"
-        digest = hashlib.md5()
-        size = 0
-        try:
-            with self._http.stream(
-                "GET",
-                f"/repos/{subject_name}/archive/{ref}.zip",
-                headers={"Authorization": f"Bearer {self.creds.token}"},
-                timeout=httpx.Timeout(30.0, read=120.0),
-            ) as response:
-                if response.status_code >= 400:
-                    raise OpenIError(
-                        f"打包下载失败 HTTP {response.status_code}：{subject_name}@{ref}",
-                        status_code=response.status_code,
-                        payload=response.read().decode("utf-8", "replace")[:200],
-                    )
-                with open(tmp_path, "wb") as handle:
-                    for chunk in response.iter_bytes(1024 * 1024):
-                        handle.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
-                        if max_bytes is not None and size > max_bytes:
-                            raise OpenIError(
-                                f"仓库打包超过 max_bytes={max_bytes} 字节，已中止下载。"
-                            )
-        except BaseException:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise
-        os.replace(tmp_path, dest)
+        with self._http.stream(
+            "GET",
+            f"/repos/{subject_name}/archive/{ref}.zip",
+            headers={"Authorization": f"Bearer {self.creds.token}"},
+            timeout=DOWNLOAD_TIMEOUT,
+        ) as response:
+            if response.status_code >= 400:
+                raise OpenIError(
+                    f"打包下载失败 HTTP {response.status_code}：{subject_name}@{ref}",
+                    status_code=response.status_code,
+                    payload=response.read().decode("utf-8", "replace")[:200],
+                )
+            written = _stream_to_file(
+                response.iter_bytes(DOWNLOAD_CHUNK_BYTES),
+                dest,
+                f"仓库打包 {subject_name}@{ref}",
+                max_bytes=max_bytes,
+            )
         return {
             "repo": subject_name,
             "ref": ref,
-            "path": dest,
-            "bytes": size,
-            "mb": round(size / 1024 / 1024, 2),
-            "md5": digest.hexdigest(),
+            "path": written["path"],
+            "bytes": written["bytes"],
+            "mb": round(written["bytes"] / 1024 / 1024, 2),
+            "md5": written["md5"],
         }
 
     def create_repo_issue(self, subject_name: str, title: str, body: str = "") -> Dict[str, Any]:
@@ -1733,26 +1802,25 @@ class OpenIClient:
         url = self.file_download_url(subject_name, subject_type, file_name, parent_dir)
         dest_dir = os.path.dirname(os.path.abspath(dest_path))
         os.makedirs(dest_dir, exist_ok=True)
-        digest = hashlib.md5()
-        size = 0
-        tmp_path = f"{dest_path}.part"
         # 单个文件可能十几 GB，所以总时长不限，但每次读要有超时：否则连接被
         # 静默挂住时这里会一直卡着，MCP 调用方看不到任何反馈。
         with httpx.stream(
-            "GET", url, timeout=httpx.Timeout(30.0, read=120.0), follow_redirects=True
+            "GET", url, timeout=DOWNLOAD_TIMEOUT, follow_redirects=True
         ) as response:
             if response.status_code >= 400:
                 raise OpenIError(
                     f"下载失败 HTTP {response.status_code}：{file_name}",
                     status_code=response.status_code,
                 )
-            with open(tmp_path, "wb") as handle:
-                for chunk in response.iter_bytes(1024 * 1024):
-                    handle.write(chunk)
-                    digest.update(chunk)
-                    size += len(chunk)
-        os.replace(tmp_path, dest_path)
-        return {"file": file_name, "bytes": size, "md5": digest.hexdigest(), "path": dest_path}
+            written = _stream_to_file(
+                response.iter_bytes(DOWNLOAD_CHUNK_BYTES), dest_path, file_name
+            )
+        return {
+            "file": file_name,
+            "bytes": written["bytes"],
+            "md5": written["md5"],
+            "path": written["path"],
+        }
 
     def walk_subject_files(
         self, subject_name: str, subject_type: str, parent_dir: str = "",
@@ -2339,59 +2407,33 @@ class OpenIClient:
         if not self.creds.has_token:
             raise OpenIError("NO_TOKEN: 没有找到启智令牌。")
         headers = {"Authorization": f"Bearer {self.creds.token}"}
-        timeout = httpx.Timeout(30.0, read=120.0)
+        timeout = DOWNLOAD_TIMEOUT
         if save_to:
             dest = os.path.abspath(os.path.expanduser(save_to))
             if os.path.isdir(dest) or save_to.endswith(os.sep):
                 os.makedirs(dest, exist_ok=True)
                 dest = os.path.join(dest, os.path.basename(label) or "download.bin")
             os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-            tmp_path = f"{dest}.part"
-            digest = hashlib.md5()
-            size = 0
-            try:
-                with self._http.stream(
-                    "GET", path, params=params, headers=headers, timeout=timeout
-                ) as response:
-                    if response.status_code >= 400:
-                        raise OpenIError(
-                            f"下载失败 HTTP {response.status_code}：{path}",
-                            status_code=response.status_code,
-                            payload=response.read().decode("utf-8", "replace")[:200],
-                        )
-                    with open(tmp_path, "wb") as handle:
-                        for chunk in response.iter_bytes(1024 * 1024):
-                            handle.write(chunk)
-                            digest.update(chunk)
-                            size += len(chunk)
-                            if max_bytes is not None and size > max_bytes:
-                                raise OpenIError(
-                                    f"{label or path} 超过 max_bytes={max_bytes} 字节，已中止下载。"
-                                )
-            except BaseException:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
-            # os.replace 会无条件覆盖 dest。这不是"可恢复"的操作：目标文件如果
-            # 是上一次成功下载的产物，这次失败就把它换成了一个可能不完整的文件。
-            # 落盘前先把已有文件挪到 .prev，成功后再删，失败时能找回来。
-            previous = None
-            if os.path.exists(dest):
-                previous = f"{dest}.prev"
-                os.replace(dest, previous)
-            try:
-                os.replace(tmp_path, dest)
-            except BaseException:
-                if previous and os.path.exists(previous):
-                    os.replace(previous, dest)  # 回滚，别把老文件也弄丢
-                raise
-            if previous and os.path.exists(previous):
-                os.remove(previous)
+            with self._http.stream(
+                "GET", path, params=params, headers=headers, timeout=timeout
+            ) as response:
+                if response.status_code >= 400:
+                    raise OpenIError(
+                        f"下载失败 HTTP {response.status_code}：{path}",
+                        status_code=response.status_code,
+                        payload=response.read().decode("utf-8", "replace")[:200],
+                    )
+                written = _stream_to_file(
+                    response.iter_bytes(DOWNLOAD_CHUNK_BYTES),
+                    dest,
+                    label or path,
+                    max_bytes=max_bytes,
+                )
             return {
-                "path": dest,
-                "bytes": size,
-                "mb": round(size / 1024 / 1024, 3),
-                "md5": digest.hexdigest(),
+                "path": written["path"],
+                "bytes": written["bytes"],
+                "mb": round(written["bytes"] / 1024 / 1024, 3),
+                "md5": written["md5"],
             }
         # 内存模式也必须边读边停：任务输出里的 ckpt 能有几十 GB，先 response.content
         # 再截断等于限制还没生效就先把进程撑爆了。所以这里流式读取，够了就断开。
@@ -2409,7 +2451,7 @@ class OpenIClient:
                 )
             # 没给 max_bytes 时也要有个上限，避免一次调用把整个大文件读进内存。
             budget = max_bytes if max_bytes is not None else IN_MEMORY_DOWNLOAD_MAX_BYTES
-            for chunk in response.iter_bytes(1024 * 1024):
+            for chunk in response.iter_bytes(DOWNLOAD_CHUNK_BYTES):
                 if total + len(chunk) > budget:
                     chunks.append(chunk[: budget - total])
                     total = budget

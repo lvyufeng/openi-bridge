@@ -474,6 +474,128 @@ class TestToolDecoratorInvariant:
         assert "kaboom" in payload["error"]
 
 
+class TestStreamToFile:
+    """The three download paths share one writer, so its guarantees are load-bearing.
+
+    Before they were unified only one of the three protected the destination:
+    the others called os.replace unconditionally, replacing a previously good
+    file with a partial one and leaving .part files behind.
+    """
+
+    def _run(self, dest, chunks, max_bytes=None, label="thing"):
+        from openi_bridge.client import _stream_to_file
+
+        return _stream_to_file(iter(chunks), str(dest), label, max_bytes=max_bytes)
+
+    def test_writes_file_and_reports_md5(self, tmp_path):
+        import hashlib
+
+        dest = tmp_path / "out.bin"
+        out = self._run(dest, [b"hello ", b"world"])
+        assert dest.read_bytes() == b"hello world"
+        assert out["bytes"] == 11
+        assert out["md5"] == hashlib.md5(b"hello world").hexdigest()
+
+    def test_existing_file_is_replaced_on_success(self, tmp_path):
+        dest = tmp_path / "out.bin"
+        dest.write_bytes(b"OLD")
+        self._run(dest, [b"NEW"])
+        assert dest.read_bytes() == b"NEW"
+
+    def test_failed_download_keeps_the_previous_file(self, tmp_path):
+        """This is the bug the unify fixed: a partial download must not clobber."""
+        from openi_bridge.client import OpenIError
+
+        dest = tmp_path / "out.bin"
+        dest.write_bytes(b"GOOD-OLD-CONTENT")
+        with pytest.raises(OpenIError):
+            self._run(dest, [b"x" * 5000], max_bytes=10)
+        assert dest.read_bytes() == b"GOOD-OLD-CONTENT"
+
+    def test_no_temp_files_left_behind_on_failure(self, tmp_path):
+        from openi_bridge.client import OpenIError
+
+        dest = tmp_path / "out.bin"
+        with pytest.raises(OpenIError):
+            self._run(dest, [b"x" * 5000], max_bytes=10)
+        assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+    def test_no_temp_files_left_behind_on_success(self, tmp_path):
+        dest = tmp_path / "out.bin"
+        dest.write_bytes(b"OLD")
+        self._run(dest, [b"NEW"])
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out.bin"]
+
+    def test_failure_at_the_replace_step_keeps_old_file_and_no_debris(self, tmp_path):
+        """The failure that actually clobbers is the one AT the finalize.
+
+        A mid-write failure returns before os.replace is ever reached, so the
+        destination was never at risk; a failure during the swap itself is what
+        needs the .prev dance. This is the case the first version of the test
+        missed, because it only exercised the mid-write path.
+        """
+        import os as _os
+        from unittest import mock
+
+        from openi_bridge import client as C
+
+        dest = tmp_path / "out.bin"
+        dest.write_bytes(b"GOOD-OLD-CONTENT")
+        real_replace = _os.replace
+
+        def flaky(src, dst):
+            if dst == str(dest) and src.endswith(".part"):
+                raise OSError(5, "I/O error")
+            return real_replace(src, dst)
+
+        with mock.patch("os.replace", side_effect=flaky):
+            with pytest.raises(OSError):
+                C._stream_to_file(iter([b"NEW"]), str(dest), "thing")
+
+        assert dest.read_bytes() == b"GOOD-OLD-CONTENT"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out.bin"]
+
+    def test_max_bytes_stops_early_rather_than_buffering(self, tmp_path):
+        """The generator must not be drained once the ceiling is passed."""
+        from openi_bridge.client import OpenIError
+
+        consumed = []
+
+        def chunks():
+            for i in range(1000):
+                consumed.append(i)
+                yield b"z" * 100
+
+        dest = tmp_path / "out.bin"
+        with pytest.raises(OpenIError):
+            self._run(dest, chunks(), max_bytes=250)
+        assert len(consumed) < 10, f"read {len(consumed)} chunks past the limit"
+
+
+class TestDownloadConstants:
+    """The duplicated literals are now shared; guard that they stay shared."""
+
+    def test_chunk_and_timeout_are_module_level(self):
+        from openi_bridge import client
+
+        assert client.DOWNLOAD_CHUNK_BYTES > 0
+        assert client.DOWNLOAD_TIMEOUT is not None
+
+    def test_no_stray_duplicate_timeout_literals(self):
+        import re
+        from pathlib import Path
+
+        text = (
+            Path(__file__).resolve().parents[1] / "src/openi_bridge/client.py"
+        ).read_text(encoding="utf-8")
+        # the literal may appear once, in the constant definition itself
+        occurrences = len(re.findall(r"httpx\.Timeout\(30\.0, read=120\.0\)", text))
+        assert occurrences == 1, (
+            f"httpx.Timeout(30.0, read=120.0) appears {occurrences} times; "
+            f"use DOWNLOAD_TIMEOUT instead"
+        )
+
+
 class TestTaskActionVerified:
     """The verified wrapper must distinguish acceptance from effect."""
 
