@@ -136,6 +136,66 @@ class TestToolNameReferences:
             assert stale not in referenced, f"stale tool name {stale} reappeared"
 
 
+class TestReadmeConsistency:
+    """The README is the front door, so its claims must match the server.
+
+    Two drifts had accumulated: the tool table header said 73 tools while there
+    were 85, and the grouped table's links pointed at anchors that did not
+    exist. Neither is caught by anything else, because the README is not code.
+    """
+
+    def _readme(self):
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "README.md").read_text(
+            encoding="utf-8"
+        )
+
+    def _defined_tools(self):
+        import re
+        from pathlib import Path
+
+        text = (Path(__file__).resolve().parents[1] / "src/openi_bridge/server.py").read_text(
+            encoding="utf-8"
+        )
+        return set(re.findall(r"^def (openi_[a-z_]+)\(", text, re.M))
+
+    def test_every_tool_is_documented_exactly_once(self):
+        import re
+
+        rows = re.findall(r"^\| (openi_[a-z_]+) \|", self._readme(), re.M)
+        defined = self._defined_tools()
+        undocumented = sorted(defined - set(rows))
+        duplicated = sorted({r for r in rows if rows.count(r) > 1})
+        assert not undocumented, f"tools missing from the README table: {undocumented}"
+        assert not duplicated, f"tools listed twice in the README table: {duplicated}"
+
+    def test_stated_tool_count_matches_reality(self):
+        import re
+
+        text = self._readme()
+        m = re.search(r"共 (\d+) 个工具", text)
+        assert m, "README no longer states a tool count"
+        assert int(m.group(1)) == len(self._defined_tools())
+
+    def test_internal_links_resolve(self):
+        import re
+
+        def slug(heading):
+            s = heading.strip().lower()
+            s = re.sub(r"[^\w\u4e00-\u9fff\- ]", "", s)
+            return s.replace(" ", "-")
+
+        text = self._readme()
+        heads = {slug(m.group(2)) for m in re.finditer(r"^(#{2,6})\s+(.+?)\s*$", text, re.M)}
+        broken = [
+            m.group(2)
+            for m in re.finditer(r"\[[^\]]+\]\(#([^)]+)\)", text)
+            if m.group(1) not in heads
+        ]
+        assert not broken, f"README links point at missing headings: {broken}"
+
+
 class TestCatalogIntegrity:
     """Cross-table consistency: the catalog is read by the model as fact."""
 
