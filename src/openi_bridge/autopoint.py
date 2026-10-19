@@ -424,8 +424,19 @@ def launch_and_wait(
         report["error"] = "创建任务后没有拿到任务 ID"
         return report
     deadline = started + wait_seconds
+    read_errors = 0
     while time.monotonic() < deadline:
-        brief = client.task_brief(task_id)
+        try:
+            brief = client.task_brief(task_id)
+        except Exception as exc:  # noqa: BLE001
+            # 平台偶尔回 502（实测遇到过），一次失败不能把整次等待判定为结束：
+            # 那会让调用方在任务还在排队时就放弃，随后拿不到 task_id 去做清理，
+            # 留下一个没人管的任务。这里退避重试，把状态读错当成"还没到"。
+            read_errors += 1
+            report["last_read_error"] = str(exc)
+            report["status_read_errors"] = read_errors
+            time.sleep(3)
+            continue
         status = (brief.get("status") or "").upper()
         report["status"] = status
         if status in RUNNING_STATUSES:

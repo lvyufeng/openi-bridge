@@ -303,6 +303,59 @@ class TestDownloadDoesNotClobber:
         assert dest.read_bytes() == b"GOOD-OLD-CONTENT"
 
 
+class TestPollingSurvivesTransientErrors:
+    """A blip while polling status must not abort the whole operation.
+
+    Found by running against the live platform: a single 502 from /ai_task/brief
+    during the wait-for-RUNNING loop raised out of launch_and_wait, so the caller
+    never got the task id and could not clean up -- a real task was left behind
+    in PREPARING. The loop now retries and only the deadline ends the wait.
+    """
+
+    def _client(self, failures, then):
+        class Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            def create_task(self, **kw):
+                return {"id": 42}
+
+            def task_brief(self, task_id):
+                self.calls += 1
+                if self.calls <= failures:
+                    raise RuntimeError("HTTP 502 Bad Gateway")
+                return {"status": then}
+
+        return Flaky()
+
+    def _spec(self):
+        return {"spec_id": 184, "compute_source": "MLU", "cluster": "C2Net"}
+
+    def test_transient_errors_do_not_abort_the_wait(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        out = autopoint.launch_and_wait(
+            self._client(failures=3, then="RUNNING"), "o/r", self._spec(), wait_seconds=60
+        )
+        assert out["reached_running"] is True
+        assert out["status_read_errors"] == 3
+
+    def test_errors_are_counted_and_reported(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        out = autopoint.launch_and_wait(
+            self._client(failures=1, then="STOPPED"), "o/r", self._spec(), wait_seconds=60
+        )
+        assert out["status_read_errors"] == 1
+        assert "last_read_error" in out
+
+    def test_clean_task_reports_no_errors(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        out = autopoint.launch_and_wait(
+            self._client(failures=0, then="RUNNING"), "o/r", self._spec(), wait_seconds=60
+        )
+        assert out["reached_running"] is True
+        assert "status_read_errors" not in out
+
+
 class TestFreeWindowAccounting:
     """keep_seconds must be measured from RUNNING, and truncation reported."""
 
