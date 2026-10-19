@@ -1,0 +1,63 @@
+任务生命周期真机验证记录（2026-10-19）
+====================================
+
+这次跑真机的目的：代码在 10-17 之后改了大量"回读确认"逻辑（stop/restart/del 会轮询
+状态、清理失败会报 ok=false、翻页有上限、路径穿越被拦截），而这些**只在 stub 上测过**，
+没在真实平台上验证过。用一次真实任务确认行为与预期一致。
+
+一、第一次尝试暴露了一个真 bug（已修）
+
+`openi_run_on_card(compute_source="MLU")` 在等 RUNNING 时，平台的 /ai_task/brief
+回了一次 502。当时的实现（autopoint.launch_and_wait 的轮询循环）没有 try：
+
+    while time.monotonic() < deadline:
+        brief = client.task_brief(task_id)     # 一次 502 就把整个调用抛出去
+
+后果是整个调用带异常退出，调用方拿不到 task_id，**清理因此根本没执行**，任务
+908271 被留在 PREPARING。这正是清理代码要防的结果，却从它没覆盖的路径溜过去了。
+
+修法：把读取失败当作"还没到"，退避重试到 deadline，并记录错误次数与最后一条错误。
+与清理逻辑同一条原则——一次读取失败既不证明任务停了，也不该成为停止观察的理由。
+新增 3 个测试，其中 2 个在修复前的代码上会失败。
+
+二、卡住的任务是平台侧的死结（不可通过 API 解决）
+
+908271 卡在 PREPARING 时的表现，实测记录：
+
+    start_time = 0, job_id = ""        -> 从未拿到 pod，没有真正被调度
+    POST /ai_task/stop                 -> 200 {"code":0} 但 status 不变
+    POST /ai_task/del                  -> 200 {"code":99,"msg":"task not stopped"}
+    POST /ai_task/batch_del            -> "platform error 99: Delete Failed"
+    /ai_task/operation_profile         -> 空数组（没有任何调度事件）
+    /ai_task/resource_usage            -> metrics_info: null（未占用卡）
+    积分流水                            -> 当天没有任何扣费
+
+同时它占住了 DEBUG 任务的名额：can_create_more=false、not_stop_task_count=1、
+limit_count=1，导致新任务无法创建。
+
+约两小时后它自行变成 CREATED_FAILED，此时可以正常删除。**结论**：这种状态平台
+自己会收尾，期间不占卡不扣费，但会阻塞新建；遇到时等平台回收或联系平台，bridge
+这边没有可用接口能强行清掉。
+
+三、最终验证（修复后）
+
+同一条路径重跑：openi_run_on_card(compute_source="GCU", code=print 两行)
+
+    ok:       True
+    stdout:   py 3.8.10 / hello
+    cleanup:  stopped=True, deleted=True, status_confirmed_stopped=True,
+              status_at_delete="STOPPED", status_read_errors=(无)
+
+也就是说：真实任务真的跑起来了、代码执行结果取回来了、停止与删除都**回读确认**
+到了终态，而不是仅仅"请求已受理"。跑完任务列表为空、积分余额 4924.6 无变化
+（不足 6 分钟不计费）。
+
+四、顺带确认的行为
+
+- 删除已停止的任务会真正把记录移除（5 条 DEBUG 记录一次性删干净，配额随之释放）
+- CREATED_FAILED / STOPPED 状态可以正常删除，PREPARING 状态不行
+- 平台的 DEBUG 并发额度是**记录数**而非运行数：留着已停止的任务记录也会占名额
+
+五、清理
+
+本次验证产生的任务全部停止并删除，任务列表为空，无残留；未消耗积分。
