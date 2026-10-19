@@ -28,7 +28,7 @@
 需要 Python ≥ 3.10。
 
 **1. 拿一个令牌。** 打开 https://openi.pcl.ac.cn/user/settings/applications 新建访问令牌，
-写进 `~/.openi/token.json`：
+写进 `~/.openi/token.json`（注意权限，见下）：
 
 ```json
 { "endpoint": "https://openi.pcl.ac.cn", "token": "你的令牌" }

@@ -26,6 +26,17 @@ export OPENI_ENDPOINT=https://openi.pcl.ac.cn
 { "endpoint": "https://openi.pcl.ac.cn", "token": "你的令牌" }
 ```
 
+**记得收紧权限。** 普通 `cat >` / 重定向建出来的文件是 0644——在多用户机器上等于
+所有本地用户都能读到你的令牌：
+
+```bash
+mkdir -p ~/.openi && chmod 700 ~/.openi
+# 写完之后
+chmod 600 ~/.openi/token.json
+```
+
+拿不准就直接查一下：`ls -l ~/.openi/token.json` 应显示 `-rw-------`。
+
 注意 MCP 客户端进程通常**不继承你 shell 里 export 的变量**，所以长期用请写文件。
 
 ---

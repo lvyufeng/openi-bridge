@@ -505,6 +505,27 @@ def _is_out_of_space() -> bool:
     return False
 
 
+def _assert_safe_path(path: str) -> None:
+    """挡掉会把请求重定向到别的端点的路径。
+
+    很多 URL 是 f"/repos/{repo}/..." 这样拼出来的，而 repo 来自调用方。httpx 会
+    把 "../" 规范化掉，所以 repo="../user" 会让 /repos/../user 真的打到 /api/v1/user
+    —— 一个仓维度的调用变成了任意 API 调用（2026-10 实测确认）。
+
+    入口处统一拦：路径里不允许出现 "." / ".." 这样的整段，也不允许换行。这一层
+    在 request() 里，所以所有接口都覆盖到，不必给 20 处拼接各加一次判断。
+    """
+    if not path.startswith("/"):
+        raise OpenIError(f"内部路径必须以 / 开头：{path!r}")
+    if "\n" in path or "\r" in path:
+        raise OpenIError(f"路径里不能有换行：{path!r}")
+    for segment in path.split("/"):
+        if segment in (".", ".."):
+            raise OpenIError(
+                f"路径里不允许出现 {segment!r} 段（会把请求打到别的端点）：{path!r}"
+            )
+
+
 def expand_upload_paths(paths: List[str], remote_dir: str = "") -> List[Dict[str, Any]]:
     """把本地文件/目录展开成待上传清单：{name(仓内路径), path, size}。
 
@@ -593,6 +614,7 @@ class OpenIClient:
         raise_for_status: bool = True,
         timeout: Optional[float] = None,
     ) -> httpx.Response:
+        _assert_safe_path(path)
         if not self.creds.has_token:
             raise OpenIError(
                 "NO_TOKEN: 没有找到启智令牌。请在 https://openi.pcl.ac.cn/user/settings/applications "

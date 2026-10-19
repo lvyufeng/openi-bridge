@@ -665,6 +665,69 @@ class TestRepoTreePagination:
         assert out["truncated"] is False
 
 
+class TestPathTraversal:
+    """A caller-supplied repo must not be able to redirect the request.
+
+    URLs are built as f"/repos/{repo}/...", and httpx normalises "../", so
+    repo="../user" turned a repo-scoped call into GET /api/v1/user. The guard
+    lives in request(), the one point every call passes through, rather than in
+    the twenty places that build a repo path.
+    """
+
+    def _c(self):
+        from openi_bridge.client import OpenIClient
+
+        return OpenIClient.__new__(OpenIClient)
+
+    def test_dotdot_segments_are_rejected(self):
+        from openi_bridge.client import OpenIError, _assert_safe_path
+
+        for path in ("/repos/../user", "/repos/a/../../user", "/repos/../notifications"):
+            with pytest.raises(OpenIError, match="不允许出现"):
+                _assert_safe_path(path)
+
+    def test_single_dot_segments_are_rejected(self):
+        from openi_bridge.client import OpenIError, _assert_safe_path
+
+        with pytest.raises(OpenIError, match="不允许出现"):
+            _assert_safe_path("/repos/owner/./repo/tags")
+
+    def test_newlines_are_rejected(self):
+        from openi_bridge.client import OpenIError, _assert_safe_path
+
+        with pytest.raises(OpenIError, match="不能有换行"):
+            _assert_safe_path("/repos/a\nb/tags")
+
+    def test_relative_paths_are_rejected(self):
+        from openi_bridge.client import OpenIError, _assert_safe_path
+
+        with pytest.raises(OpenIError, match="必须以 / 开头"):
+            _assert_safe_path("repos/a/b")
+
+    def test_ordinary_repo_paths_pass(self):
+        from openi_bridge.client import _assert_safe_path
+
+        for path in (
+            "/repos/lvyufeng/mindnlp/tags",
+            "/repos/owner/repo.git/branches",
+            "/ai_task?id=1",
+            "/user",
+        ):
+            _assert_safe_path(path)  # must not raise
+
+    def test_repo_methods_go_through_the_guard(self):
+        """The guard must be wired into request(), not just importable."""
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parents[1] / "src/openi_bridge/client.py").read_text(
+            encoding="utf-8"
+        )
+        body = src.split("    def request(", 1)[1].split("    def get_json", 1)[0]
+        assert "_assert_safe_path(path)" in body, (
+            "request() must call the path guard, or the fix is inert"
+        )
+
+
 class TestPaginationTerminates:
     """Marker pagination must end, even against a server that never converges.
 
