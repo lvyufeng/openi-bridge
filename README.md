@@ -1,5 +1,9 @@
 # openi-bridge
 
+[![tests](https://github.com/lvyufeng/openi-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/lvyufeng/openi-bridge/actions/workflows/tests.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
 [OpenI 启智社区](https://openi.pcl.ac.cn)（鹏城云脑普惠算力）的 [MCP](https://modelcontextprotocol.io)
 服务器。装上之后，在 **Claude Code / Codex / dsh / Cursor** 里直接说人话就能开卡、
 跑训练、取产物，不用记住任何工具名。
@@ -17,7 +21,7 @@
 - **数据**：建数据集/模型库、上传（>64MB 自动分片续传）、检索、拉回本地
 - **积分**：每日算力积分自动领取（零净消耗），可挂定时任务
 
-共 **85 个工具**，完整列表见 [`docs/tools.md`](docs/tools.md)。
+共 **86 个工具**，完整列表见 [`docs/tools.md`](docs/tools.md)。
 
 ## 安装
 
@@ -93,7 +97,7 @@ python -m openi_bridge.autopoint --status
 | 算力与规格 | 平台有什么、你能开什么、余额够开多久 | 6 |
 | 开卡与跑代码 | 建任务、在卡上跑代码、停/重启/删 | 7 |
 | 看任务 | 状态、日志、调度时间线、产物下载与转存 | 19 |
-| 代码仓 | 建仓、读写、issue、仓库治理面、找别人的仓 | 26 |
+| 代码仓 | 建仓、读写、issue、仓库治理面、找别人的仓 | 27 |
 | 数据集与模型库 | 建库、上传、检索、拉回本地 | 14 |
 | 任务模板 | 别人配好的一键开任务模板 | 4 |
 
@@ -144,4 +148,4 @@ pytest
 
 ## License
 
-MIT
+[MIT](LICENSE)

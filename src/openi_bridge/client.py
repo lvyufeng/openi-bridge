@@ -782,8 +782,34 @@ class OpenIClient:
         return self.get_json(f"/repos/{subject_name}")
 
     def repo_branches(self, subject_name: str) -> List[Dict[str, Any]]:
-        """Branches of a repo; the create form needs one for the code version."""
-        return self.get_json(f"/repos/{subject_name}/branches")
+        """GET /repos/{name}/branches - 分支清单（建任务要填 branch_name）。
+
+        平台每条分支带的东西非常多：commit 里有完整 PGP 签名、签名原文、作者邮箱，
+        一条就能到几 KB。这里只留选分支真正需要的几个字段——名字、最新提交、是否
+        保护分支、当前账号能不能推。
+        """
+        rows = self.get_json(f"/repos/{subject_name}/branches") or []
+        if isinstance(rows, Mapping):
+            rows = rows.get("branches") or []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            commit = row.get("commit") if isinstance(row.get("commit"), Mapping) else {}
+            author = commit.get("author") if isinstance(commit.get("author"), Mapping) else {}
+            message = (commit.get("message") or "").strip().splitlines()
+            out.append(
+                {
+                    "name": row.get("name"),
+                    "commit_sha": commit.get("id"),
+                    "commit_message": message[0] if message else None,
+                    "commit_time": row.get("timestamp") or commit.get("timestamp"),
+                    "author": author.get("username") or author.get("name"),
+                    "protected": row.get("protected"),
+                    "user_can_push": row.get("user_can_push"),
+                }
+            )
+        return out
 
     def repo_tags(self, subject_name: str) -> List[Dict[str, Any]]:
         """GET /repos/{name}/tags - 代码仓的 tag 列表（每项含指向的 commit）。

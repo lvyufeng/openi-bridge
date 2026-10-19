@@ -808,6 +808,24 @@ def openi_delete_repository(repo: str) -> str:
     return dump({"ok": True, "repo": repo, "deleted": True})
 @mcp.tool()
 @tool
+def openi_list_repo_branches(repo: str) -> str:
+    """列出代码仓的分支，用于确定 openi_start_task 的 branch_name。
+
+    每项给名字、最新提交（sha / 标题 / 时间 / 作者）、是否保护分支、当前账号能不能推。
+    平台原始响应里每条分支还带完整 PGP 签名与签名原文（几 KB 一条），这里已裁掉——
+    选分支用不到那些，留着只会把返回撑大。
+
+    repo: 代码仓全名 owner/name。
+    """
+    if not _REPO_FULLNAME_RE.match(repo or ""):
+        return dump({"ok": False, "error": f"repo 必须是 owner/name 形式：{repo!r}"})
+    with _client() as client:
+        branches = client.repo_branches(repo)
+    return dump({"ok": True, "repo": repo, "count": len(branches), "branches": branches})
+
+
+@mcp.tool()
+@tool
 def openi_list_repo_files(repo: str, ref: Optional[str] = None, path: str = "") -> str:
     """列出代码仓某个目录与全部分支，用于确定启动文件 boot_file（例如 train.py）。
 

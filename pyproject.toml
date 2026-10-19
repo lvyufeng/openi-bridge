@@ -3,7 +3,20 @@ name = "openi-bridge"
 version = "0.1.0"
 description = "MCP server that opens and manages OpenI (启智社区) compute tasks"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+keywords = ["mcp", "openi", "启智社区", "gpu", "npu", "compute", "model-context-protocol"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Environment :: Console",
+]
 dependencies = [
   "mcp>=1.9.0",
   "httpx>=0.27.0",

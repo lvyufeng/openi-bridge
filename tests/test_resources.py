@@ -346,6 +346,53 @@ class TestDocsLinks:
             )
 
 
+class TestToolGroupCounts:
+    """The per-group counts in docs/tools.md must match the rows below them.
+
+    Adding openi_list_repo_branches made the 代码仓 count wrong (26 vs 27) while
+    the overall total stayed right, so the existing total-check did not catch
+    it. Each group index row is now checked against the rows in its section.
+    """
+
+    def _text(self):
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parents[1] / "docs/tools.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_group_counts_match_their_sections(self):
+        import re
+
+        text = self._text()
+        sections = {}
+        for chunk in re.split(r"^### ", text, flags=re.M)[1:]:
+            title = chunk.splitlines()[0].strip()
+            sections[title] = len(re.findall(r"^\| (openi_[a-z_]+) \|", chunk, re.M))
+
+        index = dict(
+            (m.group(1), int(m.group(2)))
+            for m in re.finditer(
+                r"^\| \[([^\]]+)\]\(#[^)]+\) \| .* \| (\d+) \|$", text, re.M
+            )
+        )
+        assert index, "no group index table found"
+        for title, claimed in index.items():
+            actual = sections.get(title)
+            assert actual is not None, f"group {title} has no section"
+            assert claimed == actual, (
+                f"group {title} claims {claimed} tools but lists {actual}"
+            )
+
+    def test_group_counts_sum_to_the_stated_total(self):
+        import re
+
+        text = self._text()
+        total = int(re.search(r"共 \*{0,2}(\d+)\*{0,2} 个工具", text).group(1))
+        listed = len(re.findall(r"^\| (openi_[a-z_]+) \|", text, re.M))
+        assert total == listed, f"header says {total}, table lists {listed}"
+
+
 class TestReadmeClientSnippets:
     """The README documents four client config shapes; they must stay correct.
 
